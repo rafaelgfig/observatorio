@@ -1,6 +1,8 @@
 """Downloads incrementais: GET condicional (ETag / Last-Modified) e manifesto local.
 
-O manifesto guarda, para cada fonte (chave lógica, ex.: ``"aneel:2026"``), a última versão
+Há um manifesto por domínio (``data/manifest/{geo,aneel,itbi,geosampa}.json``, ver
+``Settings.manifest_path``). Ele guarda, para cada fonte (chave lógica, ex.:
+``"aneel:interrupcoes:2026"``, ``"itbi:2025"``, ``"geosampa:lote_cidadao"``), a última versão
 baixada e o hash da última versão *processada*. Assim, uma etapa de ingestão só reprocessa
 o que realmente mudou, e uma falha no processamento não marca a fonte como concluída.
 """
@@ -112,6 +114,14 @@ class Manifest:
             }
             for key, e in sorted(self._entries.items())
         }
+
+    @staticmethod
+    def merged(manifest_dir: Path) -> dict[str, Any]:
+        """:meth:`as_dict` de todos os manifestos de ``manifest_dir`` (um por domínio), juntos."""
+        merged: dict[str, Any] = {}
+        for path in sorted(manifest_dir.glob("*.json")):
+            merged.update(Manifest(path).as_dict())
+        return merged
 
     def _save(self) -> None:
         atomic_write_text(self.path, json.dumps(self.as_dict(), indent=2, ensure_ascii=False))
@@ -273,7 +283,7 @@ def fetch(
         raise
 
     headers = state.headers or httpx.Headers()
-    digest, size = _sha256(state.part)
+    digest, size = file_sha256(state.part)
     replace_file(state.part, dest)
     version = RemoteVersion(
         url=url,
@@ -295,7 +305,8 @@ def fetch(
     return DownloadResult(key=key, path=dest, version=version, downloaded=not unchanged)
 
 
-def _sha256(path: Path) -> tuple[str, int]:
+def file_sha256(path: Path) -> tuple[str, int]:
+    """sha256 (hex) e tamanho de um arquivo, lido em blocos (arquivos de centenas de MB)."""
     digest = hashlib.sha256()
     size = 0
     with path.open("rb") as fh:

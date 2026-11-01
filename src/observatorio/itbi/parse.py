@@ -76,10 +76,11 @@ RAW_COLUMNS: Final[Mapping[str, tuple[str, ...]]] = {
     "cartorio": ("Cartório de Registro",),
     "matricula": ("Matrícula do Imóvel",),
     "situacao_sql": ("Situação do SQL",),
-    "area_terreno_m2": ("Área do Terreno (m2)",),
+    # "m²" listado à parte: o search_key (NFD) não o iguala a "m2" (o "²" vira pontuação)
+    "area_terreno_m2": ("Área do Terreno (m2)", "Área do Terreno (m²)"),
     "testada_m": ("Testada (m)",),
     "fracao_ideal": ("Fração Ideal",),
-    "area_construida_m2": ("Área Construída (m2)",),
+    "area_construida_m2": ("Área Construída (m2)", "Área Construída (m²)"),
     "uso_cod": ("Uso (IPTU)",),
     "uso": ("Descrição do uso (IPTU)",),
     "padrao_cod": ("Padrão (IPTU)",),

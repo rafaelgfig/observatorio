@@ -8,8 +8,7 @@ import duckdb
 import pytest
 
 from observatorio.aneel import transform
-from observatorio.db import connect
-from observatorio.storage import sql_path
+from observatorio.db import connect, sql_path
 from test_aneel_sinteticos import (
     ABADIA,
     CAMPINAS,

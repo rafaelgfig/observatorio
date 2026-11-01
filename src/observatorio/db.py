@@ -30,11 +30,17 @@ log = logging.getLogger(__name__)
 type Params = Sequence[Any] | Mapping[str, Any] | None
 
 # Macros SQL disponíveis em toda conexão do projeto.
-# norm_text: minúsculas, sem acentos, pontuação vira espaço — igual a ``text.search_key``.
+# norm_text: minúsculas, sem acentos, pontuação vira espaço — o mesmo resultado de
+# ``text.search_key`` (testado em ``tests/test_text.py``; ``º``/``ª``/``²`` viram pontuação).
 MACROS = (
     "CREATE OR REPLACE MACRO norm_text(x) AS "
     "trim(regexp_replace(lower(strip_accents(coalesce(x, ''))), '[^0-9a-z]+', ' ', 'g'))",
 )
+
+
+def sql_path(path: Path | str) -> str:
+    """Caminho (ou glob) como literal SQL: barras normais, aspas escapadas."""
+    return "'" + str(path).replace("\\", "/").replace("'", "''") + "'"
 
 
 def connect(
@@ -243,7 +249,7 @@ class Database:
             pattern = path
         else:
             return None
-        return str(pattern).replace("\\", "/").replace("'", "''")
+        return sql_path(pattern)
 
     @staticmethod
     def _create(con: duckdb.DuckDBPyConnection, ds: Dataset, source: str) -> None:
@@ -251,7 +257,7 @@ class Database:
             body = f"SELECT {ds.select} FROM ({ds.query})"
         else:
             body = (
-                f"SELECT {ds.select} FROM read_parquet('{source}', "
+                f"SELECT {ds.select} FROM read_parquet({source}, "
                 "hive_partitioning = false, union_by_name = true)"
             )
         if not ds.materialize:

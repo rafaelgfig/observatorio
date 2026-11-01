@@ -80,8 +80,8 @@ from pathlib import Path
 
 import duckdb
 
-from observatorio.db import connect
-from observatorio.storage import copy_query, sql_path
+from observatorio.db import connect, sql_path
+from observatorio.storage import copy_query
 
 log = logging.getLogger(__name__)
 

@@ -19,9 +19,9 @@ from pathlib import Path
 import duckdb
 
 from observatorio.config import Settings
-from observatorio.db import connect
+from observatorio.db import connect, sql_path
 from observatorio.downloads import Manifest, fetch, http_client
-from observatorio.storage import copy_query, gzip_copy, sql_path, touch_version
+from observatorio.storage import copy_query, gzip_copy, touch_version
 
 log = logging.getLogger(__name__)
 

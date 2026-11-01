@@ -4,11 +4,12 @@
  *
  * - debounce + cancelamento (AbortController) para não acumular requisições;
  * - navegação por teclado (↑ ↓ Enter Esc Home End);
- * - destaque do trecho buscado ignorando acentos e caixa;
+ * - destaque do trecho buscado ignorando acentos, caixa e pontuação (`dom.normalizeText`);
  * - todo texto vindo da API entra via textContent (nunca innerHTML).
  */
 
-import { el, normalizeText } from "../dom.js";
+import { isAbort } from "../api.js";
+import { debounce, el, normalizeText } from "../dom.js";
 
 /**
  * @typedef {object} OptionView
@@ -63,8 +64,6 @@ export function createAutocomplete(options) {
   /** @type {T[]} */
   let items = [];
   let active = -1;
-  /** @type {ReturnType<typeof setTimeout> | undefined} */
-  let timer;
   /** @type {AbortController | undefined} */
   let inflight;
   let lastQuery = "";
@@ -152,17 +151,15 @@ export function createAutocomplete(options) {
       items = await search(query, inflight.signal);
       if (document.activeElement === input) render(query);
     } catch (error) {
-      if (!(error instanceof DOMException && error.name === "AbortError")) {
-        console.error("autocomplete:", error);
-      }
+      if (!isAbort(error)) console.error("autocomplete:", error);
     }
   }
+  const scheduleRun = debounce(run, debounceMs);
 
   function onInput() {
     if (input.value === lastQuery) return;
     lastQuery = input.value;
-    clearTimeout(timer);
-    timer = setTimeout(run, debounceMs);
+    scheduleRun();
     if (!input.value) onClear?.();
   }
 
@@ -232,7 +229,7 @@ export function createAutocomplete(options) {
     },
     destroy() {
       inflight?.abort();
-      clearTimeout(timer);
+      scheduleRun.cancel();
       input.removeEventListener("input", onInput);
       input.removeEventListener("keydown", onKeyDown);
       input.removeEventListener("blur", onBlur);
@@ -244,7 +241,7 @@ export function createAutocomplete(options) {
 
 /**
  * Envolve em <mark> os trechos de `text` que casam com os termos de `query`,
- * ignorando acentos e caixa.
+ * ignorando acentos, caixa e pontuação.
  * @param {string} text
  * @param {string} query
  */
@@ -272,8 +269,11 @@ function highlight(text, query) {
     for (;;) {
       const at = haystack.indexOf(term, from);
       if (at < 0) break;
-      for (let k = at; k < at + term.length; k++) marked[owner[k] ?? 0] = true;
-      from = at + term.length;
+      // só no início de palavra, como a busca do servidor (evita marcar "r" dentro de "Frei")
+      if (at === 0 || haystack[at - 1] === " ") {
+        for (let k = at; k < at + term.length; k++) marked[owner[k] ?? 0] = true;
+      }
+      from = at + 1;
     }
   }
   let buffer = "";

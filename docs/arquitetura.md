@@ -14,8 +14,9 @@ fontes abertas ──(observatorio ingest …)──► data/raw ──► data/
 ```
 
 * **Ingestão** (`observatorio ingest geo|aneel|itbi|all`) é incremental: cada fonte tem uma
-  chave lógica no `data/manifest.json` com URL, ETag/Last-Modified e sha256 do download e do
-  último processamento. Só reprocessa o que mudou. Ao terminar, grava
+  chave lógica (ex.: `aneel:interrupcoes:2026`, `itbi:2025`, `geosampa:lote_cidadao`) no
+  manifesto do seu domínio, `data/manifest/{geo,aneel,itbi,geosampa}.json`, com URL,
+  ETag/Last-Modified e sha256 do download e do último processamento. Só reprocessa o que mudou. Ao terminar, grava
   `data/processed/.version` — a API observa esse arquivo e recarrega sozinha.
 * **API** abre um DuckDB **em memória** com views sobre os Parquet (`observatorio.db.Database`).
   Nunca grava nada; a ingestão substitui arquivos de forma atômica (`storage.atomic_path`, que
@@ -30,18 +31,19 @@ fontes abertas ──(observatorio ingest …)──► data/raw ──► data/
 
 ```
 src/observatorio/
-  config.py        Settings (pydantic-settings, prefixo OBSERVATORIO_)
-  downloads.py     fetch() com GET condicional + Manifest
-  db.py            connect() p/ ingestão; Database (views/tabelas) p/ API; macro norm_text
+  config.py        Settings (pydantic-settings, prefixo OBSERVATORIO_), configure_logging()
+  downloads.py     fetch() com GET condicional + Manifest (um por domínio), file_sha256()
+  db.py            connect() p/ ingestão; Database (views/tabelas) p/ API; macro norm_text;
+                   sql_path() (caminho como literal SQL)
   storage.py       escrita atômica (COPY … TO), gzip, touch_version
-  text.py          normalização de textos (busca, nomes de logradouros)
+  text.py          normalização de textos (search_key, street_label/expand_street)
   cli.py           Typer: ingest geo|aneel|itbi|all, serve, status
   geo/ibge.py      municípios/UFs (malha simplificada, população, places)
   aneel/           sources.py, transform.py, ingest.py, queries.py, api.py
   itbi/            sources.py, parse.py, ingest.py, geosampa.py, geocode.py, queries.py, api.py
-  api/             app.py (fábrica), deps.py, meta.py, search.py
+  api/             app.py (fábrica), deps.py (DB, require, run_query), meta.py, search.py
   web/             index.html, css/, js/ (main.js, map.js, views/, components/)
-tests/             pytest (sem rede por padrão; marcador `network` para os que acessam)
+tests/             pytest (sem rede por padrão; `-m network` roda os que consultam as fontes)
 docs/
 ```
 
@@ -70,7 +72,9 @@ Cada domínio expõe em `<dominio>/api.py`:
   só com (aba, linha) no log. Nada disso é persistido; a rota de detalhe devolve uma lista
   fechada de colunas (`queries.COLUNAS_TRANSACAO`).
 * Busca: cada domínio grava `processed/<dominio>/places.parquet` com o esquema abaixo; a coluna
-  `norm` usa a macro SQL `norm_text()` (equivalente a `text.search_key`).
+  `norm` usa a macro SQL `norm_text()`, que dá o mesmo resultado de `text.search_key` (usada nos
+  termos da busca): minúsculas, sem acentos (NFD), tudo fora de `[0-9a-z]` vira espaço —
+  inclusive `º`, `ª` e `²`. `dom.normalizeText` (destaque no autocompletar) segue a mesma regra.
 
 ### Esquema de `places.parquet`
 
@@ -216,7 +220,19 @@ datas ISO-8601. Erros: `{"detail": "mensagem"}`; dados ainda não ingeridos → 
 ### Comuns
 
 * `GET /api/health` → `{status, versao, dados: [..]}`
-* `GET /api/meta` → fontes e datas de atualização.
+* `GET /api/meta` → fontes e datas de atualização:
+  ```json
+  {"dados": ["aneel_fato", "itbi", "municipios", "..."],
+   "fontes": {"itbi:2026": {"url": "https://...", "baixado_em": "2026-10-01T09:12:44+00:00",
+                            "processado": true, "linhas": 155903, "meses": [1, 2, 3],
+                            "snapshot": "2026-09-30"},
+              "geosampa:lote_cidadao": {"url": "...", "baixado_em": "...",
+                                        "processado": true, "feicoes": 1688271}},
+   "carregado_em": "2026-10-01T09:20:03+00:00"}
+  ```
+  Uma entrada por chave dos manifestos. `processado`: o último download já foi processado.
+  `linhas`, `meses`, `snapshot` e `feicoes` só aparecem nas fontes que os registram.
+  `carregado_em`: quando a API carregou os dados em uso (nulo antes da 1ª carga).
 * `GET /api/busca?q=&escopo=aneel|itbi&limite=8` →
   `[{tipo, id, rotulo, detalhe, lon, lat, bbox: [w,s,e,n] | null}]`
 * `GET /dados/geo/municipios.geojson`, `GET /dados/geo/ufs.geojson` (gzip).
@@ -377,7 +393,10 @@ Observações para a implementação: `natureza` código 5 tem dois rótulos ao 
 * `js/main.js` — roteamento por hash (`#/apagoes`, `#/itbi`), mapa único compartilhado; cada
   view exporta `mount(ctx)` / `unmount()` e reage a `ctx.onStyle(fn)` (troca de tema recria o estilo).
 * Componentes: `components/autocomplete.js`, `charts.js` (SVG: colunas, linha, barras horizontais,
-  com tooltip), `legend.js`, `table.js`; utilitários em `dom.js` (`el`, `fmt`), `api.js`.
+  com tooltip), `legend.js`, `table.js`; utilitários em `dom.js` (`el`, `fmt`, `field`, `kpiTile`,
+  `showError`, `debounce`…), `api.js` (`api`, `latest`, `isAbort`). Nomes de métricas (ANEEL) e de
+  tipos de imóvel (ITBI) vêm dos `/meta`; o frontend guarda só os ids, a formatação e os textos de
+  ajuda.
 * Tema escuro padrão; tokens CSS em `css/app.css`. Cores de dados: rampa sequencial única por
   métrica (`--seq-outage` laranja para apagões, `--seq-price` azul para preços), "sem dados" em
   cinza; status nunca carrega significado sozinho.

@@ -12,9 +12,10 @@ from conftest import PLACES_SCHEMA
 from observatorio.config import Settings
 from observatorio.db import connect
 from observatorio.itbi import geocode, geosampa
-from observatorio.itbi.geocode import TIERS, search_text, street_label, tier_query
+from observatorio.itbi.geocode import TIERS, search_text, tier_query
 from observatorio.itbi.geosampa import Lookups
 from observatorio.storage import copy_query
+from observatorio.text import street_label
 
 # Pontos do cadastro sintético (setor 001, quadra 001)
 P_LOTE = (-46.600, -23.500)  # lote 0001, R ALFA 10

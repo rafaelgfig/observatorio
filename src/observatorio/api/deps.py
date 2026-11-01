@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable, Mapping, Sequence
 from typing import Annotated
 
 from fastapi import Depends, HTTPException, Request, status
@@ -35,3 +36,22 @@ def require(db: Database, *names: str) -> None:
                 "Rode `uv run observatorio ingest all` e aguarde a recarga."
             ),
         )
+
+
+def run_query[T](
+    db: Database,
+    names: Sequence[str],
+    query: Callable[[], T],
+    errors: Mapping[type[Exception], int],
+) -> T:
+    """Exige os conjuntos ``names`` (503) e executa ``query``, convertendo erros de domínio.
+
+    ``errors`` mapeia classe de exceção → status HTTP (vale a 1ª que casar); a mensagem da
+    exceção vira o ``detail``.
+    """
+    require(db, *names)
+    try:
+        return query()
+    except tuple(errors) as exc:
+        code = next(code for kind, code in errors.items() if isinstance(exc, kind))
+        raise HTTPException(code, str(exc)) from exc

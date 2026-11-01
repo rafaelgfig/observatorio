@@ -5,8 +5,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import sys
-import types
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -18,6 +16,7 @@ import respx
 
 from observatorio.config import Settings
 from observatorio.downloads import Manifest
+from observatorio.itbi import geocode as geocode_module
 from observatorio.itbi import ingest, parse
 from observatorio.storage import VERSION_FILE
 
@@ -49,11 +48,10 @@ class FakeServer:
         return httpx.Response(200, content=self.content, headers={"ETag": etag})
 
 
-class FakeGeocode(types.ModuleType):
+class FakeGeocode:
     """Geocodificação simulada; ``failures`` > 0 faz as próximas chamadas falharem."""
 
     def __init__(self) -> None:
-        super().__init__(ingest.GEOCODE_MODULE)
         self.calls: list[bool] = []
         self.refreshes: list[bool] = []
         self.failures = 0
@@ -99,7 +97,7 @@ def parsed(monkeypatch: pytest.MonkeyPatch) -> list[Path]:
 @pytest.fixture(autouse=True)
 def geocode(monkeypatch: pytest.MonkeyPatch) -> FakeGeocode:
     fake = FakeGeocode()
-    monkeypatch.setitem(sys.modules, ingest.GEOCODE_MODULE, fake)
+    monkeypatch.setattr(geocode_module, "run", fake.run)
     return fake
 
 
@@ -291,22 +289,6 @@ def test_quarentena_vai_para_o_log_so_como_referencia(
 
     assert "JAN-2026:5" in caplog.text
     assert "itbi 2026: 3 linhas, 1 em quarentena" in caplog.text
-
-
-def test_sem_modulo_de_geocodificacao_avisa_e_segue(
-    cfg: Settings,
-    server: FakeServer,
-    parsed: list[Path],
-    monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    monkeypatch.setitem(sys.modules, ingest.GEOCODE_MODULE, None)
-
-    with caplog.at_level(logging.WARNING):
-        ingest.run(cfg)
-
-    assert "geocodificação indisponível" in caplog.text
-    assert (cfg.processed_dir / VERSION_FILE).exists()
 
 
 def test_abas_de_outro_ano_ou_repetidas() -> None:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from functools import lru_cache
 
 _SPACES = re.compile(r"\s+")
 # início de palavra: começo do texto ou depois de hífen/apóstrofo/pontuação de abertura
@@ -89,7 +90,13 @@ _LOWER_WORDS = {"de", "da", "do", "das", "dos", "e", "em", "na", "no", "nas", "n
 
 
 def strip_accents(text: str) -> str:
-    decomposed = unicodedata.normalize("NFKD", text)
+    """Remove acentos como o ``strip_accents`` do DuckDB (macro SQL ``norm_text``).
+
+    Decomposição canônica (NFD), não de compatibilidade (NFKD): ordinais e expoentes (``º``,
+    ``ª``, ``²``) não viram letras ou dígitos e saem como pontuação em :func:`search_key` — do
+    contrário ``"1º"`` viraria o termo ``"1o"``, que não casa com o ``"1"`` gravado pelo SQL.
+    """
+    decomposed = unicodedata.normalize("NFD", text)
     return "".join(c for c in decomposed if not unicodedata.combining(c))
 
 
@@ -101,7 +108,11 @@ def normalize(text: str | None) -> str:
 
 
 def search_key(text: str | None) -> str:
-    """Como :func:`normalize`, mas troca pontuação por espaço (``"d'oeste"`` → ``"d oeste"``)."""
+    """Como :func:`normalize`, mas troca pontuação por espaço (``"d'oeste"`` → ``"d oeste"``).
+
+    Mesmo resultado da macro SQL ``norm_text`` (``db.MACROS``), que grava a coluna ``norm`` da
+    busca: os termos digitados são normalizados aqui e comparados com ela.
+    """
     return _SPACES.sub(" ", _NON_ALNUM.sub(" ", normalize(text))).strip()
 
 
@@ -141,3 +152,8 @@ def expand_street(name: str | None) -> str:
     words = [TITLES.get(w.upper().rstrip("."), w) for w in clean.split()]
     rest = title_pt(" ".join(words), continuation=bool(kind))
     return f"{kind} {rest}".strip()
+
+
+# :func:`expand_street` com cache: o mesmo logradouro aparece em milhares de guias (tabela, CSV,
+# índice de busca do ITBI).
+street_label = lru_cache(maxsize=1 << 16)(expand_street)

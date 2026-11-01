@@ -189,19 +189,28 @@ def _where_numerador(filtro: FiltroAneel, ano: int, prefix: str = "") -> _Where:
     return _Where(" AND ".join(conds), params)
 
 
+def _recorte(filtro: FiltroAneel, ano: int) -> tuple[list[str], list[Any]]:
+    """Período, distribuidora e UF — recorte das tabelas com ``cnpj`` e ``uf`` (base, conjuntos)."""
+    conds, params = _periodo(filtro, ano)
+    if filtro.agente:
+        conds.append("cnpj = ?")
+        params.append(filtro.agente)
+    if filtro.uf:
+        conds.append("uf = ?")
+        params.append(filtro.uf)
+    return conds, params
+
+
 def _where_mun(filtro: FiltroAneel, ano: int, *, numerador: bool) -> _Where:
     """Filtros sobre ``mun_mes`` (numerador) ou ``mun_base`` (base)."""
     if numerador:
         base = _where_numerador(filtro, ano)
         conds, params = [base.sql], list(base.params)
+        if filtro.uf:
+            conds.append("uf = ?")
+            params.append(filtro.uf)
     else:
-        conds, params = _periodo(filtro, ano)
-        if filtro.agente:
-            conds.append("cnpj = ?")
-            params.append(filtro.agente)
-    if filtro.uf:
-        conds.append("uf = ?")
-        params.append(filtro.uf)
+        conds, params = _recorte(filtro, ano)
     if filtro.mun:
         conds.append("cod_mun = ?")
         params.append(int(filtro.mun))
@@ -509,13 +518,7 @@ def _oficial(db: Database, filtro: FiltroAneel, ano: int) -> dict[str, float | N
     """DEC/FEC oficiais do recorte: média mensal ponderada pela base, somada no período."""
     if not filtro.comparavel_oficial:
         return None
-    conds, params = _periodo(filtro, ano)
-    if filtro.agente:
-        conds.append("cnpj = ?")
-        params.append(filtro.agente)
-    if filtro.uf:
-        conds.append("uf = ?")
-        params.append(filtro.uf)
+    conds, params = _recorte(filtro, ano)
     row = db.fetch_one(
         f"""
         WITH m AS (
@@ -576,13 +579,7 @@ def _conjuntos(db: Database, filtro: FiltroAneel, ano: int, alvo: Escopo) -> lis
     ambos só nos meses sem lacuna da distribuidora."""
     if alvo.tipo == "brasil":
         return []
-    conds, params = _periodo(filtro, ano)
-    if filtro.agente:
-        conds.append("cnpj = ?")
-        params.append(filtro.agente)
-    if filtro.uf:
-        conds.append("uf = ?")
-        params.append(filtro.uf)
+    conds, params = _recorte(filtro, ano)
     if filtro.mun:
         conds.append(
             "conj IN (SELECT conj FROM aneel_conj_mun_pesos WHERE cod_mun = ? AND principal)"

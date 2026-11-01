@@ -37,7 +37,6 @@ from collections import OrderedDict
 from collections.abc import Hashable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
-from functools import lru_cache
 from pathlib import Path
 from typing import Annotated, Any, Final, Literal
 
@@ -55,7 +54,7 @@ from pydantic import (
 from observatorio.db import Database
 from observatorio.downloads import Manifest
 from observatorio.itbi.parse import TIPOS
-from observatorio.text import expand_street, title_pt
+from observatorio.text import street_label, title_pt
 
 type Tipo = Literal["apartamento", "casa", "terreno", "comercial", "garagem", "outros"]
 type Precisao = Literal["lote", "quadra", "qualquer"]
@@ -197,6 +196,12 @@ class AreaNomeada(BaseModel):
     @field_validator("id")
     @classmethod
     def _dois_digitos(cls, value: str) -> str:
+        return cls.normaliza_id(value)
+
+    @staticmethod
+    def normaliza_id(value: str) -> str:
+        """Código como gravado em ``areas``: dígitos com 2 casas (``"7"`` → ``"07"``), letras
+        em maiúsculas."""
         return value.zfill(2) if value.isdigit() else value.upper()
 
 
@@ -564,17 +569,11 @@ def _area_nomeada(
 # ------------------------------------------------------------------ exibição
 
 
-@lru_cache(maxsize=1 << 16)
-def nome_rua(logradouro: str) -> str:
-    """Nome do logradouro por extenso (``text.expand_street``), com cache."""
-    return expand_street(logradouro)
-
-
 def endereco(logradouro: str | None, numero: str | None) -> str | None:
     """``"R ISIDORO FARINA"``, ``"120"`` → ``"Rua Isidoro Farina, 120"``."""
     if not logradouro:
         return None
-    return f"{nome_rua(logradouro)}, {numero or 's/n'}"
+    return f"{street_label(logradouro)}, {numero or 's/n'}"
 
 
 def _r(valor: float | None, casas: int = 2) -> float | None:
@@ -850,7 +849,8 @@ def _partes_csv(db: Database, sql: str, params: list[Any]) -> Iterator[bytes]:
 
 def csv_lote(frame: pl.DataFrame) -> str:
     """Formata um lote (colunas de :data:`_LINHA_SQL`) como linhas CSV, sem cabeçalho."""
-    ruas = {str(nome): nome_rua(str(nome)) for nome in frame["logradouro"].unique().drop_nulls()}
+    nomes = frame["logradouro"].unique().drop_nulls()
+    ruas = {str(nome): street_label(str(nome)) for nome in nomes}
     rua = pl.col("logradouro").replace_strict(ruas, default=None, return_dtype=pl.String)
     numero = pl.col("numero_txt").fill_null("s/n")
     saida = frame.with_columns(

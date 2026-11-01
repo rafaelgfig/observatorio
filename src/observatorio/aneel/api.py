@@ -9,12 +9,12 @@ from collections.abc import Callable
 from datetime import date, datetime
 from typing import Annotated, Any, Literal
 
-from fastapi import APIRouter, HTTPException, Query, status
+from fastapi import APIRouter, Query, status
 from pydantic import BaseModel
 
 from observatorio.aneel import queries
 from observatorio.aneel.queries import FiltroAneel, Metrica, Ordem, TipoEscopo
-from observatorio.api.deps import DB, require
+from observatorio.api.deps import DB, run_query
 from observatorio.db import Database, Dataset
 
 DATASETS: list[Dataset] = [
@@ -162,15 +162,15 @@ class Interrupcao(BaseModel):
 # ------------------------------------------------------------------ rotas
 
 
+_ERROS: dict[type[Exception], int] = {
+    queries.AnoIndisponivelError: status.HTTP_422_UNPROCESSABLE_CONTENT,
+    queries.EscopoNaoEncontradoError: status.HTTP_404_NOT_FOUND,
+}
+
+
 def _run[T](db: Database, names: tuple[str, ...], query: Callable[[], T]) -> T:
     """Executa a consulta convertendo erros de domínio em respostas HTTP."""
-    require(db, *names)
-    try:
-        return query()
-    except queries.AnoIndisponivelError as exc:
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc)) from exc
-    except queries.EscopoNaoEncontradoError as exc:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+    return run_query(db, names, query, _ERROS)
 
 
 _MUNICIPAL = ("aneel_agente_mes", "aneel_mun_mes", "aneel_mun_base")

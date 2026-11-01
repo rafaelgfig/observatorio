@@ -30,16 +30,17 @@ export function el(tag, props = {}, children = []) {
 }
 
 /**
- * Minúsculas e sem acentos — mesma regra usada no servidor para buscas.
+ * Minúsculas, sem acentos e com pontuação trocada por espaço — a regra de `text.search_key` no
+ * servidor (NFD, como o `strip_accents` do DuckDB: `º`/`ª`/`²` viram pontuação), mas sem juntar
+ * nem aparar espaços, para que cada caractere continue mapeando para um trecho (destaque).
  * @param {string} text
  */
 export function normalizeText(text) {
-  return text.normalize("NFD").replace(/\p{Diacritic}/gu, "").toLowerCase();
+  return text.normalize("NFD").replace(/\p{M}/gu, "").toLowerCase().replace(/[^0-9a-z]/g, " ");
 }
 
 const nf0 = new Intl.NumberFormat("pt-BR", { maximumFractionDigits: 0 });
 const nf1 = new Intl.NumberFormat("pt-BR", { maximumFractionDigits: 1, minimumFractionDigits: 1 });
-const nf2 = new Intl.NumberFormat("pt-BR", { maximumFractionDigits: 2, minimumFractionDigits: 2 });
 const compact = new Intl.NumberFormat("pt-BR", { notation: "compact", maximumFractionDigits: 1 });
 const brl = new Intl.NumberFormat("pt-BR", { style: "currency", currency: "BRL", maximumFractionDigits: 0 });
 const brlCompact = new Intl.NumberFormat("pt-BR", {
@@ -54,8 +55,6 @@ export const fmt = {
   int: (v) => (v == null || Number.isNaN(v) ? "—" : nf0.format(v)),
   /** @param {number | null | undefined} v */
   dec1: (v) => (v == null || Number.isNaN(v) ? "—" : nf1.format(v)),
-  /** @param {number | null | undefined} v */
-  dec2: (v) => (v == null || Number.isNaN(v) ? "—" : nf2.format(v)),
   /** @param {number | null | undefined} v */
   compact: (v) => (v == null || Number.isNaN(v) ? "—" : compact.format(v)),
   /** @param {number | null | undefined} v */
@@ -79,20 +78,20 @@ export const fmt = {
 export const MONTHS = ["jan", "fev", "mar", "abr", "mai", "jun", "jul", "ago", "set", "out", "nov", "dez"];
 
 /**
+ * Adia `fn` até `ms` sem novas chamadas; `cancel()` descarta a chamada pendente.
  * @template {(...args: any[]) => void} F
  * @param {F} fn
  * @param {number} ms
- * @returns {F}
+ * @returns {F & { cancel: () => void }}
  */
 export function debounce(fn, ms) {
   /** @type {ReturnType<typeof setTimeout> | undefined} */
   let timer;
-  return /** @type {F} */ (
-    (...args) => {
-      clearTimeout(timer);
-      timer = setTimeout(() => fn(...args), ms);
-    }
-  );
+  const debounced = (/** @type {any[]} */ ...args) => {
+    clearTimeout(timer);
+    timer = setTimeout(() => fn(...args), ms);
+  };
+  return /** @type {F & { cancel: () => void }} */ (Object.assign(debounced, { cancel: () => clearTimeout(timer) }));
 }
 
 /** Ícones SVG inline (traço herdando currentColor). */
@@ -115,7 +114,6 @@ export const icons = {
     '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M12 4v11M7 10l5 5 5-5M5 20h14"/></svg>',
   chevron:
     '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>',
-  bolt: '<svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M13 2 4 14h7l-1 8 9-12h-7z"/></svg>',
 };
 
 /**
@@ -169,4 +167,37 @@ export function statusRegion() {
 export function errorNotice(error, prefix = "") {
   const message = error instanceof Error ? error.message : String(error);
   return el("div", { className: "notice notice--error", role: "alert", textContent: `${prefix}${message}` });
+}
+
+/**
+ * Troca o conteúdo de `target` pelo aviso de `error`.
+ * @param {HTMLElement} target
+ * @param {unknown} error
+ */
+export function showError(target, error) {
+  target.replaceChildren(errorNotice(error));
+}
+
+/**
+ * Controle de formulário com rótulo visível acima.
+ * @param {string} label
+ * @param {HTMLElement} control
+ */
+export function field(label, control) {
+  return el("div", { className: "field" }, [el("span", { className: "field-label", textContent: label }), control]);
+}
+
+/**
+ * Cartão de indicador (KPI): rótulo, valor e nota opcional; `hero` = o destaque do painel.
+ * @param {string} label
+ * @param {string} value
+ * @param {string | null} [note]
+ * @param {boolean} [hero]
+ */
+export function kpiTile(label, value, note, hero = false) {
+  return el("div", { className: `tile${hero ? " tile--hero" : ""}` }, [
+    el("div", { className: "tile-label", textContent: label }),
+    el("div", { className: "tile-value", textContent: value }),
+    note ? el("div", { className: "tile-note", textContent: note }) : null,
+  ]);
 }

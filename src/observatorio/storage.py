@@ -17,7 +17,7 @@ from typing import Literal
 
 import duckdb
 
-from observatorio.db import Params
+from observatorio.db import Params, sql_path
 
 type Format = Literal["parquet", "geojson"]
 
@@ -69,8 +69,7 @@ def copy_query(
 ) -> Path:
     """Executa ``COPY (query) TO dest`` de forma atômica."""
     with atomic_path(dest) as tmp:
-        target = str(tmp).replace("\\", "/").replace("'", "''")
-        con.execute(f"COPY ({query}) TO '{target}' ({_COPY_OPTIONS[fmt]})", params)
+        con.execute(f"COPY ({query}) TO {sql_path(tmp)} ({_COPY_OPTIONS[fmt]})", params)
     return dest
 
 
@@ -80,11 +79,6 @@ def gzip_copy(src: Path, level: int = 9) -> Path:
     with atomic_path(dest) as tmp, src.open("rb") as fin, gzip.open(tmp, "wb", level) as fout:
         shutil.copyfileobj(fin, fout, 1 << 20)
     return dest
-
-
-def sql_path(path: Path) -> str:
-    """Caminho como literal SQL (barras normais, aspas escapadas)."""
-    return "'" + str(path).replace("\\", "/").replace("'", "''") + "'"
 
 
 VERSION_FILE = ".version"

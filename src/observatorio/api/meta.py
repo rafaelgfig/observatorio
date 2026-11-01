@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import Any
 
 from fastapi import APIRouter
@@ -12,6 +13,10 @@ from observatorio.downloads import Manifest
 
 router = APIRouter(prefix="/api", tags=["meta"])
 
+# Metadados de processamento (``Manifest.mark_processed``) que a API publica; o resto do
+# ``extra`` do manifesto (impressões digitais, hashes, versões de regras) é interno.
+EXTRAS_PUBLICOS = ("linhas", "meses", "snapshot", "feicoes")
+
 
 @router.get("/health")
 def health(db: DB) -> dict[str, Any]:
@@ -20,18 +25,21 @@ def health(db: DB) -> dict[str, Any]:
 
 @router.get("/meta")
 def meta(db: DB, settings: AppSettings) -> dict[str, Any]:
-    """Quais fontes foram baixadas/processadas e quando."""
-    manifest: dict[str, Any] = {}
-    for path in sorted(settings.manifest_dir.glob("*.json")):
-        manifest.update(Manifest(path).as_dict())
-    fontes = {
-        key: {
-            "url": (entry.get("download") or {}).get("url"),
-            "baixado_em": (entry.get("download") or {}).get("fetched_at"),
+    """Quais fontes foram baixadas/processadas e quando (contrato em ``docs/arquitetura.md``)."""
+    fontes: dict[str, Any] = {}
+    for key, entry in Manifest.merged(settings.manifest_dir).items():
+        download = entry.get("download") or {}
+        extra = entry.get("extra") or {}
+        fontes[key] = {
+            **{nome: extra[nome] for nome in EXTRAS_PUBLICOS if nome in extra},
+            "url": download.get("url"),
+            "baixado_em": download.get("fetched_at"),
             "processado": entry.get("processed_sha256") is not None
-            and entry.get("processed_sha256") == (entry.get("download") or {}).get("sha256"),
-            **entry.get("extra", {}),
+            and entry.get("processed_sha256") == download.get("sha256"),
         }
-        for key, entry in manifest.items()
-    }
-    return {"dados": sorted(db.available), "fontes": fontes, "carregado_em": db.loaded_at}
+    carregado = (
+        datetime.fromtimestamp(db.loaded_at, UTC).isoformat(timespec="seconds")
+        if db.loaded_at
+        else None
+    )
+    return {"dados": sorted(db.available), "fontes": fontes, "carregado_em": carregado}

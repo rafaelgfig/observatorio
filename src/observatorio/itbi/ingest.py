@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
-import importlib
 import logging
 import time
 from dataclasses import dataclass, field
@@ -36,13 +35,11 @@ import polars as pl
 
 from observatorio.config import Settings
 from observatorio.downloads import Manifest, fetch, http_client
-from observatorio.itbi import parse
+from observatorio.itbi import geocode, parse
 from observatorio.itbi.sources import Source, discover
 from observatorio.storage import atomic_path, touch_version
 
 log = logging.getLogger(__name__)
-
-GEOCODE_MODULE = "observatorio.itbi.geocode"
 
 
 @dataclass(slots=True)
@@ -96,7 +93,7 @@ def run(settings: Settings, *, force: bool = False, refresh_geosampa: bool = Fal
             time.perf_counter() - started,
             "com mudanças" if changed else "sem mudanças",
         )
-        _run_geocode(settings, force=force, refresh_geosampa=refresh_geosampa)
+        geocode.run(settings, force=force, refresh_geosampa=refresh_geosampa)
     finally:
         # Mesmo que um ano seguinte ou a geocodificação falhe, o que mudou já está no disco.
         if changed or force:
@@ -218,15 +215,3 @@ def _log_report(report: YearReport, seconds: float) -> None:
         report.removed or "-",
         seconds,
     )
-
-
-def _run_geocode(settings: Settings, *, force: bool, refresh_geosampa: bool) -> None:
-    """Chama a geocodificação, se o módulo já existir nesta instalação."""
-    try:
-        geocode = importlib.import_module(GEOCODE_MODULE)
-    except ModuleNotFoundError as exc:
-        if exc.name != GEOCODE_MODULE:
-            raise
-        log.warning("itbi: módulo de geocodificação indisponível; etapa ignorada")
-        return
-    geocode.run(settings, force=force, refresh_geosampa=refresh_geosampa)

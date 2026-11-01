@@ -102,6 +102,9 @@ def test_variantes_conhecidas_do_cabecalho() -> None:
     header[26] = "ACC (IPTU)"  # 2019-2024: rótulo duplicado na coluna da descrição do padrão
     header[2] = "  NUMERO "  # sem acento, caixa e espaços diferentes
     header[0] = "Nº do Cadastro (SQL)"
+    # "m²" no lugar de "m2" (o search_key, NFD como o SQL, não troca "²" por "2")
+    header[19] = "Área do Terreno (m²)"
+    header[22] = "Área Construída (m²)"
 
     result = normalize_sheet(frame([header, row()]), "MAI-2021")
     out = result.frame.row(0, named=True)

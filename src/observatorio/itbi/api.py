@@ -15,7 +15,7 @@ from fastapi import APIRouter, Body, HTTPException, Path, Query, Response, statu
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from observatorio.api.deps import DB, AppSettings, require
+from observatorio.api.deps import DB, AppSettings, require, run_query
 from observatorio.db import Database, Dataset
 from observatorio.itbi import queries
 from observatorio.itbi.queries import (
@@ -154,15 +154,15 @@ class AreaItbi(BaseModel):
 # ------------------------------------------------------------------ rotas
 
 
+_ERROS: dict[type[Exception], int] = {
+    queries.ConsultaInvalidaError: status.HTTP_422_UNPROCESSABLE_CONTENT,
+    queries.AreaNaoEncontradaError: status.HTTP_404_NOT_FOUND,
+}
+
+
 def _run[T](db: Database, names: tuple[str, ...], query: Callable[[], T]) -> T:
     """Executa a consulta convertendo erros de domínio em respostas HTTP."""
-    require(db, *names)
-    try:
-        return query()
-    except queries.ConsultaInvalidaError as exc:
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc)) from exc
-    except queries.AreaNaoEncontradaError as exc:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+    return run_query(db, names, query, _ERROS)
 
 
 def _dados(consulta: ConsultaItbi) -> tuple[str, ...]:
@@ -243,7 +243,7 @@ def area(
     id: Annotated[str, Path(min_length=1, max_length=8, pattern=r"^[0-9A-Za-z]+$")],
 ) -> dict[str, Any]:
     """Polígono (GeoJSON) e caixa ``[w, s, e, n]`` de um distrito ou subprefeitura."""
-    codigo = id.zfill(2) if id.isdigit() else id.upper()
+    codigo = AreaNomeada.normaliza_id(id)
     row = _run(db, ("itbi_areas",), lambda: queries.area(db, tipo, codigo))
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f"{tipo} {id} não encontrado")

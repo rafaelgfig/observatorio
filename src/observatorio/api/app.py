@@ -23,7 +23,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from observatorio import __version__
 from observatorio.aneel import api as aneel_api
 from observatorio.api import meta, search
-from observatorio.config import Settings, get_settings
+from observatorio.config import Settings, configure_logging, get_settings
 from observatorio.db import Database, Dataset
 from observatorio.itbi import api as itbi_api
 from observatorio.storage import VERSION_FILE
@@ -168,6 +168,10 @@ async def _validation_error(request: Request, exc: Exception) -> JSONResponse:
 
 
 def create_app(settings: Settings | None = None, *, watch: bool = True) -> FastAPI:
+    if not logging.getLogger().handlers:
+        # ``serve --reload`` (ou ``uvicorn --factory``) chama a fábrica num processo sem o log
+        # da CLI: sem isso as mensagens ``observatorio.*`` (INFO) sumiriam
+        configure_logging()
     settings = settings or get_settings()
 
     @asynccontextmanager

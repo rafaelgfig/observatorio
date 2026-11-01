@@ -13,14 +13,13 @@ pedidos com ``--year``.
 
 from __future__ import annotations
 
-import hashlib
 import logging
 import time
 from pathlib import Path
 
 from observatorio.aneel import sources, transform
 from observatorio.config import Settings
-from observatorio.downloads import Manifest, fetch, http_client
+from observatorio.downloads import Manifest, fetch, file_sha256, http_client
 from observatorio.storage import touch_version
 
 log = logging.getLogger(__name__)
@@ -58,7 +57,7 @@ def run(settings: Settings, *, force: bool = False) -> None:
             for res in found.all()
         }
 
-    geo = _sha256(municipios)
+    geo, _ = file_sha256(municipios)
     motivos = _rebuild_reasons(manifest, found, out_dir, geo, force=force)
     if not motivos:
         log.info("aneel: fontes sem mudanças e saídas presentes (use --force para refazer)")
@@ -125,10 +124,6 @@ def _older_years(out_dir: Path, raw_dir: Path, *, skip: set[int]) -> dict[int, P
                 year,
             )
     return found
-
-
-def _sha256(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def _sizes(out_dir: Path) -> str:

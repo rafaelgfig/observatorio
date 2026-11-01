@@ -10,21 +10,16 @@ import { createAutocomplete } from "../components/autocomplete.js";
 import { columnChart, hideTooltip, horizontalBars, lineChart, showTooltip } from "../components/charts.js";
 import { createLegend, cssRamp, cssVar, stepExpression } from "../components/legend.js";
 import { createTable } from "../components/table.js";
-import { debounce, el, errorNotice, fmt, icon, MONTHS, preserveFocus, statusRegion } from "../dom.js";
+import { debounce, el, errorNotice, field, fmt, icon, kpiTile, MONTHS, preserveFocus, showError, statusRegion } from "../dom.js";
 import { SAO_PAULO_BOUNDS } from "../map.js";
 
 /** @typedef {import("../main.js").ViewContext} ViewContext */
 
-const TIPOS = [
-  { id: "apartamento", nome: "Apartamento" },
-  { id: "casa", nome: "Casa" },
-  { id: "terreno", nome: "Terreno" },
-  { id: "comercial", nome: "Comercial" },
-  { id: "garagem", nome: "Garagem" },
-  { id: "outros", nome: "Outros" },
-];
-const TIPO_NOME = Object.fromEntries(TIPOS.map((t) => [t.id, t.nome]));
-const DEFAULT_TIPOS = TIPOS.filter((t) => t.id !== "garagem").map((t) => t.id);
+/** Tipos de imóvel aceitos pela API (`queries.Tipo`); os nomes vêm de `/itbi/meta` (`tipos`). */
+const TIPO_IDS = ["apartamento", "casa", "terreno", "comercial", "garagem", "outros"];
+const DEFAULT_TIPOS = TIPO_IDS.filter((t) => t !== "garagem");
+/** @type {Record<string, string>} id → nome exibido (de `/itbi/meta`) */
+let tipoNome = {};
 const PRECISAO_NOME = { lote: "lote", condominio: "condomínio", quadra: "quadra", setor: "setor" };
 const POINT_LIMIT = 20000;
 const PAGE_SIZE = 50;
@@ -38,13 +33,14 @@ const AREA_ID = /^[0-9A-Za-z]{1,8}$/;
 const TILE_MIN_ZOOM = 9;
 
 /**
- * Calibração do heatmap (camada `itbi_agg`, uma célula de 1/32 do tile): p90 de `n` por zoom na
- * cidade inteira, medido nos dados reais com os filtros padrão (2 anos, compra e venda, sem
- * garagem, precisão até a quadra → HEAT_REF_TOTAL guias). O peso é √(n / p90), limitado a 1, com
- * o p90 escalado pelo total do filtro atual — sem isso o centro satura em qualquer período.
+ * Mosaico de densidade (camada `itbi_agg`, uma célula de 1/32 do tile): cada célula vira um
+ * círculo sem sobreposição, colorido por ln(1 + n) relativo ao p90 de `n` naquele zoom — medido
+ * na cidade inteira com os filtros padrão (2 anos, compra e venda, sem garagem, precisão até a
+ * quadra → HEAT_REF_TOTAL guias) e escalado pelo total do filtro atual. Um heatmap somaria as
+ * células vizinhas e saturaria a cidade inteira numa mancha só.
  */
 const HEAT_REF_TOTAL = 374_366;
-const HEAT_RADIUS = 22; // px no zoom inteiro (~1,4 × o vão de 16 px entre células)
+const CELL_RADIUS = 7; // px no zoom inteiro: vão de 16 px entre células, 2 px de respiro
 const HEAT_P90 = /** @type {[number, number][]} */ ([
   [9, 4200],
   [10, 1200],
@@ -209,10 +205,11 @@ async function start(params) {
   try {
     meta = await api("/itbi/meta", { signal: scoped() });
   } catch (error) {
-    if (!isAbort(error) && gen === generation) showError(error);
+    if (!isAbort(error) && gen === generation) showError(ui.notice, error);
     return;
   }
   if (gen !== generation) return; // a view foi desmontada (ou remontada) enquanto o /meta carregava
+  tipoNome = Object.fromEntries((meta.tipos ?? []).map((/** @type {any} */ t) => [t.id, t.nome]));
   const min = String(meta.periodo?.min ?? "").slice(0, 7);
   state.dataFim = defaultEnd();
   state.dataIni = shiftMonth(state.dataFim, -23);
@@ -243,7 +240,7 @@ async function applyParams(p) {
   if (p.get("t")) {
     const tipos = String(p.get("t"))
       .split(",")
-      .filter((t, i, all) => t in TIPO_NOME && all.indexOf(t) === i);
+      .filter((t, i, all) => TIPO_IDS.includes(t) && all.indexOf(t) === i);
     if (tipos.length) state.tipos = tipos;
   }
   if (p.get("nat") === "todas") state.natureza = "todas";
@@ -379,7 +376,7 @@ function consulta() {
     area: state.regiao?.payload ?? null,
     data_ini: state.dataIni ? `${state.dataIni}-01` : null,
     data_fim: state.dataFim ? monthEnd(state.dataFim) : null,
-    tipos: sameSet(state.tipos, TIPOS.map((t) => t.id)) ? null : state.tipos,
+    tipos: sameSet(state.tipos, TIPO_IDS) ? null : state.tipos,
     naturezas: state.natureza === "compra" ? [1] : null,
     valor_min: state.valorMin != null ? state.valorMin * 1000 : null,
     valor_max: state.valorMax != null ? state.valorMax * 1000 : null,
@@ -669,15 +666,15 @@ function buildFilters() {
   const tipoChips = el(
     "div",
     { className: "chips", role: "group", "aria-label": "Tipo de imóvel" },
-    TIPOS.map((t) => {
-      const box = el("input", { type: "checkbox", checked: state.tipos.includes(t.id), dataset: { focusKey: `tipo-${t.id}` } });
+    TIPO_IDS.map((id) => {
+      const box = el("input", { type: "checkbox", checked: state.tipos.includes(id), dataset: { focusKey: `tipo-${id}` } });
       box.addEventListener("change", () => {
-        state.tipos = box.checked ? [...state.tipos, t.id] : state.tipos.filter((x) => x !== t.id);
-        if (!state.tipos.length) state.tipos = [t.id];
+        state.tipos = box.checked ? [...state.tipos, id] : state.tipos.filter((x) => x !== id);
+        if (!state.tipos.length) state.tipos = [id];
         renderFilters();
         refresh();
       });
-      return el("label", { className: "chip" }, [box, el("span", { textContent: t.nome })]);
+      return el("label", { className: "chip" }, [box, el("span", { textContent: tipoNome[id] ?? id })]);
     }),
   );
 
@@ -726,19 +723,6 @@ function buildFilters() {
       field("Área máx. (m²)", numberInput(state.areaMax, "máx.", "Área máxima em m²", (v) => (state.areaMax = v))),
     ]),
   );
-}
-
-/**
- * @param {string} label
- * @param {HTMLElement} control
- */
-function field(label, control) {
-  return el("div", { className: "field" }, [el("span", { className: "field-label", textContent: label }), control]);
-}
-
-/** @param {unknown} error */
-function showError(error) {
-  ui.notice.replaceChildren(errorNotice(error));
 }
 
 // ------------------------------------------------------------------ região
@@ -804,7 +788,7 @@ async function setDistrict(tipo, id, fit) {
     drawRegiao();
     if (fit && area.bbox) ctx?.fit(area.bbox, 15);
   } catch (error) {
-    if (!isAbort(error) && gen === generation) showError(error);
+    if (!isAbort(error) && gen === generation) showError(ui.notice, error);
   }
 }
 
@@ -953,7 +937,7 @@ async function loadSummary() {
     ui.notice.replaceChildren();
     renderSummary(data);
   } catch (error) {
-    if (!isAbort(error) && gen === generation) showError(error);
+    if (!isAbort(error) && gen === generation) showError(ui.notice, error);
   } finally {
     if (gen === generation) busy.forEach((n) => n.classList.remove("is-loading"));
   }
@@ -1032,12 +1016,12 @@ function renderSummary(data) {
   const located = (p.lote ?? 0) + (p.quadra ?? 0) + (p.aproximado ?? 0);
   const exact = total ? ((p.lote ?? 0) / total) * 100 : null;
   ui.kpis.replaceChildren(
-    tile("Transações", fmt.int(total), state.regiao ? state.regiao.label : "cidade inteira", true),
-    tile("Valor mediano", fmt.brlCompact(data.valor_mediano)),
-    tile("R$/m² mediano", fmt.brl(data.rs_m2_mediano)),
-    tile("Área mediana", data.area_mediana == null ? "—" : `${fmt.int(data.area_mediana)} m²`),
-    tile("Volume total", total ? fmt.brlCompact(data.valor_total) : "—"),
-    tile(
+    kpiTile("Transações", fmt.int(total), state.regiao ? state.regiao.label : "cidade inteira", true),
+    kpiTile("Valor mediano", fmt.brlCompact(data.valor_mediano)),
+    kpiTile("R$/m² mediano", fmt.brl(data.rs_m2_mediano)),
+    kpiTile("Área mediana", data.area_mediana == null ? "—" : `${fmt.int(data.area_mediana)} m²`),
+    kpiTile("Volume total", total ? fmt.brlCompact(data.valor_total) : "—"),
+    kpiTile(
       "Localização exata",
       exact == null ? "—" : `${fmt.int(exact)}%`,
       !total ? null : located < total ? `${fmt.int(total - located)} sem coordenada` : "no lote ou condomínio",
@@ -1071,7 +1055,7 @@ function renderSummary(data) {
   horizontalBars(
     ui.tipos,
     (data.por_tipo ?? []).map((/** @type {any} */ t) => ({
-      label: TIPO_NOME[t.tipo] ?? t.tipo,
+      label: tipoNome[t.tipo] ?? t.tipo,
       value: t.n,
       detail: [`Mediana: ${fmt.brlCompact(t.valor_mediano)}`, t.rs_m2_mediano == null ? null : `${fmt.brl(t.rs_m2_mediano)}/m²`]
         .filter(Boolean)
@@ -1080,30 +1064,12 @@ function renderSummary(data) {
     (v) => fmt.int(v),
   );
 
-  // o heatmap (sem região) usa os mesmos filtros de período/tipo/natureza/precisão dos tiles;
-  // com filtro de valor ou área o total não corresponde aos tiles e a escala fica a do período
+  // o heatmap (sem região) usa os mesmos filtros do resumo (`tileUrl`): a escala segue o total
   if (!state.regiao) {
-    heatScale = hasValueFilters() ? monthsBetween(state.dataIni, state.dataFim) / 24 : total / HEAT_REF_TOTAL;
+    heatScale = total / HEAT_REF_TOTAL;
     paintHeat();
     renderLegend();
   }
-}
-
-/** Filtros que a API de tiles não aplica (o mapa sem região os ignora). */
-function hasValueFilters() {
-  return [state.valorMin, state.valorMax, state.areaMin, state.areaMax].some((v) => v != null);
-}
-
-/**
- * Nº de meses de `ini` a `fim` (inclusive), ambos YYYY-MM.
- * @param {string} ini
- * @param {string} fim
- */
-function monthsBetween(ini, fim) {
-  const [y0, m0] = ini.split("-").map(Number);
-  const [y1, m1] = fim.split("-").map(Number);
-  const n = (y1 - y0) * 12 + (m1 - m0) + 1;
-  return Number.isFinite(n) && n > 0 ? n : 24;
 }
 
 /**
@@ -1133,20 +1099,6 @@ function monthLabel(y, m, count) {
   if (count <= 36) return m === 1 ? String(y) : m % 3 === 1 ? MONTHS[m - 1] : "";
   if (count <= 96) return m === 1 ? String(y) : "";
   return m === 1 && y % 2 === 0 ? String(y) : "";
-}
-
-/**
- * @param {string} label
- * @param {string} value
- * @param {string | null} [note]
- * @param {boolean} [hero]
- */
-function tile(label, value, note, hero = false) {
-  return el("div", { className: `tile${hero ? " tile--hero" : ""}` }, [
-    el("div", { className: "tile-label", textContent: label }),
-    el("div", { className: "tile-value", textContent: value }),
-    note ? el("div", { className: "tile-note", textContent: note }) : null,
-  ]);
 }
 
 /**
@@ -1191,7 +1143,7 @@ async function exportCsv(button) {
       );
     }
   } catch (error) {
-    showError(error);
+    showError(ui.notice, error);
   } finally {
     button.disabled = false;
     button.removeAttribute("aria-busy");
@@ -1226,7 +1178,7 @@ function buildDrawer(host) {
       { key: "data", label: "Data", sortKey: "data", render: (r) => fmt.date(r.data) },
       { key: "endereco", label: "Endereço" },
       { key: "complemento", label: "Compl.", render: (r) => r.complemento ?? "" },
-      { key: "tipo", label: "Tipo", render: (r) => `${TIPO_NOME[r.tipo] ?? r.tipo ?? ""}${r.na_planta ? " (na planta)" : ""}` },
+      { key: "tipo", label: "Tipo", render: (r) => `${tipoNome[r.tipo] ?? r.tipo ?? ""}${r.na_planta ? " (na planta)" : ""}` },
       // mesma área da ordenação `area` da API: construída, ou a do terreno para terrenos
       { key: "area", label: "Área (m²)", num: true, sortKey: "area", render: (r) => formatArea(r.tipo === "terreno" ? r.area_terreno : r.area_construida) },
       { key: "valor", label: "Valor", num: true, sortKey: "valor", render: (r) => fmt.brl(r.valor) },
@@ -1264,7 +1216,7 @@ const SRC_POINTS = "itbi-points";
 const SRC_AREA = "itbi-area";
 const LAYERS = ["itbi-heat", "itbi-tile-points", "itbi-points", "itbi-area-fill", "itbi-area-line"];
 
-/** URL dos tiles com os filtros que a API de tiles aceita (`FiltroTile`). */
+/** URL dos tiles com os filtros da consulta, exceto a área (`FiltroTile`). */
 function tileUrl() {
   const c = consulta();
   const query = toQuery({
@@ -1272,6 +1224,12 @@ function tileUrl() {
     data_fim: c.data_fim,
     tipo: c.tipos ?? undefined,
     natureza: c.naturezas ?? undefined,
+    valor_min: c.valor_min,
+    valor_max: c.valor_max,
+    area_min: c.area_min,
+    area_max: c.area_max,
+    logradouro: c.logradouro,
+    cep: c.cep,
     precisao: c.precisao === "quadra" ? undefined : c.precisao,
   });
   return `${location.origin}/api/itbi/tiles/{z}/{x}/{y}.mvt${query}`;
@@ -1292,16 +1250,14 @@ function addLayers() {
     map.addLayer(
       {
         id: "itbi-heat",
-        type: "heatmap",
+        type: "circle",
         source: SRC_TILES,
         "source-layer": "itbi_agg",
         maxzoom: 14,
         paint: {
-          "heatmap-weight": /** @type {any} */ (heatWeight()),
-          // com raio = 1,4 × o vão, célula no p90 → densidade ~0,9; mediana → ~0,2
-          "heatmap-intensity": 1.8,
-          "heatmap-radius": /** @type {any} */ (heatRadius()),
-          "heatmap-opacity": 0.85,
+          "circle-radius": /** @type {any} */ (cellRadius()),
+          "circle-opacity": 0.9,
+          "circle-blur": 0.15,
         },
       },
       before,
@@ -1361,23 +1317,6 @@ function repaint() {
   const ramp = cssRamp("--seq-price");
   const surface = cssVar("--surface-1");
   const accent = cssVar("--accent");
-  map.setPaintProperty("itbi-heat", "heatmap-color", [
-    "interpolate",
-    ["linear"],
-    ["heatmap-density"],
-    0,
-    transparent(ramp[1]), // não "rgba(0,0,0,0)": interpolar a partir do preto acinzenta a borda no tema claro
-    0.15,
-    ramp[1],
-    0.35,
-    ramp[3],
-    0.6,
-    ramp[4],
-    0.85,
-    ramp[5],
-    1,
-    ramp[6],
-  ]);
   map.setPaintProperty("itbi-tile-points", "circle-color", ramp[4]);
   map.setPaintProperty("itbi-tile-points", "circle-stroke-color", surface);
   map.setPaintProperty("itbi-area-fill", "fill-color", accent);
@@ -1387,40 +1326,54 @@ function repaint() {
   paintPoints();
 }
 
-/** `#rrggbb` → a mesma cor com alfa 0 (fallback: transparente). */
-function transparent(/** @type {string | undefined} */ hex) {
-  const m = /^#([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i.exec((hex ?? "").trim());
-  return m ? `rgba(${parseInt(m[1], 16)},${parseInt(m[2], 16)},${parseInt(m[3], 16)},0)` : "rgba(0,0,0,0)";
-}
-
 /**
- * Peso de cada célula de `itbi_agg`: √(n / p90 do zoom), limitado a 1. `step` no zoom acompanha
- * a troca de tiles (o vector tile de zoom z vale até z + 1).
+ * Cor de cada célula de `itbi_agg`: ln(1 + n) / ln(1 + p90 do zoom × escala do filtro), na rampa
+ * sequencial. `step` no zoom acompanha a troca de tiles (o vector tile de zoom z vale até z + 1).
  */
-function heatWeight() {
+function cellColor() {
+  const ramp = cssRamp("--seq-price");
   const k = Math.max(heatScale, 0.02);
-  const weight = (/** @type {number} */ p90) => ["min", 1, ["/", ["get", "n"], p90 * k]];
+  const color = (/** @type {number} */ p90) => [
+    "interpolate",
+    ["linear"],
+    ["/", ["ln", ["+", 1, ["get", "n"]]], Math.log(1 + p90 * k)],
+    0,
+    ramp[0],
+    0.25,
+    ramp[1],
+    0.45,
+    ramp[2],
+    0.6,
+    ramp[3],
+    0.75,
+    ramp[4],
+    0.9,
+    ramp[5],
+    1,
+    ramp[6],
+  ];
   /** @type {unknown[]} */
-  const expr = ["step", ["zoom"], weight(HEAT_P90[0][1])];
-  for (const [z, p90] of HEAT_P90.slice(1)) expr.push(z, weight(p90));
+  const expr = ["step", ["zoom"], color(HEAT_P90[0][1])];
+  for (const [z, p90] of HEAT_P90.slice(1)) expr.push(z, color(p90));
   return expr;
 }
 
 /**
  * Raio proporcional ao vão da grade: 32 células por tile de 512 px = 16 px no zoom inteiro,
- * dobrando até o próximo (quando o tile troca). Raio fixo faria a densidade variar 4× dentro
- * de cada nível de zoom.
+ * dobrando até o próximo (quando o tile troca) — as células nunca se sobrepõem.
  */
-function heatRadius() {
+function cellRadius() {
   /** @type {unknown[]} */
   const expr = ["interpolate", ["exponential", 2], ["zoom"]];
-  for (let z = HEAT_P90[0][0]; z <= HEAT_P90[HEAT_P90.length - 1][0]; z++) expr.push(z, HEAT_RADIUS, z + 0.999, HEAT_RADIUS * 2);
+  for (let z = HEAT_P90[0][0]; z <= HEAT_P90[HEAT_P90.length - 1][0]; z++) {
+    expr.push(z, CELL_RADIUS, z + 0.999, CELL_RADIUS * 2);
+  }
   return expr;
 }
 
 function paintHeat() {
   if (!ctx?.map.getLayer("itbi-heat")) return;
-  ctx.map.setPaintProperty("itbi-heat", "heatmap-weight", /** @type {any} */ (heatWeight()));
+  ctx.map.setPaintProperty("itbi-heat", "circle-color", /** @type {any} */ (cellColor()));
 }
 
 function paintPoints() {
@@ -1510,17 +1463,13 @@ function renderLegend() {
   } else if (!state.regiao) {
     const longe = Boolean(ctx && ctx.map.getZoom() < TILE_MIN_ZOOM);
     legend.render({
-      title: "Densidade de transações",
-      colors: ramp.slice(1),
+      title: "Transações por célula (escala log.)",
+      colors: ramp,
       breaks: [],
       format: () => "",
       labels: ["menos", "mais"],
       nodataLabel: "Desenhe uma região para ver cada venda",
-      note: longe
-        ? "Aproxime o mapa para ver a densidade"
-        : hasValueFilters()
-          ? "O mapa não aplica os filtros de valor e área"
-          : undefined,
+      note: longe ? "Aproxime o mapa para ver a densidade" : undefined,
     });
   } else {
     legend.hide();
@@ -1554,7 +1503,7 @@ async function openPopup(id, lngLat, count = 1) {
       ["Área construída", areaDoLote ? "— (IPTU do lote)" : t.area_construida_m2 ? `${fmt.int(t.area_construida_m2)} m²` : "—"],
       ["Área do terreno", t.area_terreno_m2 ? `${fmt.int(t.area_terreno_m2)} m²` : "—"],
       ["R$/m²", fmt.brl(t.rs_m2)],
-      ["Tipo", `${TIPO_NOME[t.tipo] ?? t.tipo ?? "—"}${t.na_planta ? " (na planta)" : ""}`],
+      ["Tipo", `${tipoNome[t.tipo] ?? t.tipo ?? "—"}${t.na_planta ? " (na planta)" : ""}`],
       ["Uso / padrão", [t.uso, t.padrao].filter(Boolean).join(" · ") || "—"],
       ["Construção", t.acc_ano ? String(t.acc_ano) : "—"],
       ["Natureza", t.natureza ?? "—"],
@@ -1621,7 +1570,7 @@ function bindMapEvents(context) {
     const n = Number(p.n ?? 1);
     const m2 = p.m2 != null ? `${fmt.brl(p.m2)}/m²` : null;
     const extra = n > 1 ? `Mais recente de ${fmt.int(n)} no ponto${m2 ? ` · mediana ${m2}` : ""}` : m2;
-    showTooltip(ev.originalEvent.clientX, ev.originalEvent.clientY, fmt.brl(p.v), `${TIPO_NOME[p.t] ?? p.t ?? ""}${p.d ? ` · ${fmt.date(p.d)}` : ""}`, extra ?? undefined);
+    showTooltip(ev.originalEvent.clientX, ev.originalEvent.clientY, fmt.brl(p.v), `${tipoNome[p.t] ?? p.t ?? ""}${p.d ? ` · ${fmt.date(p.d)}` : ""}`, extra ?? undefined);
   };
   const onLeave = () => {
     if (state.ferramenta === "none") map.getCanvas().style.cursor = "";

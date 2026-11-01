@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import date
 from functools import lru_cache
 from pathlib import Path
@@ -83,3 +84,20 @@ class Settings(BaseSettings):
 @lru_cache
 def get_settings() -> Settings:
     return Settings()
+
+
+LOG_FORMAT = "%(asctime)s %(levelname)-7s %(name)s: %(message)s"
+
+
+def configure_logging(*, verbose: bool = False) -> None:
+    """Log da aplicação no stderr: INFO (DEBUG com ``verbose``).
+
+    Chamado pela CLI e por :func:`observatorio.api.app.create_app` quando ninguém configurou o
+    log antes (``serve --reload`` sobe o app num subprocesso que só tem o log do uvicorn).
+    """
+    logging.basicConfig(
+        level=logging.DEBUG if verbose else logging.INFO, format=LOG_FORMAT, datefmt="%H:%M:%S"
+    )
+    if not verbose:
+        # uma linha por requisição polui o log (o GeoSampa faz ~300 por atualização)
+        logging.getLogger("httpx").setLevel(logging.WARNING)

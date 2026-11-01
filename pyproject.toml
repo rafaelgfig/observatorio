@@ -94,9 +94,10 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 minversion = "8.0"
 testpaths = ["tests"]
-addopts = ["-ra", "--strict-markers", "--strict-config"]
+# os testes de rede ficam de fora por padrão; `-m network` na linha de comando substitui o filtro
+addopts = ["-ra", "--strict-markers", "--strict-config", "-m", "not network"]
 markers = [
-    "network: testes que acessam a internet (desligados por padrão; rode com -m network)",
+    "network: testes que acessam as fontes reais (desligados por padrão; rode com -m network)",
 ]
 filterwarnings = [
     "error::DeprecationWarning:observatorio.*",
@@ -110,3 +111,5 @@ branch = true
 [tool.coverage.report]
 show_missing = true
 skip_covered = true
+# piso (o total medido é ~97%): `pytest --cov` falha se a cobertura cair abaixo disso
+fail_under = 95

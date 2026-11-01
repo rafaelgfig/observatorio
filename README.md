@@ -50,8 +50,8 @@ uv run observatorio status               # o que foi baixado/processado e quando
 ## Desenvolvimento
 
 ```bash
-uv run pytest                 # testes (sem rede)
-uv run pytest -m network      # inclui testes que acessam as fontes reais
+uv run pytest                 # testes (sem acessar as fontes de dados)
+uv run pytest -m network      # só os testes que consultam as fontes reais (CKAN, Prefeitura)
 uv run ruff check . && uv run ruff format .
 uv run mypy
 uv run pre-commit install     # roda ruff + mypy a cada commit
@@ -64,6 +64,10 @@ exemplo `OBSERVATORIO_DATA_DIR`, `OBSERVATORIO_ITBI_MIN_YEAR`, `OBSERVATORIO_POR
 rede local (`serve --host 0.0.0.0`), liste os nomes ou IPs usados em
 `OBSERVATORIO_ALLOWED_HOSTS='["127.0.0.1", "192.168.0.10"]'`. Os testes ignoram essas variáveis
 e o `.env`.
+
+Na primeira execução, os testes (como a ingestão e o servidor) baixam a extensão `spatial` do
+DuckDB (dezenas de MB, de `extensions.duckdb.org`, guardada em `~/.duckdb/extensions`); depois
+disso `uv run pytest` roda sem internet.
 
 A arquitetura, os esquemas dos dados processados e os contratos da API estão em
 [docs/arquitetura.md](docs/arquitetura.md).

@@ -9,62 +9,69 @@ import { api, isAbort, latest } from "../api.js";
 import { createAutocomplete } from "../components/autocomplete.js";
 import { columnChart, hideTooltip, horizontalBars, showTooltip } from "../components/charts.js";
 import { createLegend, cssRamp, cssVar, stepExpression } from "../components/legend.js";
-import { el, errorNotice, fmt, icon, MONTHS, preserveFocus, statusRegion } from "../dom.js";
+import { el, errorNotice, field, fmt, icon, kpiTile, MONTHS, preserveFocus, showError, statusRegion } from "../dom.js";
+import { BRASIL_BOUNDS } from "../map.js";
 
 /** @typedef {import("../main.js").ViewContext} ViewContext */
 
 /**
  * @typedef {object} Metric
  * @property {string} id
- * @property {string} nome
- * @property {string} descricao
+ * @property {string} [nome]  nome exibido: o de `/aneel/meta` (`metricas`), ver `applyMetricNames`
+ * @property {string} descricao  texto de ajuda (linguagem simples) sob o seletor
  * @property {(v: number | null | undefined) => string} format
  * @property {(v: number) => string} [tick]
  */
 
-/** @type {Metric[]} */
+/**
+ * Formatação e ajuda de cada métrica da API (`queries.METRICAS`, que também dá os nomes).
+ * @type {Metric[]}
+ */
 const METRICS = [
   {
     id: "dec",
-    nome: "DEC",
     descricao: "Horas sem energia por consumidor no período (duração equivalente).",
     format: (v) => (v == null ? "—" : `${fmt.dec1(v)} h`),
     tick: (v) => fmt.dec1(v),
   },
   {
     id: "fec",
-    nome: "FEC",
     descricao: "Quantas vezes, em média, cada consumidor ficou sem energia.",
     format: (v) => (v == null ? "—" : `${fmt.dec1(v)}×`),
     tick: (v) => fmt.dec1(v),
   },
   {
     id: "consumidores",
-    nome: "Consumidores afetados",
     descricao: "Soma de consumidores atingidos (cada interrupção conta de novo).",
     format: (v) => fmt.compact(v),
   },
   {
     id: "eventos",
-    nome: "Interrupções",
     descricao: "Número de interrupções (eventos por alimentador e horário de início).",
     format: (v) => fmt.compact(v),
   },
   {
     id: "chi",
-    nome: "Consumidor-hora",
     descricao: "Consumidores afetados × horas sem energia (CHI).",
     format: (v) => fmt.compact(v),
   },
   {
     id: "duracao",
-    nome: "Duração média",
     descricao: "Horas sem energia por consumidor afetado, em média.",
     format: (v) => fmt.hours(v),
     tick: (v) => fmt.dec1(v),
   },
 ];
 const METRIC_BY_ID = Object.fromEntries(METRICS.map((m) => [m.id, m]));
+
+/**
+ * Nomes das métricas vindos do servidor (fonte única); sem nome lá, fica o id.
+ * @param {{ id: string, nome: string }[] | undefined} metricas
+ */
+function applyMetricNames(metricas) {
+  const names = new Map((metricas ?? []).map((m) => [m.id, m.nome]));
+  for (const m of METRICS) m.nome = names.get(m.id) ?? m.id;
+}
 
 const MONTH_NAMES = [
   "janeiro", "fevereiro", "março", "abril", "maio", "junho",
@@ -152,7 +159,10 @@ export function unmount() {
   cleanups.forEach((fn) => fn());
   cleanups = [];
   hideTooltip();
-  if (ctx) removeLayers(ctx);
+  if (ctx) {
+    cancelSourceWaits(ctx);
+    removeLayers(ctx);
+  }
   monthly?.destroy();
   monthly = null;
   ctx = null;
@@ -204,10 +214,11 @@ async function start() {
   try {
     meta = await api("/aneel/meta", { signal: controller?.signal });
   } catch (error) {
-    if (!isAbort(error) && gen === generation) showError(error);
+    if (!isAbort(error) && gen === generation) showError(ui.notice, error);
     return;
   }
   if (gen !== generation) return;
+  applyMetricNames(meta.metricas);
   const anos = meta.anos.map((/** @type {any} */ a) => a.ano);
   if (!state.ano || !anos.includes(state.ano)) state.ano = Math.max(...anos);
   clampMonths();
@@ -471,14 +482,6 @@ function buildFilters() {
 
 /**
  * @param {string} label
- * @param {HTMLElement} control
- */
-function field(label, control) {
-  return el("div", { className: "field" }, [el("span", { className: "field-label", textContent: label }), control]);
-}
-
-/**
- * @param {string} label
  * @param {boolean} checked
  * @param {(on: boolean) => void} onChange
  * @param {string} focusKey
@@ -500,7 +503,7 @@ function renderScopeChip() {
   clear.addEventListener("click", () => {
     state.escopo = { tipo: "brasil" };
     refreshAll({ keepMap: e.tipo !== "distribuidora" });
-    ctx?.fit([-74.1, -33.8, -34.7, 5.4], 5);
+    ctx?.fit(BRASIL_BOUNDS, 5);
   });
   ui.scope.replaceChildren(
     el("span", { className: "listbox-kind", textContent: kind }),
@@ -602,7 +605,7 @@ async function loadSummary() {
     ui.notice.replaceChildren(); // antes: renderSummary escreve os avisos deste resumo
     renderSummary(data);
   } catch (error) {
-    if (!isAbort(error) && gen === generation) showError(error);
+    if (!isAbort(error) && gen === generation) showError(ui.notice, error);
   } finally {
     if (gen === generation) setLoading([ui.kpis, ui.monthly, ui.causes, ui.extra], false);
   }
@@ -668,11 +671,6 @@ function setLoading(nodes, on) {
   for (const node of nodes) node.classList.toggle("is-loading", on);
 }
 
-/** @param {unknown} error */
-function showError(error) {
-  ui.notice.replaceChildren(errorNotice(error));
-}
-
 // ------------------------------------------------------------------ render
 
 /** @param {any} data */
@@ -683,24 +681,25 @@ function renderSummary(data) {
   const heroValue = k[m.id];
   /** @type {(HTMLElement | null)[]} */
   const tiles = [
-    tile(`${m.nome} · ${periodo}`, m.format(heroValue), officialNote(m.id, k), true),
-    m.id !== "dec" ? tile("DEC", METRIC_BY_ID.dec.format(k.dec), officialNote("dec", k)) : null,
-    m.id !== "fec" ? tile("FEC", METRIC_BY_ID.fec.format(k.fec), officialNote("fec", k)) : null,
-    m.id !== "eventos" ? tile("Interrupções", fmt.int(k.eventos)) : null,
-    m.id !== "consumidores" ? tile("Consumidores afetados", fmt.compact(k.consumidores)) : null,
-    m.id !== "duracao" ? tile("Duração média", fmt.hours(k.duracao), "por consumidor afetado") : null,
-    tile("Base de consumidores", fmt.compact(k.consumidores_base), data.estimado ? "estimada" : null),
+    kpiTile(`${m.nome} · ${periodo}`, m.format(heroValue), officialNote(m.id, k), true),
+    m.id !== "dec" ? kpiTile("DEC", METRIC_BY_ID.dec.format(k.dec), officialNote("dec", k)) : null,
+    m.id !== "fec" ? kpiTile("FEC", METRIC_BY_ID.fec.format(k.fec), officialNote("fec", k)) : null,
+    m.id !== "eventos" ? kpiTile("Interrupções", fmt.int(k.eventos)) : null,
+    m.id !== "consumidores" ? kpiTile("Consumidores afetados", fmt.compact(k.consumidores)) : null,
+    m.id !== "duracao" ? kpiTile("Duração média", fmt.hours(k.duracao), "por consumidor afetado") : null,
+    kpiTile("Base de consumidores", fmt.compact(k.consumidores_base), data.estimado ? "estimada" : null),
   ];
   ui.kpis.replaceChildren(...tiles.filter(Boolean).slice(0, 7).map((t) => /** @type {HTMLElement} */ (t)));
 
   /** @type {HTMLElement[]} */
   const notices = [];
   if (data.estimado) {
+    // o ano inteiro sem município na fonte (`municipio_estimado` em /meta) ou só parte dele
+    const semMunicipio = Boolean(yearMeta()?.municipio_estimado);
     notices.push(
       el("div", {
         className: "notice",
-        textContent:
-          "Os dados de 2025 não trazem o município: os valores municipais são estimados distribuindo cada conjunto elétrico pelos municípios que ele atende (erro típico de 25–30%).",
+        textContent: `${semMunicipio ? `Os dados de ${state.ano} não trazem o município: os` : "Os"} valores municipais são estimados distribuindo cada conjunto elétrico pelos municípios que ele atende (erro típico de 25–30%).`,
       }),
     );
   }
@@ -744,20 +743,6 @@ function renderSummary(data) {
   if (!data.causas?.length) ui.causes.replaceChildren(el("p", { className: "muted", textContent: "Sem interrupções no período." }));
 
   renderExtra(data);
-}
-
-/**
- * @param {string} label
- * @param {string} value
- * @param {string | null} [note]
- * @param {boolean} [hero]
- */
-function tile(label, value, note, hero = false) {
-  return el("div", { className: `tile${hero ? " tile--hero" : ""}` }, [
-    el("div", { className: "tile-label", textContent: label }),
-    el("div", { className: "tile-value", textContent: value }),
-    note ? el("div", { className: "tile-note", textContent: note }) : null,
-  ]);
 }
 
 /**
@@ -948,16 +933,7 @@ function fitScope() {
     }
     if (Number.isFinite(w)) ctx?.fit([w, s, east, n], e.tipo === "municipio" ? 10 : 7);
   };
-  if (map.isSourceLoaded(SRC_MUN)) run();
-  else {
-    const onData = (/** @type {any} */ ev) => {
-      if (ev.sourceId === SRC_MUN && map.isSourceLoaded(SRC_MUN)) {
-        map.off("sourcedata", onData);
-        run();
-      }
-    };
-    map.on("sourcedata", onData);
-  }
+  whenMunicipiosReady(run);
 }
 
 /** @type {Record<string, string>} */
@@ -1118,16 +1094,41 @@ function paintValues() {
       map.setFeatureState({ source: SRC_MUN, id: Number(cod) }, { v, ...flags, instavel: flags.pouca || flags.lacuna });
     }
   };
-  if (map.isSourceLoaded(SRC_MUN)) apply();
-  else {
-    const onData = (/** @type {any} */ ev) => {
-      if (ev.sourceId === SRC_MUN && map.isSourceLoaded(SRC_MUN)) {
-        map.off("sourcedata", onData);
-        apply();
-      }
-    };
-    map.on("sourcedata", onData);
+  whenMunicipiosReady(apply);
+}
+
+/** Esperas pendentes pela malha de municípios (canceladas ao desmontar a view). */
+/** @type {Set<(ev: any) => void>} */
+const pendingSourceWaits = new Set();
+
+/**
+ * Executa `fn` quando a malha de municípios estiver carregada. Nunca consulta uma fonte que
+ * já foi removida (troca de tela ou de tema durante o carregamento).
+ * @param {() => void} fn
+ */
+function whenMunicipiosReady(fn) {
+  if (!ctx) return;
+  const { map } = ctx;
+  if (map.getSource(SRC_MUN) && map.isSourceLoaded(SRC_MUN)) {
+    fn();
+    return;
   }
+  const onData = (/** @type {any} */ ev) => {
+    if (ev.sourceId !== SRC_MUN) return;
+    if (!map.getSource(SRC_MUN)) return;
+    if (!map.isSourceLoaded(SRC_MUN)) return;
+    map.off("sourcedata", onData);
+    pendingSourceWaits.delete(onData);
+    fn();
+  };
+  pendingSourceWaits.add(onData);
+  map.on("sourcedata", onData);
+}
+
+/** @param {ViewContext} context */
+function cancelSourceWaits(context) {
+  for (const onData of pendingSourceWaits) context.map.off("sourcedata", onData);
+  pendingSourceWaits.clear();
 }
 
 function renderLegend() {

@@ -47,11 +47,11 @@ import duckdb
 import polars as pl
 
 from observatorio.config import Settings
-from observatorio.db import connect
+from observatorio.db import connect, sql_path
 from observatorio.itbi import geosampa
 from observatorio.itbi.geosampa import Lookups
-from observatorio.storage import copy_query, sql_path, touch_version
-from observatorio.text import TITLES, expand_street, search_key
+from observatorio.storage import copy_query, touch_version
+from observatorio.text import TITLES, search_key, street_label
 
 log = logging.getLogger(__name__)
 
@@ -308,7 +308,7 @@ def load_keys(con: duckdb.DuckDBPyConnection, transacoes: Path) -> None:
         SELECT *,
                TRY_CAST(lote AS INTEGER) AS lote_n,
                nullif(norm_text(logradouro), '') AS logr,               -- comparação de ruas
-               CASE WHEN numero > 0 AND numero <> 99999 THEN numero END AS num  -- 0/99999: sem nº
+               numero AS num  -- o parse já anula 0, 99999 e texto (sem nº)
         FROM agrupadas
         """
     )
@@ -451,11 +451,6 @@ AREAS_SQL = "SELECT tipo, id, nome, geom, bbox_w, bbox_s, bbox_e, bbox_n FROM ar
 
 
 # ---------------------------------------------------------------- lugares (busca)
-
-
-def street_label(logradouro: str) -> str:
-    """Rótulo por extenso: ``"ES DO CORREDOR"`` → "Estrada do Corredor" (``expand_street``)."""
-    return expand_street(logradouro)
 
 
 def search_text(logradouro: str, rotulo: str) -> str:

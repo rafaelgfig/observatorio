@@ -11,14 +11,15 @@ Exemplos::
 from __future__ import annotations
 
 import json
-import logging
 import os
 import sys
+from pathlib import Path
 from typing import Annotated
 
 import typer
 
-from observatorio.config import get_settings
+import observatorio
+from observatorio.config import configure_logging, get_settings
 
 app = typer.Typer(help="Observatório — apagões (ANEEL) e ITBI (São Paulo).", no_args_is_help=True)
 ingest_app = typer.Typer(help="Baixa e processa as fontes de dados (incremental).")
@@ -36,14 +37,7 @@ def _main(
         reconfigure = getattr(stream, "reconfigure", None)
         if reconfigure is not None:
             reconfigure(encoding="utf-8", errors="replace")
-    logging.basicConfig(
-        level=logging.DEBUG if verbose else logging.INFO,
-        format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
-        datefmt="%H:%M:%S",
-    )
-    if not verbose:
-        # uma linha por requisição polui o log (o GeoSampa faz ~300 por atualização)
-        logging.getLogger("httpx").setLevel(logging.WARNING)
+    configure_logging(verbose=verbose)
 
 
 @ingest_app.command("geo")
@@ -110,12 +104,16 @@ def serve(
         os.environ["OBSERVATORIO_HOST"] = host
         get_settings.cache_clear()
     settings = get_settings()
+    # com --reload, observa só o código do pacote (não data/, .venv…); o subprocesso do app
+    # configura o próprio log (ver ``create_app``), com o nível padrão (INFO)
+    reload_dirs = [str(Path(observatorio.__file__).parent)] if reload else None
     uvicorn.run(
         "observatorio.api.app:create_app",
         factory=True,
         host=host or settings.host,
         port=port or settings.port,
         reload=reload,
+        reload_dirs=reload_dirs,
     )
 
 
@@ -124,10 +122,7 @@ def status() -> None:
     """Mostra o que já foi baixado/processado."""
     from observatorio.downloads import Manifest
 
-    settings = get_settings()
-    merged = {}
-    for path in sorted(settings.manifest_dir.glob("*.json")):
-        merged.update(Manifest(path).as_dict())
+    merged = Manifest.merged(get_settings().manifest_dir)
     typer.echo(json.dumps(merged, indent=2, ensure_ascii=False))
 
 

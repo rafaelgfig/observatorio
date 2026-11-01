@@ -22,6 +22,21 @@ jobs:
       - name: Dependências
         run: uv sync --locked
 
+      # A extensão spatial do DuckDB é baixada de extensions.duckdb.org no 1º uso; com o cache
+      # (chave = versão do DuckDB), os testes não dependem desse servidor a cada execução.
+      - name: Versão do DuckDB
+        id: duckdb
+        run: echo "version=$(uv run python -c 'import duckdb; print(duckdb.__version__)')" >> "$GITHUB_OUTPUT"
+
+      - name: Cache das extensões do DuckDB
+        uses: actions/cache@v4
+        with:
+          path: ~/.duckdb/extensions
+          key: duckdb-extensions-${{ runner.os }}-${{ steps.duckdb.outputs.version }}
+
+      - name: Extensão spatial do DuckDB
+        run: uv run python -c "import duckdb; duckdb.sql('INSTALL spatial')"
+
       - name: Lint
         run: |
           uv run ruff check .

@@ -48,9 +48,9 @@ import duckdb
 import httpx
 
 from observatorio.config import Settings
-from observatorio.db import connect
-from observatorio.downloads import Manifest, RemoteVersion, http_client
-from observatorio.storage import atomic_path, copy_query, sql_path
+from observatorio.db import connect, sql_path
+from observatorio.downloads import Manifest, RemoteVersion, file_sha256, http_client
+from observatorio.storage import atomic_path, copy_query
 from observatorio.text import title_pt
 
 log = logging.getLogger(__name__)
@@ -593,12 +593,8 @@ def _digest(files: Sequence[Path]) -> str:
     """sha256 de uma camada: combina nome e conteúdo de cada arquivo, em ordem."""
     total = hashlib.sha256()
     for path in sorted(files):
-        digest = hashlib.sha256()
-        with path.open("rb") as fh:
-            while chunk := fh.read(_CHUNK):
-                digest.update(chunk)
         total.update(path.name.encode())
-        total.update(digest.digest())
+        total.update(bytes.fromhex(file_sha256(path)[0]))
     return total.hexdigest()
 
 

@@ -1,15 +1,23 @@
 from __future__ import annotations
 
 import gzip
+import logging
+import os
+import threading
+import time
 from collections.abc import Iterator
+from datetime import UTC, datetime
 
 import pytest
 from fastapi.testclient import TestClient
 
+from observatorio.api import app as app_module
 from observatorio.api.app import MAX_BODY_BYTES, _VersionWatcher, allowed_hosts, create_app
 from observatorio.api.search import terms_for
 from observatorio.config import Settings
 from observatorio.db import Database
+from observatorio.downloads import Manifest, RemoteVersion
+from observatorio.storage import VERSION_FILE, touch_version
 
 
 def test_health_sem_dados(client: TestClient) -> None:
@@ -148,3 +156,112 @@ def test_observador_de_versao_para_e_espera_a_thread(settings: Settings) -> None
     watcher.stop()
     assert not watcher._thread.is_alive()
     db.close()
+
+
+def test_observador_recarrega_quando_a_ingestao_grava_versao(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(app_module, "RELOAD_INTERVAL_S", 0.05)
+    db = Database(settings.processed_dir, [])
+    antes = db.loaded_at
+    watcher = _VersionWatcher(db, settings.processed_dir)
+    watcher.start()
+    try:
+        touch_version(settings.processed_dir)
+        limite = time.monotonic() + 10
+        while db.loaded_at == antes and time.monotonic() < limite:
+            time.sleep(0.02)
+    finally:
+        watcher.stop()
+        db.close()
+
+    assert db.loaded_at > antes
+
+
+def test_observador_registra_falha_e_continua(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(app_module, "RELOAD_INTERVAL_S", 0.05)
+    db = Database(settings.processed_dir, [])
+    tentativas = [threading.Event(), threading.Event()]
+    chamadas: list[None] = []
+
+    def refresh_quebrado() -> None:
+        tentativas[min(len(chamadas), 1)].set()
+        chamadas.append(None)
+        msg = "disco cheio"
+        raise OSError(msg)
+
+    monkeypatch.setattr(db, "refresh", refresh_quebrado)
+    watcher = _VersionWatcher(db, settings.processed_dir)
+    with caplog.at_level(logging.ERROR, logger="observatorio.api.app"):
+        watcher.start()
+        touch_version(settings.processed_dir)
+        assert tentativas[0].wait(10)
+        # a thread sobrevive à falha: a próxima versão gravada dispara outra tentativa
+        versao = settings.processed_dir / VERSION_FILE
+        mtime = versao.stat().st_mtime
+        os.utime(versao, (mtime + 10, mtime + 10))
+        assert tentativas[1].wait(10)
+        watcher.stop()
+    db.close()
+
+    assert caplog.text.count("falha ao recarregar dados") >= 2
+    assert not watcher._thread.is_alive()
+
+
+def test_meta_com_fontes_do_manifesto(client: TestClient, settings: Settings) -> None:
+    manifest = Manifest(settings.manifest_path("itbi"))
+    versao = RemoteVersion(
+        url="https://x.test/itbi-2026.xlsx", sha256="aa", size=1, fetched_at="2026-10-01T09:00:00"
+    )
+    manifest.record_download("itbi:2026", versao)
+    manifest.mark_processed(
+        "itbi:2026", linhas=10, meses=[1, 2], fingerprints={"01": "x"}, url="https://outra"
+    )
+    Manifest(settings.manifest_path("geo")).record_download("ibge:malha", versao)
+
+    resp = client.get("/api/meta")
+
+    assert resp.status_code == 200
+    corpo = resp.json()
+    assert corpo["fontes"]["itbi:2026"] == {
+        "url": "https://x.test/itbi-2026.xlsx",  # um extra não sobrescreve os campos fixos
+        "baixado_em": "2026-10-01T09:00:00",
+        "processado": True,
+        "linhas": 10,
+        "meses": [1, 2],
+    }
+    assert corpo["fontes"]["ibge:malha"]["processado"] is False
+    carregado = datetime.fromisoformat(corpo["carregado_em"])
+    assert carregado.tzinfo is not None
+    assert abs((datetime.now(UTC) - carregado).total_seconds()) < 600
+
+
+def test_geojson_sem_gzip_e_malha_ausente(client: TestClient, settings: Settings) -> None:
+    assert client.get("/dados/geo/municipios.geojson").status_code == 503
+    pasta = settings.processed_dir / "geo"
+    pasta.mkdir(parents=True)
+    corpo = b'{"type":"FeatureCollection","features":[]}'
+    (pasta / "municipios.geojson").write_bytes(corpo)
+
+    # sem o .gz (ou sem Accept-Encoding: gzip) sai o arquivo como está
+    resp = client.get("/dados/geo/municipios.geojson", headers={"Accept-Encoding": "identity"})
+
+    assert resp.status_code == 200
+    assert "content-encoding" not in resp.headers
+    assert resp.content == corpo
+
+
+def test_app_configura_o_log_sem_a_cli(settings: Settings, monkeypatch: pytest.MonkeyPatch) -> None:
+    """``serve --reload`` cria o app num subprocesso sem o log configurado pela CLI."""
+    chamadas: list[object] = []
+    monkeypatch.setattr(app_module, "configure_logging", lambda: chamadas.append(None))
+    # só o handlers vazio fica dentro do contexto: um ``monkeypatch.undo()`` desfaria também o
+    # isolamento da configuração (fixture automática do conftest)
+    with monkeypatch.context() as sem_log:
+        sem_log.setattr(logging.getLogger(), "handlers", [])
+        create_app(settings, watch=False)
+    create_app(settings, watch=False)  # com os handlers do pytest de volta
+
+    assert chamadas == [None]  # só quando ninguém tinha configurado o log

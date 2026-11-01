@@ -21,10 +21,14 @@ export const BRASIL_BOUNDS = [
   [-34.7, 5.4],
 ];
 
-/** @type {[[number, number], [number, number]]} */
+/**
+ * Caixa da cidade de São Paulo: a mesma de `itbi.queries.SP_EXTENT` no servidor (recorte dos
+ * tiles), conferida por `tests/test_frontend.py`.
+ * @type {[[number, number], [number, number]]}
+ */
 export const SAO_PAULO_BOUNDS = [
   [-46.83, -24.01],
-  [-46.36, -23.36],
+  [-46.36, -23.35],
 ];
 
 /**

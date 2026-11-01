@@ -1,5 +1,8 @@
 // @ts-check
-/** Tema: escuro por padrão; a escolha do usuário fica no localStorage. */
+/**
+ * Tema: escuro por padrão; a escolha do usuário fica no localStorage (o script inline do
+ * `index.html` aplica o tema salvo antes do primeiro paint).
+ */
 
 import { icon } from "./dom.js";
 
@@ -8,17 +11,6 @@ const KEY = "observatorio:theme";
 /** @returns {"dark" | "light"} */
 export function currentTheme() {
   return document.documentElement.dataset.theme === "light" ? "light" : "dark";
-}
-
-/** Aplica o tema salvo (chamado o quanto antes, antes do primeiro paint). */
-export function applyStoredTheme() {
-  let stored = null;
-  try {
-    stored = localStorage.getItem(KEY);
-  } catch {
-    /* armazenamento indisponível: segue o padrão escuro */
-  }
-  document.documentElement.dataset.theme = stored === "light" ? "light" : "dark";
 }
 
 /**
