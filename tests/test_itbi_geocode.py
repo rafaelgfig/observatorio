@@ -280,12 +280,11 @@ def test_places(outputs: Path) -> None:
     ("logradouro", "rotulo"),
     [
         ("R ISIDORO FARINA", "Rua Isidoro Farina"),
-        ("AV  STO AMARO", "Avenida Sto Amaro"),
-        # tipos do cadastro que text.expand_street não conhece
+        ("AV  STO AMARO", "Avenida Santo Amaro"),
         ("ES DO CORREDOR", "Estrada do Corredor"),
         ("RV DOS BANDEIRANTES", "Rodovia dos Bandeirantes"),
         ("TVP C J NOVA PARADA", "Travessa Particular C J Nova Parada"),
-        ("ES", "Es"),  # só o tipo: nada a expandir
+        ("ES", "Estrada"),  # só o tipo
     ],
 )
 def test_rotulo_do_logradouro(logradouro: str, rotulo: str) -> None:
@@ -297,13 +296,13 @@ def test_rotulo_do_logradouro(logradouro: str, rotulo: str) -> None:
     [
         ("R ISIDORO FARINA", "rua isidoro farina"),
         ("AV PAULISTA", "avenida paulista"),
-        ("AV STO AMARO", "avenida sto amaro santo"),
-        ("AV BRIG FARIA LIMA", "avenida brig faria lima brigadeiro"),
+        ("AV STO AMARO", "avenida santo amaro sto"),
+        ("AV BRIG FARIA LIMA", "avenida brigadeiro faria lima"),
         ("PC DA SE", "praca da se pc"),
         ("ES DO CORREDOR", "estrada do corredor"),
         ("RP A DA PAZ", "rua particular a da paz rp"),
-        ("PC NSRA DA PENHA", "praca nsra da penha pc nossa senhora"),
-        ("R NSRA DA NSRA", "rua nsra da nsra nossa senhora"),  # expansão uma vez só
+        ("PC NSRA DA PENHA", "praca nossa senhora da penha pc nsra"),
+        ("R NSRA DA NSRA", "rua nossa senhora da nossa senhora nsra"),  # alias uma vez só
     ],
 )
 def test_texto_de_busca(logradouro: str, busca: str) -> None:
@@ -316,7 +315,7 @@ def test_texto_de_busca(logradouro: str, busca: str) -> None:
 def test_run_sem_transacoes_explica_o_que_fazer_sem_baixar_o_geosampa(
     settings: Settings, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    def ensure(settings: Settings, *, force: bool = False) -> Lookups:
+    def ensure(settings: Settings, *, force: bool = False, rebuild: bool = False) -> Lookups:
         pytest.fail("não deveria baixar o GeoSampa sem transações")
 
     monkeypatch.setattr(geosampa, "ensure", ensure)
@@ -328,7 +327,7 @@ def test_run_sem_transacoes_explica_o_que_fazer_sem_baixar_o_geosampa(
 def test_run_grava_saidas_e_pula_quando_em_dia(
     settings: Settings, lookups: Lookups, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(geosampa, "ensure", lambda settings, *, force=False: lookups)
+    monkeypatch.setattr(geosampa, "ensure", lambda settings, *, force=False, rebuild=False: lookups)
     write_transacoes(settings.processed_dir / "itbi" / "transacoes")
     out = settings.processed_dir / "itbi"
 
@@ -348,7 +347,7 @@ def test_run_refaz_quando_uma_particao_e_removida(
 ) -> None:
     # A ingestão apaga a partição de um mês que sumiu da planilha e chama run() sem force:
     # nenhum arquivo fica mais novo que as saídas, mas a contagem mudou.
-    monkeypatch.setattr(geosampa, "ensure", lambda settings, *, force=False: lookups)
+    monkeypatch.setattr(geosampa, "ensure", lambda settings, *, force=False, rebuild=False: lookups)
     root = write_transacoes(settings.processed_dir / "itbi" / "transacoes")
     out = settings.processed_dir / "itbi"
     geocode.run(settings)
@@ -366,3 +365,21 @@ def peso(out: Path, logradouro: str) -> float:
     places = read(out / "places.parquet")
     row = places.filter((pl.col("tipo") == "logradouro") & (pl.col("id") == logradouro))
     return float(row["peso"].item())
+
+
+def test_force_refaz_sem_baixar_o_geosampa(
+    settings: Settings, lookups: Lookups, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    chamadas: list[tuple[bool, bool]] = []
+
+    def ensure(settings: Settings, *, force: bool = False, rebuild: bool = False) -> Lookups:
+        chamadas.append((force, rebuild))
+        return lookups
+
+    monkeypatch.setattr(geosampa, "ensure", ensure)
+    write_transacoes(settings.processed_dir / "itbi" / "transacoes")
+
+    geocode.run(settings, force=True)
+    geocode.run(settings, refresh_geosampa=True)
+
+    assert chamadas == [(False, True), (True, False)]

@@ -217,6 +217,10 @@ _NUMERIC_COLUMNS: Final = (
     "valor_financiado", "matricula", "area_terreno_m2", "testada_m", "fracao_ideal",
     "area_construida_m2", "uso_cod", "padrao_cod", "acc_ano",
 )  # fmt: skip
+# Versão das regras de normalização: incremente ao mudar qualquer regra que altere a saída —
+# a ingestão reprocessa sozinha os anos gravados com outra versão.
+PARSER_VERSION: Final = 2
+
 # Textos que são só o resultado de erro de fórmula (no arquivo de 2024 viraram texto literal).
 _ERROR_TEXTS: Final = ["", "#NAME?", "#REF!", "#ERROR!", "#VALUE!", "#N/A", "#DIV/0!", "#NULL!"]
 _NUMERO_SEM_NUMERO: Final = 99999
@@ -226,6 +230,10 @@ _ACC_MIN_YEAR: Final = 1800
 # IPTU descrevem o lote inteiro (mediana valor/VVR proporcional ≈ 216 abaixo de 5%, ≈ 1,0
 # entre 10% e 100%). rs_m2 só existe entre 10% e 100%, dividindo pela fração transmitida.
 _MIN_SHARE_PCT: Final = 10.0
+# Valores simbólicos (R$ 1, R$ 100…) e R$/m² fora desta faixa não são preço de mercado: o
+# rs_m2 fica nulo (a transação continua contando nos totais e medianas de valor).
+_VALOR_MIN_RS_M2: Final = 5_000.0
+_RS_M2_RANGE: Final = (100.0, 100_000.0)
 # Mais linhas corrompidas que isto numa aba indica mudança de layout, não defeito pontual.
 _MAX_QUARANTINE: Final = 20
 _MAX_QUARANTINE_SHARE: Final = 0.01
@@ -600,6 +608,8 @@ def _classify(typed: pl.DataFrame) -> pl.DataFrame:
       (prédio antigo no lugar do lançamento). Uso, áreas e padrão do IPTU são do lote, então
       ``tipo`` sai do complemento (apartamento, se só houver torre/bloco/unidade) e
       ``rs_m2`` fica nulo;
+    * ``rs_m2`` também fica nulo para valores simbólicos (< R$ 5 mil) e fora de
+      R$ 100–100 mil/m².
     * vaga vendida com uso de apartamento/sala (complemento começa por ``VG``/``BOX``…) → garagem.
     """
     key = _unit_key(pl.col("complemento"))
@@ -634,8 +644,11 @@ def _classify(typed: pl.DataFrame) -> pl.DataFrame:
         .then("area_construida_m2")
     )
     valid = (
-        (pl.col("valor_transacao") > 0) & share_pct.is_between(_MIN_SHARE_PCT, 100.0) & (area > 0)
+        (pl.col("valor_transacao") >= _VALOR_MIN_RS_M2)
+        & share_pct.is_between(_MIN_SHARE_PCT, 100.0)
+        & (area > 0)
     )
+    rs_m2 = pl.col("valor_transacao") / (area * share_pct / 100)
     return staged.with_columns(
-        rs_m2=pl.when(valid).then(pl.col("valor_transacao") / (area * share_pct / 100)),
+        rs_m2=pl.when(valid & rs_m2.is_between(*_RS_M2_RANGE)).then(rs_m2),
     )

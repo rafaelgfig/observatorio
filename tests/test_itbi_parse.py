@@ -370,6 +370,9 @@ def test_tipo_e_na_planta(
         ({"area_construida_m2": "0"}, None),
         ({"valor_transacao": "0"}, None),
         ({"proporcao_pct": "150"}, None),
+        ({"valor_transacao": "1000"}, None),  # valor simbólico
+        ({"valor_transacao": "9000", "area_construida_m2": "100"}, None),  # R$ 90/m²
+        ({"valor_transacao": "20000000", "area_construida_m2": "100"}, None),  # R$ 200 mil/m²
     ],
 )
 def test_rs_m2(cells: dict[str, str | None], rs_m2: float | None) -> None:

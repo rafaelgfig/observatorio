@@ -51,7 +51,7 @@ from observatorio.db import connect
 from observatorio.itbi import geosampa
 from observatorio.itbi.geosampa import Lookups
 from observatorio.storage import copy_query, sql_path, touch_version
-from observatorio.text import expand_street, search_key, title_pt
+from observatorio.text import TITLES, expand_street, search_key
 
 log = logging.getLogger(__name__)
 
@@ -183,60 +183,15 @@ TIERS = (
 )
 TIER_NAMES = {tier.numero: tier.nome for tier in TIERS}
 
-# Tipos de logradouro do cadastro (padrão da Fazenda) que ``text.STREET_TYPES`` não conhece:
-# entram no rótulo ("ES DO CORREDOR" → "Estrada do Corredor") e, por tabela, na busca.
-_EXTRA_STREET_TYPES = {
-    "AC": "Acesso",
-    "CM": "Caminho",
-    "CV": "Complexo Viário",
-    "ES": "Estrada",
-    "LD": "Ladeira",
-    "RP": "Rua Particular",
-    "RV": "Rodovia",
-    "TVP": "Travessa Particular",
-    "VE": "Viela",
-}
-# Títulos e tratamentos por extenso, só para o texto pesquisável ("santo amaro" encontra
-# "AV STO AMARO"); valem em qualquer posição:
-_TITLE_EXPANSIONS = {
-    "alm": "almirante",
-    "brig": "brigadeiro",
-    "cap": "capitao",
-    "cel": "coronel",
-    "cons": "conselheiro",
-    "dep": "deputado",
-    "des": "desembargador",
-    "dr": "doutor",
-    "dra": "doutora",
-    "emb": "embaixador",
-    "eng": "engenheiro",
-    "gal": "general",
-    "gen": "general",
-    "maj": "major",
-    "mal": "marechal",
-    "marq": "marques",
-    "min": "ministro",
-    "mons": "monsenhor",
-    "nsra": "nossa senhora",
-    "pde": "padre",
-    "pres": "presidente",
-    "prof": "professor",
-    "profa": "professora",
-    "sarg": "sargento",
-    "sen": "senador",
-    "sold": "soldado",
-    "sta": "santa",
-    "sto": "santo",
-    "tte": "tenente",
-    "visc": "visconde",
-}
-
-
 # ---------------------------------------------------------------- orquestração
 
 
-def run(settings: Settings, *, force: bool = False) -> None:
-    """Geocodifica ``processed/itbi/transacoes`` e regrava áreas e lugares do ITBI."""
+def run(settings: Settings, *, force: bool = False, refresh_geosampa: bool = False) -> None:
+    """Geocodifica ``processed/itbi/transacoes`` e regrava áreas e lugares do ITBI.
+
+    ``force`` refaz tudo a partir das camadas já baixadas; ``refresh_geosampa`` também baixa de
+    novo as camadas do GeoSampa (~450 MB), mesmo que ainda estejam dentro do prazo de validade.
+    """
     transacoes = settings.processed_dir / "itbi" / "transacoes"
     # Antes do GeoSampa (centenas de MB): sem transações não há o que geocodificar.
     if not transacoes.is_dir() or not any(transacoes.rglob("*.parquet")):
@@ -245,7 +200,7 @@ def run(settings: Settings, *, force: bool = False) -> None:
             "rode `observatorio ingest itbi` antes da geocodificação."
         )
         raise FileNotFoundError(msg)
-    lookups = geosampa.ensure(settings, force=force)
+    lookups = geosampa.ensure(settings, force=refresh_geosampa, rebuild=force)
 
     out_dir = settings.processed_dir / "itbi"
     outputs = [out_dir / name for name in OUTPUTS]
@@ -483,14 +438,7 @@ AREAS_SQL = "SELECT tipo, id, nome, geom, bbox_w, bbox_s, bbox_e, bbox_n FROM ar
 
 
 def street_label(logradouro: str) -> str:
-    """Rótulo por extenso: :func:`text.expand_street` + os tipos de :data:`_EXTRA_STREET_TYPES`.
-
-    ``"R ISIDORO FARINA"`` → "Rua Isidoro Farina"; ``"ES DO CORREDOR"`` → "Estrada do Corredor".
-    """
-    kind, _, rest = " ".join(logradouro.split()).partition(" ")
-    extra = _EXTRA_STREET_TYPES.get(kind.upper())
-    if extra and rest:
-        return f"{extra} {title_pt(rest, continuation=True)}"
+    """Rótulo por extenso: ``"ES DO CORREDOR"`` → "Estrada do Corredor" (``expand_street``)."""
     return expand_street(logradouro)
 
 
@@ -505,7 +453,8 @@ def search_text(logradouro: str, rotulo: str) -> str:
     known = set(words)
     extras: list[str] = []
     for token in search_key(logradouro).split():
-        expansion = _TITLE_EXPANSIONS.get(token)
+        title = TITLES.get(token.upper())
+        expansion = search_key(title) if title else None
         if expansion and not set(expansion.split()) <= known:
             extras.append(expansion)
             known.update(expansion.split())

@@ -55,10 +55,14 @@ class FakeGeocode(types.ModuleType):
     def __init__(self) -> None:
         super().__init__(ingest.GEOCODE_MODULE)
         self.calls: list[bool] = []
+        self.refreshes: list[bool] = []
         self.failures = 0
 
-    def run(self, settings: Settings, *, force: bool = False) -> None:
+    def run(
+        self, settings: Settings, *, force: bool = False, refresh_geosampa: bool = False
+    ) -> None:
         self.calls.append(force)
+        self.refreshes.append(refresh_geosampa)
         if self.failures:
             self.failures -= 1
             msg = "GeoSampa fora do ar"
@@ -155,6 +159,25 @@ def test_segunda_execucao_sem_mudancas_nao_reprocessa(
     assert geocode.calls == [False, False]
     # ...mas a API só é avisada quando as transações mudam.
     assert (cfg.processed_dir / VERSION_FILE).read_text(encoding="utf-8") == version
+
+
+def test_nova_versao_do_parser_reprocessa_sem_reescrever_meses_iguais(
+    cfg: Settings,
+    server: FakeServer,
+    parsed: list[Path],
+    geocode: FakeGeocode,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ingest.run(cfg)
+    _age(_part(cfg, 1), _part(cfg, 2))
+
+    monkeypatch.setattr(parse, "PARSER_VERSION", parse.PARSER_VERSION + 1)
+    ingest.run(cfg)
+
+    assert len(parsed) == 2  # relido por causa da versão, mesmo com 304
+    assert _part(cfg, 1).stat().st_mtime_ns == OLD_NS  # conteúdo igual: não reescreve
+    manifest = Manifest(cfg.manifest_path("itbi"))
+    assert manifest.metadata("itbi:2026")["parser"] == parse.PARSER_VERSION
 
 
 def test_geocodificacao_que_falhou_e_refeita_na_execucao_seguinte(

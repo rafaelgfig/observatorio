@@ -152,11 +152,12 @@ class Lookups:
 # ---------------------------------------------------------------- orquestração
 
 
-def ensure(settings: Settings, *, force: bool = False) -> Lookups:
+def ensure(settings: Settings, *, force: bool = False, rebuild: bool = False) -> Lookups:
     """Garante camadas brutas atualizadas e as tabelas auxiliares geradas a partir delas.
 
     Baixa as camadas ausentes, mais velhas que ``geosampa_max_age_days`` ou todas
-    (``force``); refaz as tabelas quando alguma camada mudou ou falta alguma saída. Se só a
+    (``force``); refaz as tabelas quando alguma camada mudou, falta alguma saída ou
+    ``rebuild``/``force`` foi pedido. Se só a
     *atualização* falhar (servidor fora do ar) e todas as camadas já tiverem sido baixadas
     antes, segue com elas e avisa — a geocodificação não para por isso.
     """
@@ -182,7 +183,7 @@ def ensure(settings: Settings, *, force: bool = False) -> Lookups:
         log.info("geosampa: camadas baixadas há menos de %d dias", max_age.days)
 
     changed = any(manifest.needs_processing(layer.key) for layer in LAYERS)
-    if force or changed or not lookups.complete():
+    if force or rebuild or changed or not lookups.complete():
         counts = build(raw_root, lookups.dir)
         for layer in LAYERS:
             manifest.mark_processed(layer.key, feicoes=counts[layer.name])

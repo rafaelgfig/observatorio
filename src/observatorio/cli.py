@@ -40,6 +40,9 @@ def _main(
         format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
         datefmt="%H:%M:%S",
     )
+    if not verbose:
+        # uma linha por requisição polui o log (o GeoSampa faz ~300 por atualização)
+        logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
 @ingest_app.command("geo")
@@ -66,20 +69,29 @@ def ingest_aneel(
     ingest.run(settings, force=force)
 
 
+RefreshGeosampa = Annotated[
+    bool,
+    typer.Option(
+        "--geosampa",
+        help="Baixa de novo as camadas do GeoSampa (~450 MB) mesmo dentro do prazo de validade.",
+    ),
+]
+
+
 @ingest_app.command("itbi")
-def ingest_itbi(force: Force = False) -> None:
+def ingest_itbi(force: Force = False, geosampa: RefreshGeosampa = False) -> None:
     """Guias de ITBI pagas da Prefeitura de São Paulo (só reprocessa planilhas alteradas)."""
     from observatorio.itbi import ingest
 
-    ingest.run(get_settings(), force=force)
+    ingest.run(get_settings(), force=force, refresh_geosampa=geosampa)
 
 
 @ingest_app.command("all")
-def ingest_all(force: Force = False) -> None:
+def ingest_all(force: Force = False, geosampa: RefreshGeosampa = False) -> None:
     """Executa todas as ingestões na ordem correta."""
     ingest_geo(force=force)
     ingest_aneel(force=force)
-    ingest_itbi(force=force)
+    ingest_itbi(force=force, geosampa=geosampa)
 
 
 @app.command()

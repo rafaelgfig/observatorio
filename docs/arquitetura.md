@@ -110,9 +110,15 @@ Regras validadas contra o DEC/FEC oficial (erro < 2% em 97,5% dos conjunto-mês 
 Tabelas (detalhes de colunas em `aneel/transform.py`):
 
 * `fato/ano=YYYY.parquet` — interrupções limpas e unificadas (ambos os layouts);
-* `conj_mun_pesos.parquet` — `conj, cod_mun, w, fonte`;
-* `mun_mes.parquet` — agregado município × mês × dimensões (programada, causa, regulatório, agente);
-* `mun_base.parquet` — base de consumidores estimada por município × mês;
+* `conj_mun_pesos.parquet` — `conj, cod_mun, w, fonte, principal` (`principal`: o vínculo
+  responde por ≥ 10% do conjunto ou da base do município — usado para listar conjuntos e
+  interrupções de um município estimado sem incluir "transbordos" marginais);
+* `mun_mes.parquet` — agregado município × mês × dimensões (programada, causa, regulatório,
+  agente) com `consumidores`, `chi`, `eventos` (interrupções que atingiram o município) e
+  `eventos_frac` (cada evento dividido entre os municípios que atingiu — soma sem dupla
+  contagem em UF/Brasil/distribuidora);
+* `mun_base.parquet` — base de consumidores estimada por município × mês × agente (NumCon
+  oficial quando plausível, entre 0,5× e 2× a contagem do arquivo; senão a do arquivo);
 * `conj_mes.parquet` — DEC/FEC calculado vs. oficial por conjunto × mês;
 * `agente_mes.parquet` — completude por distribuidora × mês (lacunas conhecidas);
 * `places.parquet` — distribuidoras (escopo `aneel`).
@@ -120,10 +126,34 @@ Tabelas (detalhes de colunas em `aneel/transform.py`):
 ### itbi/
 
 * `transacoes/ref_year=YYYY/ref_month=MM/part.parquet` — uma linha por guia paga
-  (esquema na seção ITBI abaixo); partições inteiras são substituídas quando a aba muda.
-* `geocode.parquet` — `sql, logradouro, numero, cep → lon, lat, precisao, tier`.
-* `areas.parquet` — distritos e subprefeituras (GeoSampa): `tipo, id, nome, geom (WKB), bbox_*`.
-* `places.parquet` — logradouros, CEPs, distritos, subprefeituras (escopo `itbi`).
+  (esquema na seção ITBI abaixo); um mês só é regravado quando o conteúdo normalizado muda
+  (impressão digital por mês no manifesto). `parse.PARSER_VERSION` no manifesto faz a
+  ingestão reprocessar sozinha quando as regras de normalização mudam.
+* `geocode.parquet` — `sql, logradouro, numero, cep → lon, lat, precisao, tier` (uma linha por
+  chave; junção *null-safe* com `transacoes`). `precisao` ∈ `lote`, `condominio`, `quadra`,
+  `setor`; `tier` 1–9:
+
+  | tier | regra | precisão típica (p50/p90 vs. CNEFE) |
+  |---|---|---|
+  | 1 | lote exato (setor-quadra-lote) | 19 / 33 m |
+  | 2 | condomínio da quadra pelo logradouro + número | 31 / 68 m |
+  | 3 | condomínio da quadra pelo número | 30 / 69 m |
+  | 4 | lote da quadra pelo logradouro + número | 24 / 56 m |
+  | 5 | mesmo SQL resolvido em outra chave (herda a precisão) | 28 / 97 m |
+  | 6 | único condomínio do logradouro na quadra | 55 / 229 m |
+  | 7 | unidade vizinha (lote ±3) ligada a um condomínio | 45 / 143 m |
+  | 8 | ponto da quadra | 76 / 196 m |
+  | 9 | ponto do setor | ~700 m |
+
+  O filtro de precisão `lote` da API inclui `lote` **e** `condominio`.
+* `areas.parquet` — 96 distritos e 32 subprefeituras (GeoSampa), polígonos simplificados sem
+  frestas: `tipo, id, nome, geom (GEOMETRY), bbox_*`. `id` = código oficial com 2 dígitos
+  (ex.: distrito `"37"`).
+* `places.parquet` — logradouros (id = nome como na fonte, ex. `R ISIDORO FARINA`), CEPs (8
+  dígitos), distritos e subprefeituras (escopo `itbi`).
+* `geo/` — tabelas auxiliares do GeoSampa (`lotes`, `quadras`, `setores`, `distritos`,
+  `subprefeituras`), refeitas quando as camadas brutas mudam (`manifest/geosampa.json`;
+  camadas rebaixadas após `geosampa_max_age_days` ou com `ingest itbi --geosampa`).
 
 #### Esquema de `transacoes`
 
@@ -151,10 +181,10 @@ Tabelas (detalhes de colunas em `aneel/transform.py`):
 | uso_cod, uso | SMALLINT, VARCHAR | descrição sem espaços extras |
 | padrao_cod, padrao | SMALLINT, VARCHAR | |
 | acc_ano | SMALLINT | ano de construção corrigido; nulo fora de [1800, ref_year+1] |
-| tipo | VARCHAR | `apartamento`, `casa`, `terreno`, `comercial`, `garagem`, `outros` |
-| na_planta | BOOLEAN | unidade vendida antes de existir (uso terreno + complemento de unidade) |
-| rs_m2 | DOUBLE | valor / área construída (terreno: / área do terreno); nulo se não fizer sentido |
-| possivel_duplicata | BOOLEAN | idêntica a outra linha da mesma aba em todas as 28 colunas |
+| tipo | VARCHAR | `apartamento`, `casa`, `terreno`, `comercial`, `garagem`, `outros` (pelo uso do IPTU; nas unidades na planta, pelo complemento: AP → apartamento, SALA/CJ → comercial, VG → garagem…) |
+| na_planta | BOOLEAN | unidade vendida sob o SQL de um lote ainda não desdobrado: uso terreno, ou fração < 10% de um lote cujo uso não é de unidade autônoma, com complemento de unidade |
+| rs_m2 | DOUBLE | valor / (área × proporção transmitida) — área construída, ou do terreno para `terreno`; nulo para garagem, na planta, proporção fora de 10–100%, valor < R$ 5 mil ou resultado fora de R$ 100–100 mil/m² |
+| possivel_duplicata | BOOLEAN | idêntica a uma linha anterior da mesma aba nas 28 colunas (a 1ª ocorrência fica `false`) |
 | aba | VARCHAR | nome da aba de origem (ex.: `JAN-2026`) |
 
 ## Contratos da API
@@ -258,6 +288,10 @@ Corpo comum das consultas (POST), modelo `ConsultaItbi`:
 
 `precisao`: `lote` (só lote/condomínio exato), `quadra` (padrão: até centroide de quadra) ou
 `qualquer`. `tipos`/`naturezas` vazios ou nulos = todos. Datas filtram `data_transacao`.
+
+Observações para a implementação: `natureza` código 5 tem dois rótulos ao longo dos anos
+("Excesso de meação…" até 2020, "Adjudicação compulsória" a partir de 2021) — agrupe por
+(código, rótulo); `data_transacao` começa em 1994 (guias pagas em 2015+ com escritura antiga).
 
 * `GET /api/itbi/meta` →
   `{"periodo": {"min": "2015-01-02", "max": "2026-09-07"}, "atualizado_em": "...",

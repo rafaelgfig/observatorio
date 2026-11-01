@@ -74,8 +74,12 @@ def fingerprint(frame: pl.DataFrame) -> str:
     return hashlib.sha256(frame.write_csv().encode("utf-8")).hexdigest()[:16]
 
 
-def run(settings: Settings, *, force: bool = False) -> None:
-    """Baixa o que mudou, regrava só os meses alterados e mantém a geocodificação em dia."""
+def run(settings: Settings, *, force: bool = False, refresh_geosampa: bool = False) -> None:
+    """Baixa o que mudou, regrava só os meses alterados e mantém a geocodificação em dia.
+
+    ``force`` reprocessa as planilhas já baixadas e refaz a geocodificação;
+    ``refresh_geosampa`` baixa de novo as camadas do GeoSampa.
+    """
     started = time.perf_counter()
     manifest = Manifest(settings.manifest_path("itbi"))
     root = transacoes_dir(settings)
@@ -92,7 +96,7 @@ def run(settings: Settings, *, force: bool = False) -> None:
             time.perf_counter() - started,
             "com mudanças" if changed else "sem mudanças",
         )
-        _run_geocode(settings, force=force)
+        _run_geocode(settings, force=force, refresh_geosampa=refresh_geosampa)
     finally:
         # Mesmo que um ano seguinte ou a geocodificação falhe, o que mudou já está no disco.
         if changed or force:
@@ -113,9 +117,12 @@ def _ingest_year(
     key = f"itbi:{source.year}"
     dest = settings.raw_dir / "itbi" / f"itbi-{source.year}.xlsx"
     fetch(client, key=key, url=source.url, dest=dest, manifest=manifest)
-    previous = _processed_extra(manifest, key)
+    previous = manifest.metadata(key)
     if not (
-        force or manifest.needs_processing(key) or _partitions_missing(root, source.year, previous)
+        force
+        or manifest.needs_processing(key)
+        or previous.get("parser") != parse.PARSER_VERSION
+        or _partitions_missing(root, source.year, previous)
     ):
         return None
 
@@ -138,6 +145,7 @@ def _ingest_year(
 
     manifest.mark_processed(
         key,
+        parser=parse.PARSER_VERSION,
         meses=sorted(s.ref_month for s in sheets),
         linhas=report.rows,
         quarentena=len(report.quarantined),
@@ -146,12 +154,6 @@ def _ingest_year(
     )
     _log_report(report, time.perf_counter() - started)
     return report
-
-
-def _processed_extra(manifest: Manifest, key: str) -> dict[str, Any]:
-    entry: dict[str, Any] = manifest.as_dict().get(key, {})
-    extra: dict[str, Any] = entry.get("extra", {})
-    return extra
 
 
 def _partitions_missing(root: Path, year: int, previous: dict[str, Any]) -> bool:
@@ -218,7 +220,7 @@ def _log_report(report: YearReport, seconds: float) -> None:
     )
 
 
-def _run_geocode(settings: Settings, *, force: bool) -> None:
+def _run_geocode(settings: Settings, *, force: bool, refresh_geosampa: bool) -> None:
     """Chama a geocodificação, se o módulo já existir nesta instalação."""
     try:
         geocode = importlib.import_module(GEOCODE_MODULE)
@@ -227,4 +229,4 @@ def _run_geocode(settings: Settings, *, force: bool) -> None:
             raise
         log.warning("itbi: módulo de geocodificação indisponível; etapa ignorada")
         return
-    geocode.run(settings, force=force)
+    geocode.run(settings, force=force, refresh_geosampa=refresh_geosampa)

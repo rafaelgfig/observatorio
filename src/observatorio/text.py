@@ -6,6 +6,8 @@ import re
 import unicodedata
 
 _SPACES = re.compile(r"\s+")
+# início de palavra: começo do texto ou depois de hífen/apóstrofo/pontuação de abertura
+_WORD_START = re.compile(r"(^|[-'’(\[\"/])([^\W\d_])")
 _NON_ALNUM = re.compile(r"[^0-9a-z]+")
 
 # Tipos de logradouro abreviados usados no cadastro da Prefeitura de São Paulo.
@@ -16,12 +18,17 @@ STREET_TYPES: dict[str, str] = {
     "PCA": "Praça",
     "PC": "Praça",
     "TV": "Travessa",
+    "TVP": "Travessa Particular",
     "EST": "Estrada",
+    "ES": "Estrada",
     "ROD": "Rodovia",
+    "RV": "Rodovia",
     "VD": "Viaduto",
     "LG": "Largo",
     "LGO": "Largo",
+    "LD": "Ladeira",
     "PQ": "Parque",
+    "PRQ": "Parque",
     "VL": "Vila",
     "JD": "Jardim",
     "PS": "Passagem",
@@ -29,15 +36,53 @@ STREET_TYPES: dict[str, str] = {
     "VIA": "Via",
     "VEL": "Viela",
     "VLA": "Viela",
+    "VE": "Viela",
     "ESC": "Escadaria",
     "PTE": "Ponte",
     "BC": "Beco",
+    "AC": "Acesso",
+    "CM": "Caminho",
+    "CV": "Complexo Viário",
     "COMPL VIARIO": "Complexo Viário",
+    "RP": "Rua Particular",
     "PRAIA": "Praia",
     "PATIO": "Pátio",
-    "PRQ": "Parque",
     "CJ": "Conjunto",
     "SV": "Servidão",
+}
+
+# Títulos e tratamentos abreviados nos nomes de logradouros ("AV BRIG FARIA LIMA").
+TITLES: dict[str, str] = {
+    "ALM": "Almirante",
+    "BRIG": "Brigadeiro",
+    "CAP": "Capitão",
+    "CEL": "Coronel",
+    "CONS": "Conselheiro",
+    "DEP": "Deputado",
+    "DES": "Desembargador",
+    "DR": "Doutor",
+    "DRA": "Doutora",
+    "EMB": "Embaixador",
+    "ENG": "Engenheiro",
+    "GAL": "General",
+    "GEN": "General",
+    "MAJ": "Major",
+    "MAL": "Marechal",
+    "MARQ": "Marquês",
+    "MIN": "Ministro",
+    "MONS": "Monsenhor",
+    "NSRA": "Nossa Senhora",
+    "PDE": "Padre",
+    "PRES": "Presidente",
+    "PROF": "Professor",
+    "PROFA": "Professora",
+    "SARG": "Sargento",
+    "SEN": "Senador",
+    "SOLD": "Soldado",
+    "STA": "Santa",
+    "STO": "Santo",
+    "TTE": "Tenente",
+    "VISC": "Visconde",
 }
 
 _LOWER_WORDS = {"de", "da", "do", "das", "dos", "e", "em", "na", "no", "nas", "nos", "a", "o"}
@@ -63,27 +108,36 @@ def search_key(text: str | None) -> str:
 def title_pt(text: str, *, continuation: bool = False) -> str:
     """Title case em português, mantendo preposições em minúsculas.
 
-    ``continuation=True`` indica que o texto continua uma frase (a 1ª palavra também
-    pode ficar minúscula).
+    Maiúscula na 1ª letra de cada palavra e após hífen ou apóstrofo (``"M'BOI"`` → "M'Boi",
+    ``"(JACANA-JAC)"`` → "(Jacana-Jac)"). ``continuation=True`` indica que o texto continua
+    uma frase (a 1ª palavra também pode ficar minúscula).
     """
-    words = text.lower().split()
     out = []
+    words = text.lower().split()
     for i, word in enumerate(words):
-        if (i > 0 or continuation) and word in _LOWER_WORDS:
+        # preposições em minúsculas, exceto na última posição ("Freguesia do O", "Rua A")
+        if (i > 0 or continuation) and i < len(words) - 1 and word in _LOWER_WORDS:
             out.append(word)
         else:
-            out.append(word[:1].upper() + word[1:])
+            out.append(_WORD_START.sub(lambda m: m.group(1) + m.group(2).upper(), word))
     return " ".join(out)
 
 
 def expand_street(name: str | None) -> str:
-    """``"R ISIDORO FARINA"`` → ``"Rua Isidoro Farina"`` (tipo de logradouro por extenso)."""
+    """``"AV BRIG FARIA LIMA"`` → ``"Avenida Brigadeiro Faria Lima"``.
+
+    Expande o tipo de logradouro (1ª palavra) e títulos abreviados (``DR``, ``STO``…).
+    """
     if not name:
         return ""
     clean = _SPACES.sub(" ", name.strip())
     upper = clean.upper()
+    kind = ""
     for abbr in sorted(STREET_TYPES, key=len, reverse=True):
         if upper == abbr or upper.startswith(abbr + " "):
-            rest = clean[len(abbr) :].strip()
-            return f"{STREET_TYPES[abbr]} {title_pt(rest, continuation=True)}".strip()
-    return title_pt(clean)
+            kind = STREET_TYPES[abbr]
+            clean = clean[len(abbr) :].strip()
+            break
+    words = [TITLES.get(w.upper().rstrip("."), w) for w in clean.split()]
+    rest = title_pt(" ".join(words), continuation=bool(kind))
+    return f"{kind} {rest}".strip()

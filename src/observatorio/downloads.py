@@ -72,6 +72,11 @@ class Manifest:
         entry = self._entries.get(key)
         return entry.download if entry else None
 
+    def metadata(self, key: str) -> dict[str, Any]:
+        """Metadados extras gravados em :meth:`mark_processed` (vazio se não houver)."""
+        entry = self._entries.get(key)
+        return dict(entry.extra) if entry else {}
+
     def needs_processing(self, key: str) -> bool:
         entry = self._entries.get(key)
         return (

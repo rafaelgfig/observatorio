@@ -28,6 +28,9 @@ log = logging.getLogger(__name__)
 # Tolerância de simplificação em graus (~600 m). 0.006 → ~417 mil vértices, ~2.4 MB gzip.
 SIMPLIFY_TOLERANCE = 0.006
 COORD_PRECISION = 0.0001
+# Partes de um município/UF a até esta distância (graus) da parte principal entram no
+# enquadramento do mapa; mais longe que isso (ilhas oceânicas) ficam de fora.
+FRAME_DISTANCE = 1.0
 
 OUTPUTS = (
     "municipios.geojson",
@@ -146,17 +149,30 @@ def _simplify(con: duckdb.DuckDBPyConnection) -> None:
         """
     )
     con.execute(
+        f"""
+        CREATE MACRO enquadramento(g) AS TABLE
+        -- Parte principal (maior área) + partes próximas a ela. Ilhas distantes, como Trindade
+        -- (Vitória/ES), entram na malha mas não no ponto nem na caixa usada para enquadrar.
+        WITH partes AS (SELECT unnest(ST_Dump(g)).geom AS p),
+        principal AS (SELECT arg_max(p, ST_Area(p)) AS m FROM partes),
+        perto AS (
+            SELECT ST_Collect(list(p)) AS c FROM partes, principal
+            WHERE ST_Distance(p, m) <= {FRAME_DISTANCE}
+        )
+        SELECT ST_X(ST_PointOnSurface(m)) AS lon, ST_Y(ST_PointOnSurface(m)) AS lat,
+               ST_XMin(c) AS bbox_w, ST_YMin(c) AS bbox_s,
+               ST_XMax(c) AS bbox_e, ST_YMax(c) AS bbox_n
+        FROM principal, perto
+        """
+    )
+    con.execute(
         """
         CREATE TABLE municipios AS
-        SELECT l.cod, l.nome, l.uf, l.uf_cod, l.uf_nome, l.regiao, p.populacao,
-               s.geom,
-               ST_X(ST_PointOnSurface(s.geom)) AS lon,
-               ST_Y(ST_PointOnSurface(s.geom)) AS lat,
-               ST_XMin(s.geom) AS bbox_w, ST_YMin(s.geom) AS bbox_s,
-               ST_XMax(s.geom) AS bbox_e, ST_YMax(s.geom) AS bbox_n
+        SELECT l.cod, l.nome, l.uf, l.uf_cod, l.uf_nome, l.regiao, p.populacao, s.geom, e.*
         FROM localidades l
         LEFT JOIN simplificada s USING (cod)
         LEFT JOIN populacao p USING (cod)
+        LEFT JOIN LATERAL (SELECT * FROM enquadramento(s.geom)) e ON true
         ORDER BY l.cod
         """
     )
@@ -170,10 +186,7 @@ def _simplify(con: duckdb.DuckDBPyConnection) -> None:
             FROM municipios WHERE geom IS NOT NULL
             GROUP BY uf_cod, uf
         )
-        SELECT *, ST_X(ST_PointOnSurface(geom)) AS lon, ST_Y(ST_PointOnSurface(geom)) AS lat,
-               ST_XMin(geom) AS bbox_w, ST_YMin(geom) AS bbox_s,
-               ST_XMax(geom) AS bbox_e, ST_YMax(geom) AS bbox_n
-        FROM u ORDER BY cod
+        SELECT u.*, e.* FROM u, LATERAL (SELECT * FROM enquadramento(u.geom)) e ORDER BY u.cod
         """
     )
     missing = con.execute("SELECT list(cod) FROM municipios WHERE geom IS NULL").fetchall()[0][0]

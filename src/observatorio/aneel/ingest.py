@@ -83,7 +83,7 @@ def _rebuild_reasons(
 ) -> list[str]:
     """Por que reconstruir (lista vazia = nada a fazer)."""
     motivos = [res.key for res in found.all() if manifest.needs_processing(res.key)]
-    extra = manifest.as_dict().get(found.indqual.key, {}).get("extra", {})
+    extra = manifest.metadata(found.indqual.key)
     if extra.get(GEO_EXTRA) != geo:
         motivos.append("geo/municipios.parquet mudou")
     if not transform.outputs_exist(out_dir, sorted(found.interrupcoes)):

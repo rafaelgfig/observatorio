@@ -61,18 +61,19 @@ def busca(
     term_params: list[str] = [t for t in terms for _ in range(2)]
     sql = f"""
         SELECT tipo, id, rotulo, detalhe, lon, lat, bbox_w, bbox_s, bbox_e, bbox_n
-        FROM places
-        WHERE escopo = ?
-          AND (({term_sql})
-               OR (length(?) >= 4 AND jaro_winkler_similarity(norm, ?) >= 0.9))
+        FROM (
+            SELECT *, ({term_sql}) AS por_termos FROM places WHERE escopo = ?
+        )
+        WHERE por_termos OR (length(?) >= 4 AND jaro_winkler_similarity(norm, ?) >= 0.9)
         ORDER BY norm = ? DESC,
                  starts_with(norm, ?) DESC,
-                 jaro_winkler_similarity(norm, ?) DESC,
+                 por_termos DESC,
                  peso DESC,
+                 jaro_winkler_similarity(norm, ?) DESC,
                  length(rotulo)
         LIMIT ?
     """
-    params = [escopo, *term_params, full, full, full, full, full, limite]
+    params = [*term_params, escopo, full, full, full, full, full, limite]
     rows = db.fetch_dicts(sql, params)
     return [
         Lugar(
