@@ -555,6 +555,7 @@ input[type="range"] {
   right: 0;
   max-height: 340px;
   overflow-y: auto;
+  overflow-x: hidden;
   margin: 0;
   padding: var(--space-1);
   list-style: none;
@@ -584,7 +585,7 @@ input[type="range"] {
 }
 
 .listbox-label {
-  flex: 1;
+  flex: 0 1 auto;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -592,6 +593,11 @@ input[type="range"] {
 }
 
 .listbox-detail {
+  flex: 1 1 0;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  text-align: right;
   color: var(--text-muted);
   font-size: var(--fs-xs);
   white-space: nowrap;

@@ -150,7 +150,10 @@ export function unmount() {
 function stateFromParams(p) {
   /** @type {Escopo} */
   let escopo = { tipo: "brasil" };
-  if (p.get("mun")) escopo = { tipo: "municipio", id: String(p.get("mun")), nome: "" };
+  if (p.get("mun")) {
+    const cod = String(p.get("mun"));
+    escopo = { tipo: "municipio", id: cod, nome: "", uf: ufFromCode(cod) };
+  }
   else if (p.get("uf")) escopo = { tipo: "uf", id: String(p.get("uf")), nome: "" };
   else if (p.get("ag")) escopo = { tipo: "distribuidora", id: String(p.get("ag")), nome: "" };
   const metrica = p.get("m") ?? "dec";
@@ -195,6 +198,7 @@ async function start() {
   clampMonths();
   renderFilters();
   refreshAll();
+  fitScope();
 }
 
 // ------------------------------------------------------------------ painel
@@ -763,7 +767,9 @@ function renderInterruptions(rows) {
     ui.interruptions.replaceChildren(el("p", { className: "muted", textContent: "Nenhuma interrupção no período." }));
     return;
   }
-  const estimated = rows.some((r) => r.municipio_estimado);
+  // em 2025 nenhum registro tem município: o aviso só faz sentido num recorte geográfico
+  const local = state.escopo.tipo === "municipio" || state.escopo.tipo === "uf";
+  const estimated = local && rows.some((r) => r.municipio_estimado);
   ui.interruptions.replaceChildren(
     el(
       "ul",
@@ -779,13 +785,15 @@ function renderInterruptions(rows) {
         ]),
       ),
     ),
-    estimated
-      ? el("p", {
-          className: "section-subtitle",
-          textContent: "Em 2025 a lista inclui interrupções dos conjuntos elétricos que atendem o município.",
-        })
-      : null,
   );
+  if (estimated) {
+    ui.interruptions.append(
+      el("p", {
+        className: "section-subtitle",
+        textContent: "Em 2025 a lista inclui interrupções dos conjuntos elétricos que atendem o recorte.",
+      }),
+    );
+  }
 }
 
 function renderGaps() {
@@ -815,22 +823,65 @@ function renderGaps() {
  */
 function selectMunicipio(cod, nome, uf) {
   const keepMap = state.escopo.tipo !== "distribuidora";
-  state.escopo = { tipo: "municipio", id: cod, nome, uf };
+  state.escopo = { tipo: "municipio", id: cod, nome, uf: uf ?? ufFromCode(cod) };
   refreshAll({ keepMap });
-  void fitMunicipio(cod);
+  fitScope();
 }
 
-/** Enquadra um município usando a geometria já carregada no mapa. */
-async function fitMunicipio(/** @type {string} */ cod) {
-  try {
-    const [place] = await api("/busca", { params: { q: state.escopo.tipo === "municipio" ? state.escopo.nome.split(" – ")[0] : cod, escopo: "aneel", limite: 10 } }).then((rows) =>
-      /** @type {any[]} */ (rows).filter((r) => r.tipo === "municipio" && r.id === cod),
-    );
-    if (place?.bbox) ctx?.fit(place.bbox, 10);
-  } catch {
-    /* enquadrar é opcional */
+/** UF de um município pelos 2 primeiros dígitos do código IBGE. */
+function ufFromCode(/** @type {string} */ cod) {
+  return UF_BY_CODE[cod.slice(0, 2)];
+}
+
+/**
+ * Enquadra o município ou a UF selecionada usando a geometria já carregada no mapa
+ * (útil ao abrir um link compartilhado, quando não há caixa vinda da busca).
+ */
+function fitScope() {
+  if (!ctx) return;
+  const { map } = ctx;
+  const e = state.escopo;
+  if (e.tipo !== "municipio" && e.tipo !== "uf") return;
+  const run = () => {
+    const filter = e.tipo === "municipio" ? ["==", ["get", "cod"], Number(e.id)] : ["==", ["get", "uf"], e.id];
+    const features = map.querySourceFeatures(SRC_MUN, { filter: /** @type {any} */ (filter) });
+    let w = Infinity;
+    let s = Infinity;
+    let east = -Infinity;
+    let n = -Infinity;
+    for (const f of features) {
+      const geom = /** @type {any} */ (f.geometry);
+      const polys = geom.type === "Polygon" ? [geom.coordinates] : geom.coordinates;
+      for (const poly of polys) {
+        for (const [x, y] of poly[0]) {
+          w = Math.min(w, x);
+          s = Math.min(s, y);
+          east = Math.max(east, x);
+          n = Math.max(n, y);
+        }
+      }
+    }
+    if (Number.isFinite(w)) ctx?.fit([w, s, east, n], e.tipo === "municipio" ? 10 : 7);
+  };
+  if (map.isSourceLoaded(SRC_MUN)) run();
+  else {
+    const onData = (/** @type {any} */ ev) => {
+      if (ev.sourceId === SRC_MUN && map.isSourceLoaded(SRC_MUN)) {
+        map.off("sourcedata", onData);
+        run();
+      }
+    };
+    map.on("sourcedata", onData);
   }
 }
+
+/** @type {Record<string, string>} */
+const UF_BY_CODE = {
+  11: "RO", 12: "AC", 13: "AM", 14: "RR", 15: "PA", 16: "AP", 17: "TO",
+  21: "MA", 22: "PI", 23: "CE", 24: "RN", 25: "PB", 26: "PE", 27: "AL", 28: "SE", 29: "BA",
+  31: "MG", 32: "ES", 33: "RJ", 35: "SP", 41: "PR", 42: "SC", 43: "RS",
+  50: "MS", 51: "MT", 52: "GO", 53: "DF",
+};
 
 // ------------------------------------------------------------------ mapa
 

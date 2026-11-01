@@ -48,11 +48,8 @@ function tooltip() {
  */
 export function showTooltip(x, y, value, label, extra) {
   const tip = tooltip();
-  tip.replaceChildren(
-    el("strong", { textContent: value }),
-    el("span", { className: "muted", textContent: label }),
-    extra ? el("div", { className: "muted", textContent: extra }) : null,
-  );
+  tip.replaceChildren(el("strong", { textContent: value }), el("span", { className: "muted", textContent: label }));
+  if (extra) tip.append(el("div", { className: "muted", textContent: extra }));
   tip.hidden = false;
   const { width, height } = tip.getBoundingClientRect();
   const left = Math.min(Math.max(8, x - width / 2), window.innerWidth - width - 8);

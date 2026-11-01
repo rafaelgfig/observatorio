@@ -41,8 +41,8 @@ export function createLegend(host) {
         ramp,
         ticks,
         el("div", { className: "legend-nodata" }, [el("i"), el("span", { textContent: nodataLabel })]),
-        note ? el("div", { className: "legend-nodata", textContent: note }) : null,
       );
+      if (note) card.append(el("div", { className: "legend-nodata", textContent: note }));
       card.hidden = false;
     },
     hide() {
