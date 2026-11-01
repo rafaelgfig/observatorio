@@ -10,6 +10,7 @@ import threading
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.gzip import GZipMiddleware
@@ -38,6 +39,15 @@ GEO_DATASETS = (
 GEO_FILES = {"municipios.geojson", "ufs.geojson"}
 
 RELOAD_INTERVAL_S = 5.0
+
+
+class _RevalidatingStaticFiles(StaticFiles):
+    """Arquivos estáticos sem hash no nome: o navegador revalida sempre (ETag → 304 barato)."""
+
+    def file_response(self, *args: Any, **kwargs: Any) -> Response:
+        response = super().file_response(*args, **kwargs)
+        response.headers["Cache-Control"] = "no-cache"
+        return response
 
 
 def datasets() -> list[Dataset]:
@@ -125,7 +135,7 @@ def create_app(settings: Settings | None = None, *, watch: bool = True) -> FastA
             return FileResponse(gz, media_type="application/geo+json", headers=headers)
         return FileResponse(path, media_type="application/geo+json", headers=headers)
 
-    app.mount("/static", StaticFiles(directory=WEB_DIR), name="static")
+    app.mount("/static", _RevalidatingStaticFiles(directory=WEB_DIR), name="static")
 
     @app.get("/", include_in_schema=False)
     def index() -> FileResponse:

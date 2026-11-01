@@ -67,3 +67,23 @@ def test_connect_spatial() -> None:
     con = connect(spatial=True)
     assert con.execute("SELECT ST_AsText(ST_Point(1, 2))").fetchall() == [("POINT (1 2)",)]
     con.close()
+
+
+def test_dataset_derivado_por_query(tmp_path: Path) -> None:
+    pl.DataFrame({"k": [1, 2], "v": [10.0, 20.0]}).write_parquet(tmp_path / "a.parquet")
+    pl.DataFrame({"k": [1], "geo": ["x"]}).write_parquet(tmp_path / "b.parquet")
+    derivado = Dataset(
+        "ab",
+        materialize=True,
+        query="SELECT a.*, b.geo FROM a LEFT JOIN b USING (k)",
+        requires=("a", "b"),
+        order_by="k",
+    )
+    db = Database(tmp_path, [Dataset("a", "a.parquet"), Dataset("b", "b.parquet"), derivado])
+    assert db.has("ab")
+    assert db.fetch_dicts("SELECT k, geo FROM ab") == [{"k": 1, "geo": "x"}, {"k": 2, "geo": None}]
+
+    (tmp_path / "b.parquet").unlink()
+    db.refresh()
+    assert not db.has("ab")
+    db.close()

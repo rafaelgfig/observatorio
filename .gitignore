@@ -27,3 +27,6 @@ Thumbs.db
 
 # Segredos locais
 .env
+
+# Ferramentas locais
+.claude/

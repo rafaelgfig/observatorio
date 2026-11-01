@@ -68,17 +68,23 @@ def enable_spatial(con: duckdb.DuckDBPyConnection) -> None:
 class Dataset:
     """Um conjunto de dados exposto à API.
 
-    ``path`` é um arquivo ``.parquet`` ou um diretório (lido recursivamente) — relativo ao
-    diretório ``processed``. Com ``materialize=True`` vira uma tabela em memória
+    ``path`` é um arquivo ``.parquet``, um diretório (lido recursivamente) ou um glob — relativo
+    ao diretório ``processed``. Com ``materialize=True`` vira uma tabela em memória
     (opcionalmente ordenada e com índices), útil para consultas espaciais repetidas.
+
+    Alternativamente, ``query`` define o conteúdo com SQL que referencia outros datasets
+    (pelo nome) listados em ``requires`` — que devem vir antes na lista. Ex.: uma tabela
+    materializada juntando duas views.
     """
 
     name: str
-    path: str
+    path: str = ""
     materialize: bool = False
     select: str = "*"
     order_by: str | None = None
     post_sql: tuple[str, ...] = field(default_factory=tuple)
+    query: str | None = None
+    requires: tuple[str, ...] = field(default_factory=tuple)
 
 
 class Database:
@@ -102,9 +108,15 @@ class Database:
         con.execute("SET preserve_insertion_order = false")
         available: set[str] = set()
         for ds in self.datasets.values():
-            source = self._source(ds)
-            if source is None:
-                continue
+            if ds.query is not None:
+                if not all(r in available for r in ds.requires):
+                    continue
+                source = ""
+            else:
+                found = self._source(ds)
+                if found is None:
+                    continue
+                source = found
             try:
                 self._create(con, ds, source)
             except duckdb.Error:
@@ -177,11 +189,17 @@ class Database:
 
     @staticmethod
     def _create(con: duckdb.DuckDBPyConnection, ds: Dataset, source: str) -> None:
-        scan = f"read_parquet('{source}', hive_partitioning = false, union_by_name = true)"
+        if ds.query is not None:
+            body = f"SELECT {ds.select} FROM ({ds.query})"
+        else:
+            body = (
+                f"SELECT {ds.select} FROM read_parquet('{source}', "
+                "hive_partitioning = false, union_by_name = true)"
+            )
         if not ds.materialize:
-            con.execute(f'CREATE OR REPLACE VIEW "{ds.name}" AS SELECT {ds.select} FROM {scan}')
+            con.execute(f'CREATE OR REPLACE VIEW "{ds.name}" AS {body}')
             return
         order = f" ORDER BY {ds.order_by}" if ds.order_by else ""
-        con.execute(f'CREATE OR REPLACE TABLE "{ds.name}" AS SELECT {ds.select} FROM {scan}{order}')
+        con.execute(f'CREATE OR REPLACE TABLE "{ds.name}" AS {body}{order}')
         for statement in ds.post_sql:
             con.execute(statement)
