@@ -48,14 +48,26 @@ export async function api(path, { params = {}, body, signal } = {}) {
   if (!response.ok) {
     let detail = response.statusText;
     try {
-      const payload = await response.json();
-      detail = typeof payload.detail === "string" ? payload.detail : JSON.stringify(payload.detail);
+      detail = formatDetail((await response.json()).detail) || detail;
     } catch {
       /* corpo não-JSON */
     }
     throw new ApiError(detail, response.status);
   }
   return /** @type {Promise<T>} */ (response.json());
+}
+
+/**
+ * Mensagem legível a partir do `detail` da API: texto simples ou a lista de erros de
+ * validação do FastAPI (422).
+ * @param {unknown} detail
+ */
+export function formatDetail(detail) {
+  if (typeof detail === "string") return detail;
+  if (Array.isArray(detail)) {
+    return detail.map((item) => String(item?.msg ?? item).replace(/^Value error, /, "")).join("; ");
+  }
+  return detail == null ? "" : JSON.stringify(detail);
 }
 
 /**

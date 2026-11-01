@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Instalar uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Dependências
+        run: uv sync --locked
+
+      - name: Lint
+        run: |
+          uv run ruff check .
+          uv run ruff format --check .
+
+      - name: Tipos
+        run: uv run mypy
+
+      - name: Testes
+        run: uv run pytest --cov --cov-report=term-missing
+
+      - name: Sintaxe do frontend
+        run: |
+          for f in $(find src/observatorio/web/js -name '*.js'); do
+            node --input-type=module --check < "$f"
+          done

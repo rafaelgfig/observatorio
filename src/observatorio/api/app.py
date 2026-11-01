@@ -13,8 +13,9 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from observatorio import __version__
@@ -88,6 +89,13 @@ class _VersionWatcher:
         self._stop.set()
 
 
+async def _validation_error(request: Request, exc: Exception) -> JSONResponse:
+    """422 como o do FastAPI, mas tolerante a NaN/Infinity no corpo recebido."""
+    errors = exc.errors() if isinstance(exc, RequestValidationError) else []
+    detail = [{k: v for k, v in e.items() if k not in {"input", "ctx", "url"}} for e in errors]
+    return JSONResponse(status_code=422, content={"detail": detail})
+
+
 def create_app(settings: Settings | None = None, *, watch: bool = True) -> FastAPI:
     settings = settings or get_settings()
 
@@ -114,7 +122,9 @@ def create_app(settings: Settings | None = None, *, watch: bool = True) -> FastA
         docs_url="/api/docs",
         openapi_url="/api/openapi.json",
     )
-    app.add_middleware(GZipMiddleware, minimum_size=1024)
+    # nível 5: quase a mesma taxa do 9 em metade do tempo (GeoJSON de 20 mil pontos ~3,8 MB)
+    app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=5)
+    app.add_exception_handler(RequestValidationError, _validation_error)
 
     app.include_router(meta.router)
     app.include_router(search.router)

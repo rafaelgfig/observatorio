@@ -33,7 +33,7 @@ export const SAO_PAULO_BOUNDS = [
  * @property {typeof maplibregl} maplibregl
  * @property {(fn: () => void) => () => void} onStyle  registra camadas; devolve função p/ cancelar
  * @property {(theme: "dark" | "light") => void} setTheme
- * @property {() => string | undefined} labelLayerId   1ª camada de símbolos (inserir preenchimentos abaixo)
+ * @property {() => string | undefined} labelLayerId   rótulos do basemap (inserir camadas de dados abaixo)
  * @property {(bbox: [number, number, number, number] | [[number, number], [number, number]], maxZoom?: number) => void} fit
  */
 
@@ -73,7 +73,10 @@ export function createMap(container) {
     }
   };
 
+  /** Camadas do basemap (as das views são acrescentadas depois). */
+  let baseLayers = new Set();
   map.on("style.load", () => {
+    baseLayers = new Set(map.getStyle().layers.map((layer) => layer.id));
     styleReady = true;
     runAll();
   });
@@ -100,7 +103,14 @@ export function createMap(container) {
       map.setStyle(BASEMAPS[theme]);
     },
     labelLayerId() {
-      return map.getStyle().layers.find((layer) => layer.type === "symbol")?.id;
+      // 1ª camada de rótulos acima de todas as linhas/preenchimentos do basemap: dados ficam
+      // sobre ruas e prédios, e os nomes continuam legíveis por cima deles.
+      const base = map.getStyle().layers.filter((layer) => baseLayers.has(layer.id));
+      let last = -1;
+      base.forEach((layer, i) => {
+        if (layer.type === "line" || layer.type === "fill" || layer.type === "fill-extrusion") last = i;
+      });
+      return base.slice(last + 1).find((layer) => layer.type === "symbol")?.id;
     },
     fit(bbox, maxZoom = 15) {
       /** @type {[[number, number], [number, number]]} */

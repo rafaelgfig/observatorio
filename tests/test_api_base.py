@@ -75,3 +75,13 @@ def test_geojson_pre_comprimido(client: TestClient, settings: Settings) -> None:
 def test_index_e_estaticos(client: TestClient) -> None:
     assert client.get("/").status_code == 200
     assert client.get("/static/css/app.css").status_code == 200
+
+
+def test_422_com_nan_no_corpo_nao_vira_500(client: TestClient) -> None:
+    resp = client.post(
+        "/api/itbi/resumo",
+        content=b'{"valor_min": NaN}',
+        headers={"Content-Type": "application/json"},
+    )
+    assert resp.status_code == 422
+    assert resp.json()["detail"][0]["loc"][-1] == "valor_min"

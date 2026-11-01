@@ -18,7 +18,9 @@ Tema escuro por padrão, sem chaves de API (basemap do [OpenFreeMap](https://ope
 ## Requisitos
 
 * [uv](https://docs.astral.sh/uv/) (instala o Python 3.13 sozinho)
-* Internet na primeira ingestão (~1 GB de downloads no total) e para os mapas de fundo
+* Internet na primeira ingestão (~1,3 GB de downloads, ~2 min de processamento) e para os
+  mapas de fundo
+* ~2 GB de RAM livres para o servidor (o ITBI é carregado em memória e comprimido)
 
 ## Começando
 

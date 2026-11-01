@@ -123,6 +123,8 @@ class Database:
                 log.exception("falha ao carregar %s", ds.name)
                 continue
             available.add(ds.name)
+        # Comprime as tabelas materializadas (ex.: ITBI ~470 → ~80 MiB) antes de servir.
+        con.execute("FORCE CHECKPOINT")
         with self._lock:
             old, self._con = self._con, con
             self.available = frozenset(available)

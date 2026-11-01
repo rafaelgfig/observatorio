@@ -77,9 +77,10 @@ const ctx = {
 let current = null;
 let routing = Promise.resolve();
 
-async function route() {
+/** @param {boolean} [remount] recarrega a view mesmo sem trocar de rota (link colado) */
+async function route(remount = false) {
   const { name } = parseHash();
-  if (current?.name === name) return;
+  if (current?.name === name && !remount) return;
   current?.view.unmount();
   current = null;
   panel.replaceChildren();
@@ -94,7 +95,8 @@ async function route() {
   view.mount(ctx);
 }
 
+// `setParams` usa replaceState (não dispara hashchange): este evento é navegação do usuário.
 window.addEventListener("hashchange", () => {
-  routing = routing.then(route).catch((error) => console.error("rota:", error));
+  routing = routing.then(() => route(true)).catch((error) => console.error("rota:", error));
 });
 routing = route().catch((error) => console.error("rota:", error));

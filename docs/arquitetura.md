@@ -319,8 +319,16 @@ Observações para a implementação: `natureza` código 5 tem dois rótulos ao 
 * `POST /api/itbi/exportar` → CSV (`;`, UTF-8 com BOM) com as linhas filtradas.
 * `GET /api/itbi/transacao/{id}` → todas as colunas de uma transação.
 * `GET /api/itbi/area/{tipo}/{id}` → `{"tipo", "id", "nome", "geometria": GeoJSON, "bbox"}`.
-* `GET /api/itbi/tiles/{z}/{x}/{y}.mvt?data_ini=&data_fim=&tipo=&natureza=` → vector tile:
-  camada `itbi_agg` (z < 14; pontos de grade com `n`, `m2`) ou `itbi` (z ≥ 14; `id`, `v`, `m2`, `t`).
+* `GET /api/itbi/tiles/{z}/{x}/{y}.mvt?data_ini=&data_fim=&tipo=&natureza=&valor_min=&valor_max=&area_min=&area_max=&logradouro=&cep=&precisao=`
+  → vector tile (z 9–18; `tipo`/`natureza` repetíveis; mesmos filtros de `ConsultaItbi`, sem
+  área). Camada `itbi_agg` (z < 14): pontos de uma grade de 128 unidades com `n` (guias) e `m2`
+  (mediana de R$/m²). Camada `itbi` (z ≥ 14): uma feição por ponto geocodificado com `n` (guias no
+  ponto), `m2` (mediana no ponto) e `id`, `v`, `t`, `d` da guia mais recente. Propriedades nulas
+  são omitidas; não há *feature id* (use a propriedade `id`). Corpo vazio = nada no tile.
+* `POST /api/itbi/pontos`: `total` conta as guias filtradas **com coordenada**.
+* `POST /api/itbi/exportar`: no máximo 500 mil linhas (as mais recentes); cabeçalhos
+  `X-Total-Linhas`, `X-Linhas-Exportadas`, `X-Limite-Linhas`, `X-Truncado`. CEP sai como
+  `01452-000` e textos que começam com `= + - @` ganham apóstrofo (proteção contra fórmulas).
 
 ## Frontend
 
