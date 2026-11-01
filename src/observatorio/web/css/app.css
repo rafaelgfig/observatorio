@@ -868,6 +868,11 @@ input[type="range"] {
   min-width: 220px;
 }
 
+/* com a gaveta de resultados (ITBI), a legenda sobe para não ficar atrás do cabeçalho dela */
+.drawer ~ .map-legend {
+  bottom: calc(var(--space-3) + 60px);
+}
+
 .legend-title {
   font-size: var(--fs-xs);
   color: var(--text-secondary);
