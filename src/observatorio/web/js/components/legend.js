@@ -11,6 +11,7 @@ import { el } from "../dom.js";
  * @property {(v: number) => string} format
  * @property {string} [nodataLabel]
  * @property {string} [note]            observação curta (ex.: "valores estimados")
+ * @property {string[]} [labels]        rótulos fixos sob a rampa (ex.: ["menos", "mais"])
  */
 
 /**
@@ -25,12 +26,16 @@ export function createLegend(host) {
   return {
     /** @param {LegendOptions} options */
     render(options) {
-      const { title, colors, breaks, format, nodataLabel = "Sem dados", note } = options;
+      const { title, colors, breaks, format, nodataLabel = "Sem dados", note, labels } = options;
       const ramp = el("div", { className: "legend-ramp" }, colors.map((c) => el("span", { style: `background:${c}` })));
       // rótulos: início, limites intermediários selecionados e fim
       const ticks = el("div", { className: "legend-ticks" });
-      const picks = breaks.length > 4 ? [breaks[1], breaks[3], breaks[5] ?? breaks[breaks.length - 1]] : breaks;
-      ticks.append(el("span", { textContent: "0" }), ...picks.map((b) => el("span", { textContent: format(b) })));
+      if (labels) {
+        ticks.append(...labels.map((text) => el("span", { textContent: text })));
+      } else {
+        const picks = breaks.length > 4 ? [breaks[1], breaks[3], breaks[5] ?? breaks[breaks.length - 1]] : breaks;
+        ticks.append(el("span", { textContent: "0" }), ...picks.map((b) => el("span", { textContent: format(b) })));
+      }
       card.replaceChildren(
         el("div", { className: "legend-title", textContent: title }),
         ramp,
