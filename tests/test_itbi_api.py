@@ -284,8 +284,14 @@ def test_meta(api: TestClient) -> None:
     resp = api.get("/api/itbi/meta")
     assert resp.status_code == 200
     meta = resp.json()
-    # 1º dia do 1º mês de pagamento (a escritura de dez/2014 foi paga em jan/2015)
-    assert meta["periodo"] == {"min": "2015-01-01", "max": "2026-08-20"}
+    # datas de transação (a escritura de dez/2014 foi paga em jan/2015); último mês de
+    # pagamento = ago/2026, então só até jul/2026 os meses de transação estão completos
+    assert meta["periodo"] == {
+        "min": "2014-12-20",
+        "max": "2026-08-20",
+        "pago_ate": "2026-08-31",
+        "completo_ate": "2026-07-31",
+    }
     assert meta["total"] == 9
     assert meta["tipos"] == [{"id": t, "nome": t.capitalize()} for t in TIPOS]
     assert meta["naturezas"] == [
@@ -571,6 +577,7 @@ def test_linhas_da_tabela(api: TestClient) -> None:
         "bairro": "CENTRO",
         "cep": "01001000",
         "tipo": "apartamento",
+        "na_planta": False,
         "uso": "OUTROS",
         "padrao": "RESIDENCIAL HORIZONTAL",
         "area_construida": 75.0,
@@ -698,6 +705,7 @@ def test_csv_lote_formata_e_protege_formulas() -> None:
             "bairro": ["@x", "+y"],
             "cep": ["01452000", None],
             "tipo": ["comercial", "casa"],
+            "na_planta": [False, None],
             "uso": [None, None],
             "padrao": [None, None],
             "area_construida": [10.25, None],
@@ -716,11 +724,11 @@ def test_csv_lote_formata_e_protege_formulas() -> None:
     linhas = queries.csv_lote(frame).splitlines()
     # CEP com hífen (a planilha não perde o zero); números negativos não são "fórmula"
     assert linhas[0] == (
-        "1;2025-01-02;Avenida Brigadeiro Faria Lima, 1;'=SOMA(A1);'@x;01452-000;comercial;;;"
+        "1;2025-01-02;Avenida Brigadeiro Faria Lima, 1;'=SOMA(A1);'@x;01452-000;comercial;não;;;"
         "10,25;;1,5;;Compra e venda;;2000;lote;-46,5;-23,5"
     )
     # toda coluna de texto é protegida, não só as de endereço (financiamento, aqui)
-    assert linhas[1] == '2;;;"SALA ""2""";\'+y;;casa;;;;1,0;2,0;;;\'=HYPERLINK(1);;;;'
+    assert linhas[1] == '2;;;"SALA ""2""";\'+y;;casa;;;;;1,0;2,0;;;\'=HYPERLINK(1);;;;'
 
 
 _TEXTOS_LOTE = (
@@ -1151,3 +1159,96 @@ def test_injecao_no_logradouro_nao_vaza(api: TestClient, logradouro: str) -> Non
     assert len(_csv(resp)) == 1
     # a tabela continua lá, inteira
     assert api.get("/api/itbi/meta").json()["total"] == 9
+
+
+# ------------------------------------------------------------------ áreas do lote (na planta)
+
+
+def test_area_do_lote_nao_vale_como_area_da_unidade(tmp_path: Path) -> None:
+    """Na planta (T8) e fração < 10% (T9): as áreas do IPTU são do lote inteiro."""
+    settings = Settings(data_dir=tmp_path / "dados")
+    escreve_cenario(settings.processed_dir)
+    parte = (
+        settings.processed_dir / "itbi" / "transacoes" / "ref_year=2026" / "ref_month=08"
+    ) / "part.parquet"
+    pl.read_parquet(parte).with_columns(
+        na_planta=pl.col("id") == T8,
+        area_construida_m2=pl.when(pl.col("id") == T8).then(3997.0).otherwise(0.0),
+        proporcao_pct=pl.when(pl.col("id") == T9).then(5.0).otherwise(100.0),
+    ).write_parquet(parte)
+
+    with TestClient(create_app(settings, watch=False)) as client:
+        todas = {"precisao": "qualquer"}
+        assert T8 not in ids(client, {**todas, "area_min": 1000})
+        assert T9 not in ids(client, {**todas, "area_max": 80})
+        assert not {T8, T9} & ids(client, {**todas, "area_min": 0})
+        com_lotes = [g[6] if g[2] == "terreno" else g[5] for g in GUIAS if g[0][:2] != (2026, 8)]
+        assert post(client, "resumo", todas)["area_mediana"] == statistics.median(com_lotes)
+
+        corpo = {"consulta": todas, "ordem": "area", "direcao": "asc", "por_pagina": 200}
+        linhas = post(client, "transacoes", corpo)["linhas"]
+        assert [linha["id"] for linha in linhas][-2:] == [T8, T9]  # área nula: no fim, por id
+        t8 = next(linha for linha in linhas if linha["id"] == T8)
+        assert (t8["na_planta"], t8["area_construida"], t8["area_terreno"]) == (True, None, 1000)
+
+        csv_ = _csv(client.post("/api/itbi/exportar", json=todas))
+        nomes = csv_[0]
+        t8_csv = next(c for c in csv_[1:] if int(c[0]) == T8)
+        assert t8_csv[nomes.index("Na planta")] == "sim"
+        assert t8_csv[nomes.index("Área construída (m²)")] == ""
+
+
+# ------------------------------------------------------------------ custo de polígonos
+
+
+def test_zigue_zague_vira_lascas_demais_e_e_recusado(api: TestClient) -> None:
+    # anel que cruza a si mesmo a cada vértice: ST_MakeValid devolve centenas de partes
+    w, s = leste(-1000)
+    passos = 400
+    alto = [[w + i * 0.0001, s + (0.01 if i % 2 else 0.0)] for i in range(passos)]
+    baixo = [[w + i * 0.0001, s + (0.0 if i % 2 else 0.01)] for i in reversed(range(passos))]
+    corpo = _poligono([[*alto, *baixo]])
+    resp = api.post("/api/itbi/resumo", json=corpo)
+    assert resp.status_code == 422
+    assert "partes" in resp.text
+
+
+def test_multipoligono_com_partes_demais_422(api: TestClient) -> None:
+    def caixa(i: int) -> list[list[list[float]]]:
+        x = _W + i * 0.001
+        return [[[x, _S], [x + 0.0005, _S], [x + 0.0005, _S + 0.0005], [x, _S + 0.0005]]]
+
+    corpo = _poligono([caixa(i) for i in range(queries.MAX_PARTES + 1)], "MultiPolygon")
+    resp = api.post("/api/itbi/resumo", json=corpo)
+    assert resp.status_code == 422
+    assert f"{queries.MAX_PARTES} partes" in resp.text
+
+
+def test_validacao_do_poligono_fica_em_cache(
+    api: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    chamadas: list[str] = []
+    original = queries._valida_no_banco
+
+    def contando(db: Any, geojson: str) -> Any:
+        chamadas.append(geojson)
+        return original(db, geojson)
+
+    monkeypatch.setattr(queries, "_valida_no_banco", contando)
+    queries._POLIGONOS.clear()
+    d = 0.000123
+    geometria = {"type": "Polygon", "coordinates": [[[_W, _S], [_W + d, _S], [_W + d, _S + d]]]}
+    for rota in ("resumo", "pontos", "transacoes"):
+        corpo = {"area": {"tipo": "poligono", "geometria": geometria}}
+        post(api, rota, {"consulta": corpo} if rota == "transacoes" else corpo)
+    assert len(chamadas) == 1
+
+
+def test_anel_gigante_recusado_antes_de_percorrer(monkeypatch: pytest.MonkeyPatch) -> None:
+    class Anel(list[Any]):
+        def __iter__(self) -> Iterator[Any]:
+            pytest.fail("não deveria percorrer um anel acima do limite de vértices")
+
+    anel = Anel([[0.0, 0.0]] * (queries.MAX_VERTICES + 1))
+    with pytest.raises(ValueError, match="vértices"):
+        queries.normaliza_poligono({"type": "Polygon", "coordinates": [anel]})

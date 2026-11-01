@@ -7,7 +7,7 @@ import httpx
 import pytest
 import respx
 
-from observatorio.downloads import Manifest, fetch
+from observatorio.downloads import InsecureRedirectError, Manifest, fetch, http_client
 
 URL = "https://example.test/dados.parquet"
 
@@ -129,7 +129,7 @@ def test_retoma_download_com_range(tmp_path: Path, monkeypatch: pytest.MonkeyPat
                 stream=_Interrompido(b"abc"),
                 headers={"ETag": '"v1"', "Accept-Ranges": "bytes"},
             ),
-            httpx.Response(206, content=b"def"),
+            httpx.Response(206, content=b"def", headers={"Content-Range": "bytes 3-5/6"}),
         ]
     )
     manifest = Manifest(tmp_path / "manifest.json")
@@ -139,8 +139,97 @@ def test_retoma_download_com_range(tmp_path: Path, monkeypatch: pytest.MonkeyPat
 
     assert dest.read_bytes() == b"abcdef"
     assert pedidos[1].headers["Range"] == "bytes=3-"
+    # só aceita o pedaço se o arquivo no servidor ainda for o da 1ª resposta
+    assert pedidos[1].headers["If-Range"] == '"v1"'
     assert result.version.size == 6
     assert result.version.etag == '"v1"'
+
+
+def test_faixa_diferente_da_pedida_recomeca_do_zero(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("observatorio.downloads.time.sleep", lambda _s: None)
+    cliente, pedidos = _cliente_roteirizado(
+        [
+            httpx.Response(
+                200,
+                stream=_Interrompido(b"abc"),
+                headers={
+                    "Last-Modified": "Mon, 05 Oct 2026 05:10:44 GMT",
+                    "Accept-Ranges": "bytes",
+                },
+            ),
+            # 206 de outra faixa: emendar daria um arquivo misturado
+            httpx.Response(206, content=b"xyz", headers={"Content-Range": "bytes 0-2/6"}),
+            httpx.Response(200, content=b"novo!!"),
+        ]
+    )
+    manifest = Manifest(tmp_path / "manifest.json")
+    dest = tmp_path / "f.bin"
+
+    fetch(cliente, key="k", url=URL, dest=dest, manifest=manifest)
+
+    assert dest.read_bytes() == b"novo!!"
+    assert pedidos[1].headers["If-Range"] == "Mon, 05 Oct 2026 05:10:44 GMT"
+    assert "Range" not in pedidos[2].headers
+
+
+def test_416_com_tamanho_completo_conclui(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("observatorio.downloads.time.sleep", lambda _s: None)
+    cliente, pedidos = _cliente_roteirizado(
+        [
+            httpx.Response(
+                200,
+                stream=_Interrompido(b"abcdef"),
+                headers={"Content-Length": "6", "Accept-Ranges": "bytes"},
+            ),
+            httpx.Response(416),
+        ]
+    )
+    manifest = Manifest(tmp_path / "manifest.json")
+    dest = tmp_path / "f.bin"
+
+    result = fetch(cliente, key="k", url=URL, dest=dest, manifest=manifest)
+
+    assert dest.read_bytes() == b"abcdef"
+    assert result.version.size == 6
+    assert len(pedidos) == 2
+
+
+def test_416_com_tamanho_diferente_recomeca(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("observatorio.downloads.time.sleep", lambda _s: None)
+    cliente, pedidos = _cliente_roteirizado(
+        [
+            httpx.Response(
+                200,
+                stream=_Interrompido(b"abc"),
+                headers={"Content-Length": "6", "Accept-Ranges": "bytes"},
+            ),
+            httpx.Response(416),
+            httpx.Response(200, content=b"abcdef"),
+        ]
+    )
+    manifest = Manifest(tmp_path / "manifest.json")
+    dest = tmp_path / "f.bin"
+
+    fetch(cliente, key="k", url=URL, dest=dest, manifest=manifest)
+
+    assert dest.read_bytes() == b"abcdef"
+    assert "Range" not in pedidos[2].headers
+
+
+def test_cliente_recusa_redirecionamento_para_http() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.scheme == "https":
+            return httpx.Response(302, headers={"Location": "http://example.test/dados.parquet"})
+        return httpx.Response(200, content=b"trocado")
+
+    with http_client("teste", 5.0) as cliente:
+        cliente._transport = httpx.MockTransport(handler)
+        with pytest.raises(InsecureRedirectError, match="inseguro"):
+            cliente.get(URL)
 
 
 def test_recomeca_quando_servidor_ignora_range(

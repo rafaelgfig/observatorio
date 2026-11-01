@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import gzip
+from collections.abc import Iterator
 
 import pytest
 from fastapi.testclient import TestClient
 
+from observatorio.api.app import MAX_BODY_BYTES, _VersionWatcher, allowed_hosts, create_app
 from observatorio.api.search import terms_for
 from observatorio.config import Settings
+from observatorio.db import Database
 
 
 def test_health_sem_dados(client: TestClient) -> None:
@@ -85,3 +88,63 @@ def test_422_com_nan_no_corpo_nao_vira_500(client: TestClient) -> None:
     )
     assert resp.status_code == 422
     assert resp.json()["detail"][0]["loc"][-1] == "valor_min"
+
+
+# ------------------------------------------------------------------ proteções do servidor local
+
+
+@pytest.mark.parametrize("host", ["127.0.0.1:8000", "localhost", "[::1]:8765"])
+def test_host_local_aceito(client: TestClient, host: str) -> None:
+    assert client.get("/api/health", headers={"Host": host}).status_code == 200
+
+
+def test_host_desconhecido_recusado(client: TestClient) -> None:
+    # DNS rebinding: um domínio qualquer que resolve para 127.0.0.1 não fala com a API
+    resp = client.get("/api/health", headers={"Host": "attacker.example:8000"})
+    assert resp.status_code == 400
+
+
+def test_hosts_extras_e_host_configurado(settings: Settings) -> None:
+    extra = settings.model_copy(update={"host": "192.168.0.10"})
+    assert "192.168.0.10" in allowed_hosts(extra)
+    todos = settings.model_copy(update={"host": "0.0.0.0", "allowed_hosts": ["casa.lan"]})  # noqa: S104
+    assert allowed_hosts(todos) == ["casa.lan"]
+    with TestClient(create_app(todos, watch=False), base_url="http://casa.lan") as client:
+        assert client.get("/api/health").status_code == 200
+
+
+def test_corpo_grande_demais_413(client: TestClient) -> None:
+    grande = b'{"area": null, "x": "' + b"a" * (MAX_BODY_BYTES + 1) + b'"}'
+    resp = client.post(
+        "/api/itbi/resumo", content=grande, headers={"Content-Type": "application/json"}
+    )
+    assert resp.status_code == 413
+    assert "grande demais" in resp.json()["detail"]
+
+
+def test_corpo_em_fluxo_sem_content_length_tambem_e_limitado(client: TestClient) -> None:
+    def pedacos() -> Iterator[bytes]:
+        for _ in range(MAX_BODY_BYTES // 65536 + 2):
+            yield b"a" * 65536
+
+    resp = client.post(
+        "/api/itbi/resumo", content=pedacos(), headers={"Content-Type": "application/json"}
+    )
+    assert resp.status_code == 413
+
+
+def test_corpo_pequeno_chega_inteiro(client: TestClient) -> None:
+    # sem dados ingeridos: passa do limite de tamanho e chega à rota (503), com o JSON lido
+    resp = client.post("/api/itbi/resumo", json={"precisao": "lote"})
+    assert resp.status_code == 503
+    resp = client.post("/api/itbi/resumo", json={"precisao": "exata"})
+    assert resp.status_code == 422
+
+
+def test_observador_de_versao_para_e_espera_a_thread(settings: Settings) -> None:
+    db = Database(settings.processed_dir, [])
+    watcher = _VersionWatcher(db, settings.processed_dir)
+    watcher.start()
+    watcher.stop()
+    assert not watcher._thread.is_alive()
+    db.close()

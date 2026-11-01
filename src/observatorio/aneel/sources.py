@@ -106,6 +106,11 @@ def _resource(key: str, resource: dict[str, Any], filename: str) -> Resource:
     return Resource(key=key, url=str(resource["url"]), filename=filename)
 
 
+def interrupcoes_filename(year: int) -> str:
+    """Nome do Parquet de interrupções de ``year`` em ``raw/aneel``."""
+    return f"interrupcoes-{year}.parquet"
+
+
 def _interrupcoes(
     resources: list[dict[str, Any]], years: list[int], current_year: int
 ) -> dict[int, Resource]:
@@ -115,7 +120,7 @@ def _interrupcoes(
         if match:
             year = int(match.group(1))
             by_year[year] = _resource(
-                f"aneel:interrupcoes:{year}", res, f"interrupcoes-{year}.parquet"
+                f"aneel:interrupcoes:{year}", res, interrupcoes_filename(year)
             )
     found: dict[int, Resource] = {}
     for year in years:

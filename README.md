@@ -60,7 +60,10 @@ uv run observatorio serve --reload
 
 Configuração por variáveis de ambiente com prefixo `OBSERVATORIO_` (ou arquivo `.env`), por
 exemplo `OBSERVATORIO_DATA_DIR`, `OBSERVATORIO_ITBI_MIN_YEAR`, `OBSERVATORIO_PORT` — veja
-`src/observatorio/config.py`.
+`src/observatorio/config.py`. O servidor só responde a `127.0.0.1`/`localhost`; para abrir na
+rede local (`serve --host 0.0.0.0`), liste os nomes ou IPs usados em
+`OBSERVATORIO_ALLOWED_HOSTS='["127.0.0.1", "192.168.0.10"]'`. Os testes ignoram essas variáveis
+e o `.env`.
 
 A arquitetura, os esquemas dos dados processados e os contratos da API estão em
 [docs/arquitetura.md](docs/arquitetura.md).
@@ -70,11 +73,20 @@ A arquitetura, os esquemas dos dados processados e os contratos da API estão em
 * **DEC/FEC** são recalculados a partir das interrupções com o critério regulatório
   (duração ≥ 3 min, sem expurgos), que reproduz os indicadores oficiais da ANEEL com erro
   < 2% em ~97% dos conjuntos-mês. A tela mostra o valor oficial ao lado quando disponível.
+* A **base de consumidores** de cada município (o denominador do DEC/FEC municipal) é estimada
+  pelo tamanho dos alimentadores que o atendem, medido nas interrupções de 2026 — não por
+  quantas vezes faltou energia ali —, limitada a 1,5 unidade consumidora por habitante.
 * O arquivo de **2025** não informa o município de cada interrupção: os valores municipais
-  desse ano são **estimados** distribuindo cada conjunto elétrico pelos municípios que atende
-  (pesos aprendidos com os dados de 2026). A interface sinaliza esses casos.
-* Algumas distribuidoras têm meses faltando nos arquivos da ANEEL; a tela lista essas lacunas.
+  desse ano são **estimados** distribuindo cada conjunto elétrico pelos municípios que atende,
+  com os mesmos pesos. A interface sinaliza esses casos.
+* Algumas distribuidoras têm meses faltando nos arquivos da ANEEL. Esses meses ficam fora das
+  contas (não viram DEC 0): a tela lista as lacunas, marca os municípios e meses afetados e os
+  tira do ranking.
 * No **ITBI**, a localização vem do número de cadastro (SQL) cruzado com os lotes e condomínios
   do GeoSampa; ~94% das transações ficam no lote/condomínio exato e quase todo o resto no
-  centro da quadra. Unidades vendidas na planta aparecem como terreno na fonte e são marcadas.
-* Linhas corrompidas na origem (que expõem nomes das partes) são descartadas na ingestão.
+  centro da quadra. Unidades vendidas na planta aparecem como terreno na fonte e são marcadas;
+  a área do IPTU delas é a do lote inteiro e não entra nos filtros nem na mediana de área.
+* O último mês de pagamento ainda recebe guias atrasadas: o período padrão termina no último
+  mês completo, e os meses parciais aparecem marcados nos gráficos.
+* Linhas corrompidas na origem (que expõem nomes das partes) são descartadas na ingestão, e
+  CPFs/CNPJs digitados em campos de texto livre são removidos.

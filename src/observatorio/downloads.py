@@ -20,6 +20,8 @@ from typing import Any
 
 import httpx
 
+from observatorio.storage import replace_file
+
 log = logging.getLogger(__name__)
 
 _CHUNK = 1 << 20
@@ -122,7 +124,7 @@ def atomic_write_text(path: Path, text: str) -> None:
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
             fh.write(text)
-        Path(tmp).replace(path)
+        replace_file(Path(tmp), path)
     except BaseException:
         Path(tmp).unlink(missing_ok=True)
         raise
@@ -130,6 +132,14 @@ def atomic_write_text(path: Path, text: str) -> None:
 
 class _NotModifiedError(Exception):
     """Servidor respondeu 304: a cópia local continua válida."""
+
+
+class _RestartError(Exception):
+    """A retomada não serve (arquivo mudou no servidor, faixa errada): recomeçar do zero."""
+
+
+class InsecureRedirectError(httpx.HTTPError):
+    """Redirecionamento de HTTPS para HTTP (o conteúdo poderia ser trocado no caminho)."""
 
 
 @dataclass(slots=True)
@@ -153,18 +163,45 @@ def _conditional_headers(
     return headers
 
 
+def _resume_headers(offset: int, first: httpx.Headers | None) -> dict[str, str]:
+    """``Range`` a partir de ``offset`` com ``If-Range``: se o arquivo mudou no servidor desde a
+    1ª resposta, ele devolve o arquivo novo inteiro (200) em vez de um pedaço dele."""
+    headers = {"Range": f"bytes={offset}-"}
+    first = first or httpx.Headers()
+    etag, last_modified = first.get("ETag"), first.get("Last-Modified")
+    if etag and not etag.startswith("W/"):  # ETag fraco não vale em If-Range
+        headers["If-Range"] = etag
+    elif last_modified:
+        headers["If-Range"] = last_modified
+    return headers
+
+
+def _content_length(headers: httpx.Headers | None) -> int | None:
+    value = (headers or httpx.Headers()).get("Content-Length", "")
+    return int(value) if value.isdigit() else None
+
+
 def _download_once(
     client: httpx.Client, url: str, conditional: dict[str, str], state: _Attempt
 ) -> None:
     if not state.can_resume:
         state.part.unlink(missing_ok=True)
     offset = state.part.stat().st_size if state.part.exists() else 0
-    headers = dict(conditional) if offset == 0 else {"Range": f"bytes={offset}-"}
+    headers = dict(conditional) if offset == 0 else _resume_headers(offset, state.headers)
     with client.stream("GET", url, headers=headers, follow_redirects=True) as resp:
-        if resp.status_code == httpx.codes.NOT_MODIFIED and conditional:
+        if resp.status_code == httpx.codes.NOT_MODIFIED and conditional and offset == 0:
             raise _NotModifiedError
+        if offset and resp.status_code == httpx.codes.REQUESTED_RANGE_NOT_SATISFIABLE:
+            # a conexão caiu logo depois do último byte: completo se o tamanho bate
+            if _content_length(state.headers) == offset:
+                return
+            state.can_resume = False
+            raise _RestartError
         resp.raise_for_status()
         resumed = offset > 0 and resp.status_code == httpx.codes.PARTIAL_CONTENT
+        if resumed and not resp.headers.get("Content-Range", "").startswith(f"bytes {offset}-"):
+            state.can_resume = False
+            raise _RestartError
         if not resumed:
             state.headers = resp.headers
             # Só retomamos conteúdo sem codificação de transporte (Range sobre gzip
@@ -192,7 +229,8 @@ def fetch(
     * Usa ``If-None-Match``/``If-Modified-Since`` quando há versão anterior da mesma URL
       (resposta 304 = nada a fazer).
     * Falhas de rede (inclusive travamentos detectados pelo *read timeout*) são repetidas até
-      ``retries`` vezes, retomando do ponto em que parou com ``Range`` quando o servidor aceita.
+      ``retries`` vezes, retomando do ponto em que parou com ``Range`` + ``If-Range`` quando o
+      servidor aceita (206 com a faixa pedida; qualquer outra resposta recomeça do zero).
     * O conteúdo vai para um ``.part`` e só então é movido atomicamente para ``dest``.
     """
     previous = manifest.download(key)
@@ -206,6 +244,11 @@ def fetch(
             try:
                 _download_once(client, url, conditional, state)
                 break
+            except _RestartError:
+                if attempt == retries:
+                    msg = f"{key}: download não pôde ser retomado em {retries + 1} tentativas"
+                    raise httpx.TransportError(msg) from None
+                log.warning("%s: retomada recusada pelo servidor; recomeçando do zero", key)
             except httpx.TransportError as exc:
                 if attempt == retries:
                     raise
@@ -231,7 +274,7 @@ def fetch(
 
     headers = state.headers or httpx.Headers()
     digest, size = _sha256(state.part)
-    state.part.replace(dest)
+    replace_file(state.part, dest)
     version = RemoteVersion(
         url=url,
         sha256=digest,
@@ -262,11 +305,21 @@ def _sha256(path: Path) -> tuple[str, int]:
     return digest.hexdigest(), size
 
 
+def no_downgrade(response: httpx.Response) -> None:
+    """Gancho de resposta: recusa redirecionamento de HTTPS para HTTP."""
+    if response.has_redirect_location and response.request.url.scheme == "https":
+        target = response.request.url.join(response.headers["Location"])
+        if target.scheme != "https":
+            msg = f"redirecionamento inseguro de {response.request.url} para {target}"
+            raise InsecureRedirectError(msg)
+
+
 def http_client(user_agent: str, timeout: float) -> httpx.Client:
-    """Cliente HTTP padrão do projeto."""
+    """Cliente HTTP padrão do projeto (segue redirecionamentos, nunca de HTTPS para HTTP)."""
     # ``timeout`` vale por operação de leitura: um download travado falha e é retomado.
     return httpx.Client(
         headers={"User-Agent": user_agent},
         timeout=httpx.Timeout(timeout, connect=30.0),
         follow_redirects=True,
+        event_hooks={"response": [no_downgrade]},
     )

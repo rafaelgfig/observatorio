@@ -83,7 +83,7 @@ export function createAutocomplete(options) {
 
   /** @param {number} index */
   function setActive(index) {
-    const options = listbox.querySelectorAll('[role="option"]');
+    const options = listbox.querySelectorAll('[role="option"]:not([aria-disabled="true"])');
     if (!options.length) return;
     active = (index + options.length) % options.length;
     options.forEach((node, i) => node.setAttribute("aria-selected", String(i === active)));
@@ -105,8 +105,13 @@ export function createAutocomplete(options) {
   /** @param {string} query */
   function render(query) {
     listbox.replaceChildren();
+    active = -1;
+    input.removeAttribute("aria-activedescendant"); // a opção anterior não existe mais
     if (!items.length) {
-      listbox.append(el("li", { className: "listbox-empty", textContent: emptyText }));
+      const empty = el("li", { className: "listbox-empty", id: `${id}-vazio`, role: "option", textContent: emptyText });
+      empty.setAttribute("aria-disabled", "true");
+      empty.setAttribute("aria-selected", "false");
+      listbox.append(empty);
       open();
       return;
     }

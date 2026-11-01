@@ -521,3 +521,45 @@ def _is_number(value: str) -> bool:
     except ValueError:
         return False
     return True
+
+
+# ---------------------------------------------------------------- dados pessoais
+
+CPF = "529.982.247-25"  # dígitos verificadores válidos
+
+
+@pytest.mark.parametrize(
+    ("cells", "coluna", "esperado"),
+    [
+        ({"complemento": f"AP 12 {CPF}"}, "complemento", "AP 12 [removido]"),
+        ({"referencia": CPF.replace(".", "").replace("-", "")}, "referencia", "[removido]"),
+        ({"bairro": "CENTRO 12.345.678/0001-95"}, "bairro", "CENTRO [removido]"),
+        ({"numero": CPF}, "numero_raw", "[removido]"),
+        # dígitos verificadores errados: não é CPF
+        ({"complemento": "529.982.247-26"}, "complemento", "529.982.247-26"),
+        # 11 dígitos iguais ao SQL da própria guia: é o cadastro, não um CPF
+        ({"sql": "52998224725", "complemento": "52998224725"}, "complemento", "52998224725"),
+        # o SQL formatado (3.3.4-1) não tem o formato de CPF
+        ({"complemento": "SQL 001.002.0003-4"}, "complemento", "SQL 001.002.0003-4"),
+    ],
+)
+def test_cpf_e_cnpj_saem_dos_textos_livres(
+    cells: dict[str, str | None], coluna: str, esperado: str
+) -> None:
+    assert one(**cells)[coluna] == esperado
+
+
+def test_remocao_de_cpf_so_registra_aba_e_linha(caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level(logging.INFO)
+    result = normalize_sheet(frame([HEADER, row(), row(complemento=f"AP 3 {CPF}")]), "JAN-2026")
+
+    assert result.frame.get_column("complemento").to_list() == ["AP 1905", "AP 3 [removido]"]
+    assert "JAN-2026: identificadores pessoais removidos de 1 linha(s): 3" in caplog.text
+    assert "529" not in caplog.text
+
+
+def test_cpf_valido() -> None:
+    assert parse.cpf_valid("52998224725")
+    assert not parse.cpf_valid("52998224726")
+    assert not parse.cpf_valid("11111111111")  # repetidos passam na conta, mas não existem
+    assert not parse.cpf_valid("5299822472")

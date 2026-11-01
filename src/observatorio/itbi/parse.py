@@ -20,6 +20,9 @@ Regras verificadas nas 155 abas mensais de 2015 a 2026:
   9-10: vão para a quarentena — só ``(aba, linha)`` sai daqui, nunca o conteúdo. Além de
   valor/data inválidos, texto em qualquer coluna numérica também indica deslocamento (nas
   linhas íntegras de 2015-2026 isso nunca ocorre), para que um nome não escape por outra coluna;
+* CPFs (que passam nos dígitos verificadores e não são o SQL da guia) e CNPJs formatados que
+  aparecem nos textos livres de linhas íntegras viram ``[removido]`` (:func:`scrub_ids`); só
+  ``(aba, linha)`` vai para o log;
 * textos iniciados por ``-``/``+`` viraram fórmulas com ``#NAME?``: o texto original é lido
   do XML da aba (:func:`formula_texts`);
 * não há deduplicação: linhas idênticas são declarações distintas (coadquirentes); elas
@@ -219,7 +222,15 @@ _NUMERIC_COLUMNS: Final = (
 )  # fmt: skip
 # Versão das regras de normalização: incremente ao mudar qualquer regra que altere a saída —
 # a ingestão reprocessa sozinha os anos gravados com outra versão.
-PARSER_VERSION: Final = 2
+PARSER_VERSION: Final = 3
+
+# Identificadores pessoais em textos livres (ex.: CPF no complemento) — ver :func:`scrub_ids`.
+# O pré-filtro (regex do polars, sem lookaround) só escolhe as linhas a conferir.
+_ID_CANDIDATE: Final = r"\d{3}\.?\d{3}\.?\d{3}-?\d{2}|\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}"
+_CPF: Final = re.compile(r"(?<![\d./-])(\d{3})\.?(\d{3})\.?(\d{3})-?(\d{2})(?![\d/])")
+_CNPJ: Final = re.compile(r"(?<![\d./-])\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}(?!\d)")
+REMOVED: Final = "[removido]"
+_SCRUB_COLUMNS: Final = ("logradouro", "numero_raw", "complemento", "bairro", "referencia")
 
 # Textos que são só o resultado de erro de fórmula (no arquivo de 2024 viraram texto literal).
 _ERROR_TEXTS: Final = ["", "#NAME?", "#REF!", "#ERROR!", "#VALUE!", "#N/A", "#DIV/0!", "#NULL!"]
@@ -274,6 +285,29 @@ class SheetResult:
     ref_month: int
     frame: pl.DataFrame
     quarantined: tuple[QuarantinedRow, ...]
+
+
+def cpf_valid(digits: str) -> bool:
+    """Os 11 dígitos formam um CPF (dígitos verificadores corretos, não repetidos)?"""
+    if len(digits) != 11 or not digits.isdigit() or len(set(digits)) == 1:
+        return False
+    nums = [int(c) for c in digits]
+    for size in (9, 10):
+        total = sum(n * (size + 1 - i) for i, n in enumerate(nums[:size]))
+        if total * 10 % 11 % 10 != nums[size]:
+            return False
+    return True
+
+
+def scrub_ids(text: str, sql: str | None = None) -> str:
+    """Troca por ``[removido]`` CPFs (válidos e diferentes do ``sql`` da guia, que também tem
+    11 dígitos) e CNPJs formatados encontrados num texto livre."""
+
+    def cpf(match: re.Match[str]) -> str:
+        digits = "".join(match.groups())
+        return REMOVED if cpf_valid(digits) and digits != sql else match[0]
+
+    return _CNPJ.sub(REMOVED, _CPF.sub(cpf, text))
 
 
 def parse_sheet_name(name: str) -> tuple[int, int] | None:
@@ -594,7 +628,43 @@ def _derive(data: pl.DataFrame, ref_year: int, ref_month: int, sheet: str) -> pl
         acc_ano=pl.when(acc.is_between(_ACC_MIN_YEAR, ref_year + 1)).then(acc),
         aba=pl.lit(sheet),
     )
+    typed = _scrub_personal_ids(typed, sheet)
     return _classify(typed).select(pl.col(name).cast(dtype) for name, dtype in SCHEMA.items())
+
+
+def _scrub_personal_ids(typed: pl.DataFrame, sheet: str) -> pl.DataFrame:
+    """Aplica :func:`scrub_ids` aos textos livres; registra só ``aba:linha`` das alteradas."""
+    suspect = pl.any_horizontal(
+        pl.col(name).str.contains(_ID_CANDIDATE).fill_null(False) for name in _SCRUB_COLUMNS
+    )
+    hits = typed.with_row_index("_i").filter(suspect)
+    if hits.is_empty():
+        return typed
+    changes: dict[str, dict[int, str]] = {}
+    rows: set[int] = set()
+    for record in hits.iter_rows(named=True):
+        for name in _SCRUB_COLUMNS:
+            value = record[name]
+            if value is None:
+                continue
+            clean = scrub_ids(value, record["sql"])
+            if clean != value:
+                changes.setdefault(name, {})[record["_i"]] = clean
+                rows.add(int(record["_linha"]) + 1)
+    if not changes:
+        return typed
+    columns = []
+    for name, by_index in changes.items():
+        series = typed.get_column(name).clone()
+        series.scatter(list(by_index), list(by_index.values()))
+        columns.append(series)
+    log.info(
+        "%s: identificadores pessoais removidos de %d linha(s): %s",
+        sheet,
+        len(rows),
+        ", ".join(str(r) for r in sorted(rows)),
+    )
+    return typed.with_columns(columns)
 
 
 def _classify(typed: pl.DataFrame) -> pl.DataFrame:

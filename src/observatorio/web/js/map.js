@@ -34,7 +34,8 @@ export const SAO_PAULO_BOUNDS = [
  * @property {(fn: () => void) => () => void} onStyle  registra camadas; devolve função p/ cancelar
  * @property {(theme: "dark" | "light") => void} setTheme
  * @property {() => string | undefined} labelLayerId   rótulos do basemap (inserir camadas de dados abaixo)
- * @property {(bbox: [number, number, number, number] | [[number, number], [number, number]], maxZoom?: number) => void} fit
+ * @property {(bbox: [number, number, number, number] | [[number, number], [number, number]], maxZoom?: number, minZoom?: number) => void} fit
+ *   enquadra a caixa sem passar de `maxZoom` nem ficar abaixo de `minZoom` (centraliza nela)
  */
 
 /**
@@ -53,6 +54,16 @@ export function createMap(container) {
     touchPitch: false,
     maxPitch: 0,
     cooperativeGestures: false,
+    // rótulos dos controles em português (a página é pt-BR)
+    locale: {
+      "NavigationControl.ZoomIn": "Aproximar",
+      "NavigationControl.ZoomOut": "Afastar",
+      "NavigationControl.ResetBearing": "Restaurar orientação",
+      "AttributionControl.ToggleAttribution": "Mostrar/ocultar atribuição",
+      "AttributionControl.MapFeedback": "Comentários sobre o mapa",
+      "ScaleControl.Meters": "m",
+      "ScaleControl.Kilometers": "km",
+    },
   });
   map.touchZoomRotate.disableRotation();
   map.keyboard.disableRotation();
@@ -112,7 +123,7 @@ export function createMap(container) {
       });
       return base.slice(last + 1).find((layer) => layer.type === "symbol")?.id;
     },
-    fit(bbox, maxZoom = 15) {
+    fit(bbox, maxZoom = 15, minZoom = 0) {
       /** @type {[[number, number], [number, number]]} */
       const bounds =
         bbox.length === 4
@@ -121,6 +132,12 @@ export function createMap(container) {
               [bbox[2], bbox[3]],
             ]
           : bbox;
+      const camera = minZoom > 0 ? map.cameraForBounds(bounds, { padding: 48, maxZoom }) : undefined;
+      if (camera?.center && camera.zoom !== undefined && camera.zoom < minZoom) {
+        // mapa pequeno (celular, notebook baixo): a caixa inteira não cabe sem sair do zoom útil
+        map.easeTo({ center: camera.center, zoom: minZoom, duration: 700 });
+        return;
+      }
       map.fitBounds(bounds, { padding: 48, maxZoom, duration: 700 });
     },
   };

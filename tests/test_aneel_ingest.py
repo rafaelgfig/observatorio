@@ -165,3 +165,33 @@ def test_municipios_do_ibge_alterados_reprocessam(
     ingest.run(settings_ckan)
     assert "sem mudanças" in caplog.text
     assert versao(settings_ckan) == reprocessada
+
+
+@respx.mock
+def test_regras_novas_refazem_tambem_anos_fora_da_ingestao(
+    settings_ckan: Settings, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    mock_fontes(settings_ckan, tmp_path)
+    escrever_geo(settings_ckan.processed_dir / "geo")
+    ingest.run(settings_ckan)
+    fato_2025 = transform.fato_path(settings_ckan.processed_dir / "aneel", 2025)
+    gravado = fato_2025.stat().st_mtime_ns
+    manifest = Manifest(settings_ckan.manifest_path("aneel"))
+    assert manifest.metadata("aneel:indqual")[ingest.TRANSFORM_EXTRA] == transform.TRANSFORM_VERSION
+
+    # saídas de uma versão anterior das regras; nova ingestão só de 2026 (fontes: 304)
+    manifest.mark_processed("aneel:indqual", **{ingest.TRANSFORM_EXTRA: 0})
+    so_2026 = settings_ckan.model_copy(update={"aneel_years": [2026]})
+    caplog.set_level(logging.INFO)
+    ingest.run(so_2026)
+
+    assert f"regras de transformação v{transform.TRANSFORM_VERSION}" in caplog.text
+    assert fato_2025.stat().st_mtime_ns != gravado  # refeito a partir do bruto guardado
+    manifest = Manifest(settings_ckan.manifest_path("aneel"))
+    assert manifest.metadata("aneel:indqual")[ingest.TRANSFORM_EXTRA] == transform.TRANSFORM_VERSION
+    assert not manifest.needs_processing("aneel:interrupcoes:2025")
+
+    # versão em dia: nada a fazer
+    caplog.clear()
+    ingest.run(so_2026)
+    assert "sem mudanças" in caplog.text

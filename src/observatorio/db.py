@@ -7,7 +7,9 @@
   servidor roda, e :meth:`Database.refresh` troca a conexão inteira de uma vez.
 
 Cada requisição usa seu próprio cursor (``connection.cursor()``), que é a forma segura de
-usar DuckDB a partir das threads do FastAPI.
+usar DuckDB a partir das threads do FastAPI. No DuckDB 2.0, fechar uma conexão mata os cursores
+dela (e falha se algum estiver executando): a conexão trocada por :meth:`Database.refresh` só é
+fechada quando o último cursor aberto nela termina.
 """
 
 from __future__ import annotations
@@ -87,6 +89,22 @@ class Dataset:
     requires: tuple[str, ...] = field(default_factory=tuple)
 
 
+@dataclass(slots=True)
+class _Generation:
+    """Uma conexão montada por :meth:`Database.refresh` e quantos cursores a usam agora."""
+
+    con: duckdb.DuckDBPyConnection
+    cursors: int = 0
+    retired: bool = False
+
+
+def _close_quietly(con: duckdb.DuckDBPyConnection) -> None:
+    try:
+        con.close()
+    except duckdb.Error:
+        log.warning("falha ao fechar conexão antiga do DuckDB", exc_info=True)
+
+
 class Database:
     """DuckDB em memória com views/tabelas nomeadas apontando para Parquet."""
 
@@ -94,7 +112,8 @@ class Database:
         self.root = root
         self.datasets = {d.name: d for d in datasets}
         self._lock = threading.Lock()
-        self._con: duckdb.DuckDBPyConnection | None = None
+        self._current: _Generation | None = None
+        self._closed = False
         self.available: frozenset[str] = frozenset()
         self.loaded_at = 0.0
         self.refresh()
@@ -102,9 +121,35 @@ class Database:
     # ------------------------------------------------------------ ciclo de vida
 
     def refresh(self) -> None:
-        """Monta uma conexão nova com o que existe em disco e troca a atual por ela."""
+        """Monta uma conexão nova com o que existe em disco e troca a atual por ela.
+
+        A conexão anterior é aposentada: fecha agora se nenhum cursor a usa, senão quando o
+        último terminar (requisições em andamento continuam no banco antigo).
+        """
         started = time.perf_counter()
         con = connect(spatial=True)
+        try:
+            available = self._load(con)
+        except BaseException:
+            _close_quietly(con)
+            raise
+        with self._lock:
+            if self._closed:  # fechado enquanto carregava (desligamento do servidor)
+                old: _Generation | None = _Generation(con, retired=True)
+            else:
+                old, self._current = self._current, _Generation(con)
+                self.available = frozenset(available)
+                self.loaded_at = time.time()
+            close_now = self._retire(old)
+        if close_now is not None:
+            _close_quietly(close_now)
+        log.info(
+            "dados carregados em %.1fs: %s",
+            time.perf_counter() - started,
+            ", ".join(sorted(available)) or "(nenhum)",
+        )
+
+    def _load(self, con: duckdb.DuckDBPyConnection) -> set[str]:
         con.execute("SET preserve_insertion_order = false")
         available: set[str] = set()
         for ds in self.datasets.values():
@@ -125,23 +170,25 @@ class Database:
             available.add(ds.name)
         # Comprime as tabelas materializadas (ex.: ITBI ~470 → ~80 MiB) antes de servir.
         con.execute("FORCE CHECKPOINT")
-        with self._lock:
-            old, self._con = self._con, con
-            self.available = frozenset(available)
-            self.loaded_at = time.time()
-        if old is not None:
-            old.close()
-        log.info(
-            "dados carregados em %.1fs: %s",
-            time.perf_counter() - started,
-            ", ".join(sorted(available)) or "(nenhum)",
-        )
+        return available
+
+    @staticmethod
+    def _retire(gen: _Generation | None) -> duckdb.DuckDBPyConnection | None:
+        """Marca a geração como aposentada; devolve a conexão se já pode fechar (sob o lock)."""
+        if gen is None:
+            return None
+        gen.retired = True
+        return gen.con if gen.cursors == 0 else None
 
     def close(self) -> None:
+        """Fecha o banco: novas consultas falham; as em andamento terminam antes do fechamento."""
         with self._lock:
-            if self._con is not None:
-                self._con.close()
-                self._con = None
+            self._closed = True
+            current, self._current = self._current, None
+            self.available = frozenset()
+            close_now = self._retire(current)
+        if close_now is not None:
+            _close_quietly(close_now)
 
     def has(self, *names: str) -> bool:
         return all(n in self.available for n in names)
@@ -151,14 +198,23 @@ class Database:
     @contextmanager
     def cursor(self) -> Iterator[duckdb.DuckDBPyConnection]:
         with self._lock:
-            if self._con is None:
+            gen = self._current
+            if gen is None:
                 msg = "banco fechado"
                 raise RuntimeError(msg)
-            cur = self._con.cursor()
+            cur = gen.con.cursor()
+            gen.cursors += 1
         try:
             yield cur
         finally:
-            cur.close()
+            try:
+                cur.close()
+            finally:
+                with self._lock:
+                    gen.cursors -= 1
+                    close_now = gen.con if gen.retired and gen.cursors == 0 else None
+                if close_now is not None:
+                    _close_quietly(close_now)
 
     def fetch_dicts(self, sql: str, params: Params = None) -> list[dict[str, Any]]:
         with self.cursor() as cur:

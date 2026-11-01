@@ -18,10 +18,13 @@ Regras dos filtros (:class:`ConsultaItbi`):
 * ``precisao``: ``lote`` → lote/condomínio; ``quadra`` (padrão) → também o ponto da quadra;
   ``qualquer`` → tudo, inclusive guias sem coordenada (que só entram sem filtro de área);
 * ``area_min``/``area_max`` valem para a área construída, ou a do terreno quando ``tipo`` é
-  ``terreno`` (coluna ``area_m2``);
+  ``terreno`` (coluna ``area_m2``). Nas unidades vendidas na planta e nas frações < 10% de um
+  lote, as áreas do IPTU são do lote inteiro: ``area_m2`` e ``area_construida_m2`` ficam nulas
+  (a guia não entra em filtro, mediana nem ordenação por área);
 * círculo: distância exata na esfera (caixa em graus + ``ST_Distance_Sphere``);
-* polígono desenhado: GeoJSON validado (≤ 5.000 vértices, corrigido com ``ST_MakeValid``,
-  área ≤ 2.000 km²); distrito/subprefeitura: o polígono de ``itbi_areas``.
+* polígono desenhado: GeoJSON validado (≤ 5.000 vértices e ≤ 20 partes, corrigido com
+  ``ST_MakeValid`` — que também não pode passar de 20 partes —, área ≤ 2.000 km²; validação em
+  cache); distrito/subprefeitura: o polígono de ``itbi_areas``.
 """
 
 from __future__ import annotations
@@ -69,6 +72,9 @@ SP_EXTENT: Final = (-46.83, -24.01, -46.36, -23.35)  # oeste, sul, leste, norte
 RAIO_MIN_M: Final = 50.0
 RAIO_MAX_M: Final = 20_000.0
 MAX_VERTICES: Final = 5_000
+# Partes do polígono (na entrada e depois de ST_MakeValid): um anel em zigue-zague vira milhares
+# de lascas, e cada uma custa no ST_Intersects de cada guia da caixa (segundos de CPU).
+MAX_PARTES: Final = 20
 MAX_AREA_KM2: Final = 2_000.0
 LIMITE_PONTOS: Final = 20_000
 MAX_PONTOS: Final = 50_000
@@ -108,13 +114,20 @@ NUMERO_SQL: Final = (
     " ELSE trim(numero_raw) END"
 )
 
+# Áreas do IPTU que descrevem o lote inteiro, não a unidade: venda na planta (SQL do lote-mãe)
+# ou fração transmitida < 10% de um lote (mesma regra de ``parse._MIN_SHARE_PCT``).
+AREA_DO_LOTE_SQL: Final = "(t.na_planta OR t.proporcao_pct < 10)"
+
 # Conteúdo da tabela materializada ``itbi`` (consumida por ``api.DATASETS``).
 ITBI_SQL: Final = f"""
-    SELECT t.id, t.ref_year, t.ref_month, t.data_transacao, t.tipo,
+    SELECT t.id, t.ref_year, t.ref_month, t.data_transacao, t.tipo, t.na_planta,
            t.natureza_cod, t.natureza, t.valor_transacao, t.rs_m2,
-           t.area_construida_m2, t.area_terreno_m2,
-           CASE WHEN t.tipo = 'terreno' THEN t.area_terreno_m2 ELSE t.area_construida_m2 END
-               AS area_m2,
+           CASE WHEN NOT coalesce({AREA_DO_LOTE_SQL}, false) THEN t.area_construida_m2 END
+               AS area_construida_m2,
+           t.area_terreno_m2,
+           CASE WHEN coalesce({AREA_DO_LOTE_SQL}, false) THEN NULL
+                WHEN t.tipo = 'terreno' THEN t.area_terreno_m2
+                ELSE t.area_construida_m2 END AS area_m2,
            t.logradouro, t.numero_txt, t.complemento, t.bairro, t.cep,
            t.uso, t.padrao, t.financiamento, t.acc_ano,
            g.lon, g.lat, g.precisao, g.tier,
@@ -323,6 +336,9 @@ def normaliza_poligono(geometria: dict[str, Any]) -> dict[str, Any]:
     else:
         msg = "geometria deve ser um GeoJSON Polygon ou MultiPolygon"
         raise ValueError(msg)
+    if len(poligonos) > MAX_PARTES:
+        msg = f"polígono com mais de {MAX_PARTES} partes"
+        raise ValueError(msg)
     vertices = 0
     saida: list[list[list[list[float]]]] = []
     for poligono in poligonos:
@@ -331,7 +347,7 @@ def normaliza_poligono(geometria: dict[str, Any]) -> dict[str, Any]:
             raise ValueError(msg)
         aneis: list[list[list[float]]] = []
         for anel in poligono:
-            pontos = _anel(anel)
+            pontos = _anel(anel, MAX_VERTICES - vertices)
             vertices += len(pontos)
             if vertices > MAX_VERTICES:
                 msg = f"polígono com mais de {MAX_VERTICES} vértices"
@@ -343,9 +359,13 @@ def normaliza_poligono(geometria: dict[str, Any]) -> dict[str, Any]:
     return {"type": "MultiPolygon", "coordinates": saida}
 
 
-def _anel(anel: Any) -> list[list[float]]:
+def _anel(anel: Any, restantes: int) -> list[list[float]]:
+    """Valida um anel; ``restantes`` = vértices que ainda cabem (antes de percorrer a lista)."""
     if not isinstance(anel, list):
         msg = "anel de polígono deve ser uma lista de posições"
+        raise ValueError(msg)
+    if len(anel) > restantes:
+        msg = f"polígono com mais de {MAX_VERTICES} vértices"
         raise ValueError(msg)
     pontos: list[list[float]] = []
     for posicao in anel:
@@ -471,10 +491,37 @@ def _atributos(consulta: ConsultaItbi, conds: list[str], params: list[Any]) -> N
         params.extend(aceitas)
 
 
+type _Validacao = tuple[bytes, tuple[float, float, float, float]] | str
+
+# Polígonos já validados (o mesmo desenho chega 3–4 vezes por atualização da tela: resumo,
+# pontos, tabela). A validação não depende dos dados, então vale entre recargas.
+_POLIGONOS: OrderedDict[str, _Validacao] = OrderedDict()
+_POLIGONOS_MAX: Final = 64
+_POLIGONOS_LOCK = threading.Lock()
+
+
 def _valida_poligono(
     db: Database, geometria: dict[str, Any]
 ) -> tuple[bytes, tuple[float, float, float, float]]:
-    """Corrige (``ST_MakeValid``) e confere a área do polígono desenhado."""
+    """Corrige (``ST_MakeValid``) e confere partes e área do polígono desenhado (com cache)."""
+    chave = json.dumps(geometria, sort_keys=True)
+    with _POLIGONOS_LOCK:
+        resultado = _POLIGONOS.get(chave)
+        if resultado is not None:
+            _POLIGONOS.move_to_end(chave)
+    if resultado is None:
+        resultado = _valida_no_banco(db, chave)
+        with _POLIGONOS_LOCK:
+            _POLIGONOS[chave] = resultado
+            while len(_POLIGONOS) > _POLIGONOS_MAX:
+                _POLIGONOS.popitem(last=False)
+    if isinstance(resultado, str):
+        raise ConsultaInvalidaError(resultado)
+    return resultado
+
+
+def _valida_no_banco(db: Database, geojson: str) -> _Validacao:
+    """``(wkb, caixa)`` do polígono corrigido, ou a mensagem de erro (que também vai ao cache)."""
     sql = """
         WITH entrada AS (SELECT ST_GeomFromGeoJSON(?) AS g),
         valida AS (
@@ -482,21 +529,21 @@ def _valida_poligono(
                         ELSE ST_CollectionExtract(ST_MakeValid(g), 3) END AS g
             FROM entrada
         )
-        SELECT ST_IsEmpty(g) AS vazia, ST_Area_Spheroid(g) AS area_m2, ST_AsWKB(g) AS wkb,
+        SELECT ST_IsEmpty(g) AS vazia, ST_NumGeometries(g) AS partes,
+               ST_Area_Spheroid(g) AS area_m2, ST_AsWKB(g) AS wkb,
                ST_XMin(g) AS w, ST_YMin(g) AS s, ST_XMax(g) AS e, ST_YMax(g) AS n
         FROM valida
     """
     try:
-        row = db.fetch_one(sql, [json.dumps(geometria)])
-    except duckdb.Error as exc:
-        msg = "polígono inválido"
-        raise ConsultaInvalidaError(msg) from exc
+        row = db.fetch_one(sql, [geojson])
+    except duckdb.Error:
+        return "polígono inválido"
     if row is None or row["vazia"] or not row["area_m2"]:
-        msg = "polígono inválido (sem área)"
-        raise ConsultaInvalidaError(msg)
+        return "polígono inválido (sem área)"
+    if row["partes"] > MAX_PARTES:
+        return f"polígono com autointerseções demais (mais de {MAX_PARTES} partes)"
     if row["area_m2"] > MAX_AREA_KM2 * 1e6:
-        msg = f"polígono grande demais (máximo {MAX_AREA_KM2:.0f} km²)"
-        raise ConsultaInvalidaError(msg)
+        return f"polígono grande demais (máximo {MAX_AREA_KM2:.0f} km²)"
     return bytes(row["wkb"]), (row["w"], row["s"], row["e"], row["n"])
 
 
@@ -538,11 +585,21 @@ def _r(valor: float | None, casas: int = 2) -> float | None:
 
 
 def meta(db: Database, atualizado_em: str | None) -> dict[str, Any]:
-    """Período (1º dia do 1º mês de pagamento → última transação), tipos, naturezas, total."""
+    """Período, tipos, naturezas (código × rótulo) e total de guias.
+
+    ``periodo``: ``min``/``max`` = primeira e última data de transação; ``pago_ate`` = último
+    dia do último mês de pagamento publicado; ``completo_ate`` = último dia do mês anterior a
+    ele. ~20% das guias são pagas no mês seguinte ao da transação, então os meses de transação
+    depois de ``completo_ate`` ainda vão crescer (parciais).
+    """
     # agregação sem GROUP BY: sempre uma linha
     geral = db.fetch_dicts(
-        "SELECT min(make_date(ref_year, ref_month, 1)) AS ini, max(data_transacao) AS fim,"
-        " count(*) AS total FROM itbi"
+        """
+        SELECT min(data_transacao) AS ini, max(data_transacao) AS fim, count(*) AS total,
+               last_day(max(make_date(ref_year, ref_month, 1))) AS pago_ate,
+               (max(make_date(ref_year, ref_month, 1)) - INTERVAL 1 DAY)::DATE AS completo_ate
+        FROM itbi
+        """
     )[0]
     naturezas = db.fetch_dicts(
         """
@@ -552,7 +609,12 @@ def meta(db: Database, atualizado_em: str | None) -> dict[str, Any]:
         """
     )
     return {
-        "periodo": {"min": geral["ini"], "max": geral["fim"]},
+        "periodo": {
+            "min": geral["ini"],
+            "max": geral["fim"],
+            "pago_ate": geral["pago_ate"],
+            "completo_ate": geral["completo_ate"],
+        },
         "atualizado_em": atualizado_em,
         "tipos": [{"id": t, "nome": title_pt(t)} for t in TIPOS],
         "naturezas": naturezas,
@@ -692,9 +754,10 @@ def pontos(db: Database, consulta: ConsultaItbi, limite: int) -> bytes:
 
 # ------------------------------------------------------------------ transações (tabela)
 
+# ``area_construida`` já vem nula quando a área do IPTU é a do lote (ver ``ITBI_SQL``).
 _LINHA_SQL: Final = """
-    id, data_transacao AS data, logradouro, numero_txt, complemento, bairro, cep, tipo, uso,
-    padrao, area_construida_m2 AS area_construida, area_terreno_m2 AS area_terreno,
+    id, data_transacao AS data, logradouro, numero_txt, complemento, bairro, cep, tipo,
+    na_planta, uso, padrao, area_construida_m2 AS area_construida, area_terreno_m2 AS area_terreno,
     valor_transacao AS valor, round(rs_m2, 2) AS rs_m2, natureza, financiamento, acc_ano,
     precisao, round(lon, 6) AS lon, round(lat, 6) AS lat
 """
@@ -732,6 +795,7 @@ COLUNAS_CSV: Final = (
     ("bairro", "Bairro"),
     ("cep", "CEP"),
     ("tipo", "Tipo"),
+    ("na_planta", "Na planta"),
     ("uso", "Uso (IPTU)"),
     ("padrao", "Padrão (IPTU)"),
     ("area_construida", "Área construída (m²)"),
@@ -796,6 +860,11 @@ def csv_lote(frame: pl.DataFrame) -> str:
         # "01452-000": com os 8 dígitos puros a planilha lê um número e perde o zero à esquerda
         # (quase todo CEP da cidade começa com 0)
         pl.col("cep").cast(pl.String).str.replace(r"^(\d{5})(\d{3})$", "${1}-${2}"),
+        pl.when(pl.col("na_planta").cast(pl.Boolean))
+        .then(pl.lit("sim"))
+        .when(pl.col("na_planta").cast(pl.Boolean).not_())
+        .then(pl.lit("não"))
+        .alias("na_planta"),
     ).select(c for c, _ in COLUNAS_CSV)
     textos = [c for c, tipo in saida.schema.items() if tipo == pl.String]
     saida = saida.with_columns(
@@ -812,8 +881,22 @@ def csv_lote(frame: pl.DataFrame) -> str:
 # ------------------------------------------------------------------ transação e área
 
 
+# Colunas de ``transacoes`` que a rota de detalhe devolve (lista fechada: uma coluna nova na
+# ingestão não vaza para a API sem passar por aqui).
+COLUNAS_TRANSACAO: Final = (
+    "id", "ref_year", "ref_month", "row_in_sheet", "sql", "setor", "quadra", "lote",
+    "logradouro", "numero", "numero_raw", "complemento", "bairro", "referencia", "cep",
+    "natureza_cod", "natureza", "valor_transacao", "data_transacao", "valor_venal_ref",
+    "proporcao_pct", "valor_venal_ref_prop", "base_calculo", "financiamento_cod",
+    "financiamento", "valor_financiado", "cartorio_num", "matricula", "situacao_sql",
+    "area_terreno_m2", "testada_m", "fracao_ideal", "area_construida_m2", "uso_cod", "uso",
+    "padrao_cod", "padrao", "acc_ano", "tipo", "na_planta", "rs_m2", "possivel_duplicata", "aba",
+)  # fmt: skip
+
+
 def transacao(db: Database, id_: int) -> dict[str, Any] | None:
-    """Todas as colunas de uma guia + coordenadas, precisão, regra (tier) e endereço.
+    """As colunas de :data:`COLUNAS_TRANSACAO` de uma guia + coordenadas, precisão, regra
+    (tier) e endereço.
 
     O id traz o mês de pagamento (``ref_year*10^8 + ref_month*10^6 + linha``): lê só o
     Parquet daquele mês (~5 ms) em vez da view, que abre os metadados de todos (~70 ms).
@@ -832,7 +915,8 @@ def transacao(db: Database, id_: int) -> dict[str, Any] | None:
         params = [id_, id_]
     rows = db.fetch_dicts(
         f"""
-        SELECT t.*, {NUMERO_SQL} AS numero_txt, i.lon, i.lat, i.precisao, i.tier
+        SELECT {", ".join(f"t.{c}" for c in COLUNAS_TRANSACAO)},
+               {NUMERO_SQL} AS numero_txt, i.lon, i.lat, i.precisao, i.tier
         FROM (SELECT * FROM {fonte} WHERE id = ?) t
         LEFT JOIN (SELECT id, lon, lat, precisao, tier FROM itbi WHERE id = ?) i USING (id)
         """,

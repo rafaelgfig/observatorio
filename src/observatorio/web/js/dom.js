@@ -127,3 +127,46 @@ export function icon(name) {
   template.innerHTML = icons[name];
   return /** @type {SVGElement} */ (template.content.firstElementChild);
 }
+
+/**
+ * Recria o conteúdo de `container` com `render` sem perder o foco do teclado: se o elemento
+ * focado estava dentro dele e tinha `data-focus-key`, o novo elemento com a mesma chave recebe
+ * o foco de volta (senão o foco cairia no `<body>` a cada filtro alterado).
+ * @param {HTMLElement} container
+ * @param {() => void} render
+ */
+export function preserveFocus(container, render) {
+  const active = /** @type {HTMLElement | null} */ (document.activeElement);
+  const key = active && container.contains(active) ? active.dataset.focusKey : undefined;
+  render();
+  if (!key) return;
+  const next = /** @type {HTMLElement | null} */ (container.querySelector(`[data-focus-key="${CSS.escape(key)}"]`));
+  next?.focus({ preventScroll: true });
+}
+
+/**
+ * Região `role="status"` (invisível) para anunciar um resumo curto de cada atualização.
+ * @returns {HTMLElement & { announce: (text: string) => void }}
+ */
+export function statusRegion() {
+  const node = el("div", { className: "visually-hidden", role: "status" });
+  let last = "";
+  return Object.assign(node, {
+    /** @param {string} text */
+    announce(text) {
+      if (text === last) return;
+      last = text;
+      node.textContent = text;
+    },
+  });
+}
+
+/**
+ * Aviso de erro (anunciado na hora por leitores de tela).
+ * @param {unknown} error
+ * @param {string} [prefix]
+ */
+export function errorNotice(error, prefix = "") {
+  const message = error instanceof Error ? error.message : String(error);
+  return el("div", { className: "notice notice--error", role: "alert", textContent: `${prefix}${message}` });
+}

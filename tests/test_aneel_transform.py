@@ -314,3 +314,118 @@ def test_places_das_distribuidoras(con: duckdb.DuckDBPyConnection) -> None:
     assert (lon, lat) == (-49.3, -16.7)  # Goiânia, maior base
     assert (bbox_w, bbox_e) == (pytest.approx(-49.6), pytest.approx(-49.1))
     assert lugares[LIGHT.cnpj14][6:8] == (-43.2, -22.9)  # Rio de Janeiro
+
+
+# ------------------------------------------------------------------ pesos (variações do cenário)
+
+
+def _variante(tmp_path: Path, extras: list[dict[str, object]]) -> duckdb.DuckDBPyConnection:
+    """Cenário-base + linhas extras de 2026, reconstruído em ``tmp_path``."""
+    out_dir = tmp_path / "processed" / "aneel"
+    transform.build(cenario(tmp_path, extras), out_dir)
+    db = duckdb.connect()
+    for name in transform.AGGREGATES:
+        stem = name.removesuffix(".parquet")
+        db.execute(f"CREATE VIEW {stem} AS SELECT * FROM '{(out_dir / name).as_posix()}'")
+    return db
+
+
+def _fec(con: duckdb.DuckDBPyConnection, cod_mun: int, ano: int, mes: int) -> float:
+    [(fec,)] = rows(
+        con,
+        "SELECT (SELECT sum(consumidores) FROM mun_mes WHERE ano = ? AND mes = ? AND cod_mun = ?)"
+        " / (SELECT sum(base) FROM mun_base WHERE ano = ? AND mes = ? AND cod_mun = ?)",
+        [ano, mes, cod_mun, ano, mes, cod_mun],
+    )
+    return float(fec)
+
+
+def test_peso_vem_do_tamanho_do_alimentador_e_nao_da_frequencia(tmp_path: Path) -> None:
+    # Campinas cai mais 3 vezes em janeiro no mesmo alimentador (mesmos 100 consumidores): o
+    # tamanho do alimentador não muda, então o peso também não — e o FEC de Campinas sobe.
+    # Somando afetados, o peso subiria junto e o FEC municipal repetiria o do conjunto.
+    extras = []
+    for dia in (12, 19, 26):
+        linha = linha_2026(
+            ELETROPAULO,
+            101,
+            f"R{dia}",
+            CAMPINAS,
+            local(f"2026-01-{dia} 08:00:00"),
+            horas=1,
+            consumidores=100,
+        )
+        linha["CodAlimentador"] = "AL-I2"
+        extras.append(linha)
+    con = _variante(tmp_path, extras)
+
+    pesos = dict(rows(con, "SELECT cod_mun, w FROM conj_mun_pesos WHERE conj = 101"))
+    assert pesos == {SAO_PAULO: pytest.approx(0.75), CAMPINAS: pytest.approx(0.25)}
+    # São Paulo: 300 afetados ÷ 750; Campinas: 4 × 100 ÷ (250 do 101 + 220 do 102)
+    assert _fec(con, SAO_PAULO, 2026, 1) == pytest.approx(300 / 750)
+    assert _fec(con, CAMPINAS, 2026, 1) == pytest.approx(400 / 470)
+
+
+def test_evento_macico_ou_externo_nao_ensina_peso(tmp_path: Path) -> None:
+    # Dois registros codificados em Ribeirão Preto (fora do conjunto 101 no IndQual):
+    # um de origem externa com mais consumidores que o conjunto, e um evento que derruba três
+    # alimentadores no mesmo minuto (subestação). Nenhum deve dar peso a Ribeirão no 101.
+    externo = linha_2026(
+        ELETROPAULO, 101, "X1", RIBEIRAO_PRETO, local("2026-01-20 10:00:00"),
+        horas=2, consumidores=5000,
+        expurgo="Interrupção de origem externa ao sistema de distribuição",
+    )  # fmt: skip
+    externo["DscFatoGeradorOrigem"] = "Externa"
+    macico = [
+        linha_2026(
+            ELETROPAULO,
+            101,
+            f"M{i}",
+            RIBEIRAO_PRETO,
+            local("2026-01-21 03:00:00"),
+            horas=1,
+            consumidores=900,
+        )
+        for i in range(transform.MASSA_ALIMENTADORES)
+    ]
+    con = _variante(tmp_path, [externo, *macico])
+
+    pesos = dict(rows(con, "SELECT cod_mun, w FROM conj_mun_pesos WHERE conj = 101"))
+    assert pesos == {SAO_PAULO: pytest.approx(0.75), CAMPINAS: pytest.approx(0.25)}
+    # os registros continuam no numerador de Ribeirão Preto (observados)
+    [(consumidores,)] = rows(
+        con,
+        "SELECT sum(consumidores) FROM mun_mes WHERE ano = 2026 AND cod_mun = ?",
+        [RIBEIRAO_PRETO],
+    )
+    assert consumidores == pytest.approx(5000 + 900 * transform.MASSA_ALIMENTADORES)
+
+
+def test_base_acima_da_populacao_e_limitada() -> None:
+    con = connect()
+    con.execute(
+        "CREATE TABLE municipios AS SELECT * FROM (VALUES"
+        " (1, 'Pequeno', 'SP', 100), (2, 'Grande', 'SP', 10000), (3, 'Isolado', 'SP', 10))"
+        " m(cod, nome, uf, populacao)"
+    )
+    con.execute(
+        "CREATE TABLE conj_mes AS SELECT * FROM (VALUES (2026, 1, 10, 1000.0), (2026, 1, 20, 50.0))"
+        " c(ano, mes, conj, base)"
+    )
+    # conjunto 10: metade para o município de 100 habitantes (base implícita 500);
+    # conjunto 20: só o "Isolado" (sem para onde mover o excesso: fica como está)
+    con.execute(
+        "CREATE TABLE pesos AS SELECT * FROM (VALUES"
+        " (10, 1, 0.5, 'observado'), (10, 2, 0.5, 'observado'), (20, 3, 1.0, 'observado'))"
+        " p(conj, cod_mun, w, fonte)"
+    )
+
+    transform._limit_pesos(con)
+
+    pesos = {(c, m): w for c, m, w in rows(con, "SELECT conj, cod_mun, w FROM pesos")}
+    limite = transform.CONSUMIDORES_POR_HABITANTE_MAX * 100 / 1000
+    assert pesos == {
+        (10, 1): pytest.approx(limite),
+        (10, 2): pytest.approx(1 - limite),
+        (20, 3): pytest.approx(1.0),
+    }

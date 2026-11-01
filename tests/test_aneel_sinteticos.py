@@ -17,6 +17,7 @@ O cenário foi montado para que DEC/FEC, pesos e alocações possam ser conferid
 from __future__ import annotations
 
 import csv
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -442,7 +443,9 @@ def escrever_geo(geo_dir: Path) -> Path:
     return geo_dir / "municipios.parquet"
 
 
-def escrever_brutos(raw_dir: Path) -> dict[str, Path]:
+def escrever_brutos(
+    raw_dir: Path, extras_2026: Sequence[dict[str, object]] = ()
+) -> dict[str, Path]:
     """Os quatro arquivos brutos do cenário, com os nomes usados em ``raw/aneel``."""
     raw_dir.mkdir(parents=True, exist_ok=True)
     return {
@@ -450,16 +453,16 @@ def escrever_brutos(raw_dir: Path) -> dict[str, Path]:
             raw_dir / "interrupcoes-2025.parquet", linhas_2025()
         ),
         "interrupcoes-2026.parquet": escrever_2026(
-            raw_dir / "interrupcoes-2026.parquet", linhas_2026()
+            raw_dir / "interrupcoes-2026.parquet", [*linhas_2026(), *extras_2026]
         ),
         "indicadores.parquet": escrever_indicadores(raw_dir / "indicadores.parquet"),
         "indqual-municipio.csv": escrever_indqual(raw_dir / "indqual-municipio.csv"),
     }
 
 
-def cenario(raiz: Path) -> transform.Inputs:
-    """Escreve brutos + geo em ``raiz`` e devolve as entradas da transformação."""
-    brutos = escrever_brutos(raiz / "raw")
+def cenario(raiz: Path, extras_2026: Sequence[dict[str, object]] = ()) -> transform.Inputs:
+    """Escreve brutos + geo em ``raiz`` (com linhas extras em 2026) e devolve as entradas."""
+    brutos = escrever_brutos(raiz / "raw", extras_2026)
     return transform.Inputs(
         interrupcoes={
             2025: brutos["interrupcoes-2025.parquet"],

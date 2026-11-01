@@ -10,7 +10,7 @@ import { createAutocomplete } from "../components/autocomplete.js";
 import { columnChart, hideTooltip, horizontalBars, lineChart, showTooltip } from "../components/charts.js";
 import { createLegend, cssRamp, cssVar, stepExpression } from "../components/legend.js";
 import { createTable } from "../components/table.js";
-import { debounce, el, fmt, icon, MONTHS } from "../dom.js";
+import { debounce, el, errorNotice, fmt, icon, MONTHS, preserveFocus, statusRegion } from "../dom.js";
 import { SAO_PAULO_BOUNDS } from "../map.js";
 
 /** @typedef {import("../main.js").ViewContext} ViewContext */
@@ -34,6 +34,8 @@ const RADIUS_MAX = 3000;
 const RADIUS_STEP = 50;
 const YM = /^\d{4}-(0[1-9]|1[0-2])$/;
 const AREA_ID = /^[0-9A-Za-z]{1,8}$/;
+// os tiles (e o heatmap) existem a partir deste zoom (`queries.ZOOM_MIN` no servidor)
+const TILE_MIN_ZOOM = 9;
 
 /**
  * Calibração do heatmap (camada `itbi_agg`, uma célula de 1/32 do tile): p90 de `n` por zoom na
@@ -117,6 +119,19 @@ let viaBbox = /** @type {[number, number, number, number] | null} */ (null);
 let tilesUrl = "";
 /** Fator do p90 do heatmap (total do filtro / HEAT_REF_TOTAL). */
 let heatScale = 1;
+/** Cancela tudo o que a montagem atual pôs no ar (desmontar = abortar). */
+let controller = /** @type {AbortController | null} */ (null);
+/** Nº da montagem atual: respostas de uma montagem anterior são descartadas. */
+let generation = 0;
+
+/**
+ * Sinal da requisição combinado com o da montagem.
+ * @param {AbortSignal} [signal]
+ */
+function scoped(signal) {
+  if (!controller) return signal;
+  return signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
+}
 
 /** @returns {State} */
 function defaultState() {
@@ -143,6 +158,8 @@ function defaultState() {
 /** @param {ViewContext} context */
 export function mount(context) {
   ctx = context;
+  generation += 1;
+  controller = new AbortController();
   state = defaultState();
   buildPanel(context.panel);
   buildDrawer(context.mapWrap);
@@ -151,16 +168,23 @@ export function mount(context) {
   cleanups.push(context.onStyle(addLayers));
   cleanups.push(
     context.onTheme(() => {
+      // o terra-draw não sobrevive à troca de estilo: `addLayers` (no estilo novo) o recria
+      // na mesma ferramenta
       stopDrawing();
       repaint();
     }),
   );
   bindMapEvents(context);
-  context.fit([SAO_PAULO_BOUNDS[0][0], SAO_PAULO_BOUNDS[0][1], SAO_PAULO_BOUNDS[1][0], SAO_PAULO_BOUNDS[1][1]], 12);
+  // nunca abaixo do zoom dos tiles: num mapa baixo (celular, notebook) a cidade inteira não
+  // cabe acima dele e o heatmap ficaria vazio
+  context.fit([SAO_PAULO_BOUNDS[0][0], SAO_PAULO_BOUNDS[0][1], SAO_PAULO_BOUNDS[1][0], SAO_PAULO_BOUNDS[1][1]], 12, TILE_MIN_ZOOM);
   void start(context.params());
 }
 
 export function unmount() {
+  generation += 1;
+  controller?.abort();
+  controller = null;
   stopDrawing();
   cleanups.forEach((fn) => fn());
   cleanups = [];
@@ -181,21 +205,22 @@ export function unmount() {
 
 /** @param {URLSearchParams} params */
 async function start(params) {
+  const gen = generation;
   try {
-    meta = await api("/itbi/meta");
+    meta = await api("/itbi/meta", { signal: scoped() });
   } catch (error) {
-    if (!isAbort(error)) showError(error);
+    if (!isAbort(error) && gen === generation) showError(error);
     return;
   }
-  if (!ctx) return; // a view foi desmontada enquanto o /meta carregava
-  const max = String(meta.periodo?.max ?? "").slice(0, 7);
+  if (gen !== generation) return; // a view foi desmontada (ou remontada) enquanto o /meta carregava
   const min = String(meta.periodo?.min ?? "").slice(0, 7);
-  state.dataFim = max;
-  state.dataIni = shiftMonth(max, -23);
+  state.dataFim = defaultEnd();
+  state.dataIni = shiftMonth(state.dataFim, -23);
   if (min && state.dataIni < min) state.dataIni = min;
   await applyParams(params);
-  if (!ctx) return;
-  ctx.setFreshness(`ITBI até ${fmt.date(meta.periodo?.max)}`);
+  if (gen !== generation || !ctx) return;
+  const pago = meta.periodo?.pago_ate ?? meta.periodo?.max;
+  ctx.setFreshness(`ITBI: guias pagas até ${fmt.date(pago)}`);
   // a região vinda da URL precisa aparecer no painel (senão fica "Sem região")
   renderTools();
   renderRegiao();
@@ -252,6 +277,22 @@ async function applyParams(p) {
     state.via = null;
     state.soVia = false;
   }
+}
+
+/**
+ * Fim padrão do período: o último mês completo (os seguintes ainda recebem guias atrasadas —
+ * ~20% são pagas no mês seguinte ao da transação) ou, sem essa informação, o último com dados.
+ */
+function defaultEnd() {
+  const completo = String(meta?.periodo?.completo_ate ?? "").slice(0, 7);
+  const max = String(meta?.periodo?.max ?? "").slice(0, 7);
+  return completo && (!max || completo <= max) ? completo : max;
+}
+
+/** Primeiro mês de transação ainda parcial (YYYY-MM), ou "" se não se sabe. */
+function firstPartialMonth() {
+  const completo = String(meta?.periodo?.completo_ate ?? "").slice(0, 7);
+  return YM.test(completo) ? shiftMonth(completo, 1) : "";
 }
 
 /** @param {string | null} v  número não negativo, ou nulo */
@@ -376,12 +417,16 @@ function buildPanel(panel) {
   ui.regiao = el("div", { className: "section" });
   ui.tools = el("div", { className: "section" });
   ui.filters = el("div", { className: "section" });
+  ui.status = statusRegion();
+  // erros de pontos/tabela à parte: o resumo, ao chegar, só limpa os avisos dele
+  ui.errors = el("div");
   ui.notice = el("div");
   // aviso de pontos cortados: separado de `notice` (que o resumo limpa ao chegar)
   ui.pointsNote = el("div");
   ui.kpis = el("div", { className: "tiles" });
   ui.price = el("div");
   ui.count = el("div");
+  ui.partialNote = el("p", { className: "section-subtitle" });
   ui.tipos = el("div");
 
   panel.append(
@@ -392,10 +437,12 @@ function buildPanel(panel) {
         textContent: "Transações imobiliárias declaradas nas guias de ITBI pagas à Prefeitura de São Paulo.",
       }),
     ]),
+    ui.status,
     el("div", { className: "section" }, [combobox]),
     ui.tools,
     ui.regiao,
     ui.filters,
+    ui.errors,
     ui.notice,
     ui.pointsNote,
     el("section", { className: "section", "aria-label": "Indicadores" }, [ui.kpis]),
@@ -406,10 +453,11 @@ function buildPanel(panel) {
     el("section", { className: "section" }, [
       el("h2", { className: "section-title", textContent: "Transações por mês" }),
       ui.count,
+      ui.partialNote,
     ]),
     el("section", { className: "section" }, [
       el("h2", { className: "section-title", textContent: "Por tipo de imóvel" }),
-      el("p", { className: "section-subtitle", textContent: "Número de transações (mediana de R$/m² ao passar o mouse)" }),
+      el("p", { className: "section-subtitle", textContent: "Número de transações, com o valor e o R$/m² medianos" }),
       ui.tipos,
     ]),
     el("p", { className: "section-subtitle" }, [
@@ -443,13 +491,17 @@ function buildPanel(panel) {
 }
 
 function renderTools() {
+  preserveFocus(ui.tools, buildTools);
+}
+
+function buildTools() {
   const tool = (/** @type {State["ferramenta"]} */ id, /** @type {string} */ label, /** @type {keyof typeof import("../dom.js").icons} */ ic) => {
-    const btn = el("button", { className: "btn", type: "button", title: label }, [icon(ic), label]);
+    const btn = el("button", { className: "btn", type: "button", title: label, dataset: { focusKey: `tool-${id}` } }, [icon(ic), label]);
     btn.setAttribute("aria-pressed", String(state.ferramenta === id));
     btn.addEventListener("click", () => setTool(state.ferramenta === id ? "none" : id));
     return btn;
   };
-  const clear = el("button", { className: "btn btn-ghost", type: "button", title: "Limpar região" }, [icon("trash"), "Limpar"]);
+  const clear = el("button", { className: "btn btn-ghost", type: "button", title: "Limpar região", dataset: { focusKey: "tool-limpar" } }, [icon("trash"), "Limpar"]);
   clear.addEventListener("click", () => clearRegiao());
   clear.disabled = !state.regiao;
 
@@ -475,6 +527,10 @@ function renderTools() {
 }
 
 function renderRegiao() {
+  preserveFocus(ui.regiao, buildRegiao);
+}
+
+function buildRegiao() {
   const r = state.regiao;
   if (!r) {
     ui.regiao.replaceChildren(
@@ -501,6 +557,7 @@ function renderRegiao() {
       step: String(RADIUS_STEP),
       value: String(state.raio),
       "aria-label": "Raio em metros",
+      dataset: { focusKey: "raio" },
     });
     const apply = debounce(() => refresh(), 250);
     slider.addEventListener("input", () => {
@@ -515,7 +572,7 @@ function renderRegiao() {
     children.push(el("div", { className: "field" }, [el("div", { className: "row" }, [el("span", { className: "field-label", textContent: "Raio" }), value]), slider]));
   }
   if (state.via && r.tipo === "circulo") {
-    const box = el("input", { type: "checkbox", checked: state.soVia });
+    const box = el("input", { type: "checkbox", checked: state.soVia, dataset: { focusKey: "so-via" } });
     box.addEventListener("change", () => {
       state.soVia = box.checked;
       // a rua (ou o CEP) pode passar do raio: amplia o círculo para cobrir a caixa da busca
@@ -558,8 +615,13 @@ function radiusToCover(bbox, lon, lat) {
 }
 
 function renderFilters() {
-  const ini = el("input", { className: "input", type: "month", value: state.dataIni, "aria-label": "Mês inicial" });
-  const fim = el("input", { className: "input", type: "month", value: state.dataFim, "aria-label": "Mês final" });
+  preserveFocus(ui.filters, buildFilters);
+}
+
+/** Recria os controles de filtro (cada um com `data-focus-key`, ver `preserveFocus`). */
+function buildFilters() {
+  const ini = el("input", { className: "input", type: "month", value: state.dataIni, "aria-label": "Mês inicial", dataset: { focusKey: "mes-ini" } });
+  const fim = el("input", { className: "input", type: "month", value: state.dataFim, "aria-label": "Mês final", dataset: { focusKey: "mes-fim" } });
   if (meta?.periodo) {
     for (const node of [ini, fim]) {
       node.min = String(meta.periodo.min).slice(0, 7);
@@ -579,21 +641,24 @@ function renderFilters() {
 
   const max = String(meta?.periodo?.max ?? state.dataFim).slice(0, 7);
   const min = String(meta?.periodo?.min ?? state.dataIni).slice(0, 7);
+  // períodos prontos terminam no último mês completo; "Tudo" vai até a última transação
+  const fimPadrao = meta ? defaultEnd() : state.dataFim;
   const presets = [
-    { label: "12 meses", ini: shiftMonth(max, -11) },
-    { label: "2 anos", ini: shiftMonth(max, -23) },
-    { label: "5 anos", ini: shiftMonth(max, -59) },
-    { label: "Tudo", ini: min },
+    { label: "12 meses", ini: shiftMonth(fimPadrao, -11), fim: fimPadrao },
+    { label: "2 anos", ini: shiftMonth(fimPadrao, -23), fim: fimPadrao },
+    { label: "5 anos", ini: shiftMonth(fimPadrao, -59), fim: fimPadrao },
+    { label: "Tudo", ini: min, fim: max },
   ];
   const presetRow = el(
     "div",
     { className: "chips", role: "group", "aria-label": "Períodos prontos" },
     presets.map((p) => {
-      const btn = el("button", { className: "btn btn-ghost", type: "button", textContent: p.label });
-      btn.setAttribute("aria-pressed", String(state.dataIni === p.ini && state.dataFim === max));
+      const ini = p.ini < min ? min : p.ini;
+      const btn = el("button", { className: "btn btn-ghost", type: "button", textContent: p.label, dataset: { focusKey: `preset-${p.label}` } });
+      btn.setAttribute("aria-pressed", String(state.dataIni === ini && state.dataFim === p.fim));
       btn.addEventListener("click", () => {
-        state.dataIni = p.ini < min ? min : p.ini;
-        state.dataFim = max;
+        state.dataIni = ini;
+        state.dataFim = p.fim;
         renderFilters();
         refresh();
       });
@@ -605,7 +670,7 @@ function renderFilters() {
     "div",
     { className: "chips", role: "group", "aria-label": "Tipo de imóvel" },
     TIPOS.map((t) => {
-      const box = el("input", { type: "checkbox", checked: state.tipos.includes(t.id) });
+      const box = el("input", { type: "checkbox", checked: state.tipos.includes(t.id), dataset: { focusKey: `tipo-${t.id}` } });
       box.addEventListener("change", () => {
         state.tipos = box.checked ? [...state.tipos, t.id] : state.tipos.filter((x) => x !== t.id);
         if (!state.tipos.length) state.tipos = [t.id];
@@ -616,7 +681,7 @@ function renderFilters() {
     }),
   );
 
-  const natureza = el("select", { className: "select", "aria-label": "Natureza da transação" }, [
+  const natureza = el("select", { className: "select", "aria-label": "Natureza da transação", dataset: { focusKey: "natureza" } }, [
     el("option", { value: "compra", textContent: "Compra e venda", selected: state.natureza === "compra" }),
     el("option", { value: "todas", textContent: "Todas as naturezas", selected: state.natureza === "todas" }),
   ]);
@@ -625,7 +690,7 @@ function renderFilters() {
     refresh();
   });
 
-  const precisao = el("select", { className: "select", "aria-label": "Precisão da localização" }, [
+  const precisao = el("select", { className: "select", "aria-label": "Precisão da localização", dataset: { focusKey: "precisao" } }, [
     el("option", { value: "lote", textContent: "Só lote/condomínio exato", selected: state.precisao === "lote" }),
     el("option", { value: "quadra", textContent: "Até o centro da quadra", selected: state.precisao === "quadra" }),
     el("option", { value: "qualquer", textContent: "Qualquer precisão", selected: state.precisao === "qualquer" }),
@@ -635,8 +700,8 @@ function renderFilters() {
     refresh();
   });
 
-  const numberInput = (/** @type {number | null} */ value, /** @type {string} */ label, /** @type {(v: number | null) => void} */ set) => {
-    const node = el("input", { className: "input", type: "number", min: "0", inputMode: "numeric", value: value == null ? "" : String(value), placeholder: label, "aria-label": label });
+  const numberInput = (/** @type {number | null} */ value, /** @type {string} */ label, /** @type {string} */ name, /** @type {(v: number | null) => void} */ set) => {
+    const node = el("input", { className: "input", type: "number", min: "0", inputMode: "numeric", value: value == null ? "" : String(value), placeholder: label, "aria-label": name, dataset: { focusKey: name } });
     node.addEventListener("change", () => {
       set(numOrNull(node.value));
       // negativo ou inválido vira vazio; mínimo > máximo é trocado
@@ -653,12 +718,12 @@ function renderFilters() {
     field("Tipo de imóvel", tipoChips),
     el("div", { className: "grid-2" }, [field("Natureza", natureza), field("Localização", precisao)]),
     el("div", { className: "grid-2" }, [
-      field("Valor mín. (R$ mil)", numberInput(state.valorMin, "mín.", (v) => (state.valorMin = v))),
-      field("Valor máx. (R$ mil)", numberInput(state.valorMax, "máx.", (v) => (state.valorMax = v))),
+      field("Valor mín. (R$ mil)", numberInput(state.valorMin, "mín.", "Valor mínimo em R$ mil", (v) => (state.valorMin = v))),
+      field("Valor máx. (R$ mil)", numberInput(state.valorMax, "máx.", "Valor máximo em R$ mil", (v) => (state.valorMax = v))),
     ]),
     el("div", { className: "grid-2" }, [
-      field("Área mín. (m²)", numberInput(state.areaMin, "mín.", (v) => (state.areaMin = v))),
-      field("Área máx. (m²)", numberInput(state.areaMax, "máx.", (v) => (state.areaMax = v))),
+      field("Área mín. (m²)", numberInput(state.areaMin, "mín.", "Área mínima em m²", (v) => (state.areaMin = v))),
+      field("Área máx. (m²)", numberInput(state.areaMax, "máx.", "Área máxima em m²", (v) => (state.areaMax = v))),
     ]),
   );
 }
@@ -673,7 +738,7 @@ function field(label, control) {
 
 /** @param {unknown} error */
 function showError(error) {
-  ui.notice.replaceChildren(el("div", { className: "notice notice--error", textContent: (error instanceof Error ? error.message : String(error)) }));
+  ui.notice.replaceChildren(errorNotice(error));
 }
 
 // ------------------------------------------------------------------ região
@@ -687,7 +752,11 @@ async function selectPlace(place) {
     state.via = null;
     state.soVia = false;
     viaBbox = null;
-    await setDistrict(place.tipo, String(place.id), true);
+    const gen = generation;
+    const pedido = String(place.id);
+    await setDistrict(place.tipo, pedido, true);
+    // montagem nova, ou outra escolha chegou depois desta
+    if (gen !== generation || state.regiao?.payload?.id !== pedido) return;
   } else if (place.lon != null && place.lat != null) {
     const tipo = place.tipo === "logradouro" || place.tipo === "cep" ? place.tipo : null;
     state.via = tipo ? { tipo, id: String(place.id) } : null;
@@ -726,15 +795,22 @@ function setCircle(lon, lat, label, fit) {
  * @param {boolean} fit
  */
 async function setDistrict(tipo, id, fit) {
+  const gen = generation;
   try {
-    const area = await api(`/itbi/area/${tipo}/${encodeURIComponent(id)}`);
+    // só a última escolha vale: duas escolhas rápidas não podem chegar fora de ordem
+    const area = await fetchArea(tipo, id);
+    if (gen !== generation) return;
     state.regiao = { tipo, payload: { tipo, id }, label: area.nome, geometry: area.geometria };
     drawRegiao();
     if (fit && area.bbox) ctx?.fit(area.bbox, 15);
   } catch (error) {
-    if (!isAbort(error)) showError(error);
+    if (!isAbort(error) && gen === generation) showError(error);
   }
 }
+
+const fetchArea = latest((signal, /** @type {string} */ tipo, /** @type {string} */ id) =>
+  api(`/itbi/area/${tipo}/${encodeURIComponent(id)}`, { signal: scoped(signal) }),
+);
 
 /** @param {any} geometry GeoJSON Polygon */
 function setPolygon(geometry) {
@@ -865,57 +941,88 @@ function refresh(options = {}) {
   updateTiles();
 }
 
-const fetchSummary = latest((signal) => api("/itbi/resumo", { body: consulta(), signal }));
+const fetchSummary = latest((signal) => api("/itbi/resumo", { body: consulta(), signal: scoped(signal) }));
 
 async function loadSummary() {
+  const gen = generation;
   const busy = [ui.kpis, ui.price, ui.count, ui.tipos];
   busy.forEach((n) => n.classList.add("is-loading"));
   try {
     const data = await fetchSummary();
+    if (gen !== generation) return;
     ui.notice.replaceChildren();
     renderSummary(data);
   } catch (error) {
-    if (!isAbort(error)) showError(error);
+    if (!isAbort(error) && gen === generation) showError(error);
   } finally {
-    busy.forEach((n) => n.classList.remove("is-loading"));
+    if (gen === generation) busy.forEach((n) => n.classList.remove("is-loading"));
   }
 }
 
-const fetchPoints = latest((signal) => api(`/itbi/pontos?limite=${POINT_LIMIT}`, { body: consulta(), signal }));
+const fetchPoints = latest((signal) => api(`/itbi/pontos?limite=${POINT_LIMIT}`, { body: consulta(), signal: scoped(signal) }));
 
 async function loadPoints() {
+  const gen = generation;
   if (!state.regiao) {
     points = null;
+    ui.errors.querySelector("[data-erro='pontos']")?.remove();
     setPoints();
     return;
   }
   try {
-    points = await fetchPoints();
+    const data = await fetchPoints();
+    if (gen !== generation) return;
+    points = data;
+    ui.errors.querySelector("[data-erro='pontos']")?.remove();
     setPoints();
   } catch (error) {
-    if (!isAbort(error)) showError(error);
+    if (isAbort(error) || gen !== generation) return;
+    // sem pontos velhos de outro filtro no mapa
+    points = null;
+    setPoints();
+    showBlockError("pontos", error, "Não foi possível carregar os pontos do mapa: ");
   }
 }
 
 const fetchRows = latest((signal) =>
   api("/itbi/transacoes", {
     body: { consulta: consulta(), pagina: page, por_pagina: PAGE_SIZE, ordem: sort.key, direcao: sort.dir },
-    signal,
+    signal: scoped(signal),
   }),
 );
 
 async function loadTable() {
   if (!table) return;
+  const gen = generation;
   ui.drawerBody.classList.add("is-loading");
   try {
     const data = await fetchRows();
+    if (gen !== generation || !table) return;
     table.setRows(data.linhas, { total: data.total, page, perPage: PAGE_SIZE });
     ui.drawerTitle.textContent = `Transações (${fmt.int(data.total)})`;
+    ui.errors.querySelector("[data-erro='tabela']")?.remove();
   } catch (error) {
-    if (!isAbort(error)) ui.drawerTitle.textContent = "Transações";
+    if (isAbort(error) || gen !== generation || !table) return;
+    // linhas do filtro anterior não ficam na tela como se fossem deste
+    table.clear("Não foi possível carregar a tabela.");
+    ui.drawerTitle.textContent = "Transações";
+    showBlockError("tabela", error, "Não foi possível carregar a tabela: ");
   } finally {
-    ui.drawerBody.classList.remove("is-loading");
+    if (gen === generation) ui.drawerBody.classList.remove("is-loading");
   }
+}
+
+/**
+ * Erro de um bloco (pontos ou tabela), no contêiner de erros e com `role="alert"`.
+ * @param {string} key
+ * @param {unknown} error
+ * @param {string} prefix
+ */
+function showBlockError(key, error, prefix) {
+  ui.errors.querySelector(`[data-erro='${key}']`)?.remove();
+  const notice = errorNotice(error, prefix);
+  notice.dataset.erro = key;
+  ui.errors.append(notice);
 }
 
 /** @param {any} data */
@@ -942,6 +1049,7 @@ function renderSummary(data) {
 
   const mensal = fillMonths(data.mensal ?? []);
   const count = mensal.length;
+  const parcial = firstPartialMonth();
   const datums = mensal.map((r) => {
     const [y, m] = String(r.mes).split("-").map(Number);
     return {
@@ -949,10 +1057,16 @@ function renderSummary(data) {
       title: `${MONTHS[m - 1]}/${y} · ${fmt.int(r.n)} ${r.n === 1 ? "transação" : "transações"}`,
       value: r.rs_m2_mediano,
       n: r.n,
+      partial: Boolean(parcial) && r.mes >= parcial,
     };
   });
   priceChart?.update(datums);
   countChart?.update(datums.map((d) => ({ ...d, value: d.n })));
+  const [py, pm] = parcial ? parcial.split("-").map(Number) : [0, 0];
+  ui.partialNote.textContent = datums.some((d) => d.partial)
+    ? `De ${MONTHS[pm - 1]}/${py} em diante (barras claras) os meses ainda recebem guias pagas com atraso: os números vão crescer.`
+    : "";
+  ui.status.announce(`${fmt.int(total)} ${total === 1 ? "transação" : "transações"} · ${state.regiao ? state.regiao.label : "cidade inteira"}`);
 
   horizontalBars(
     ui.tipos,
@@ -1112,7 +1226,7 @@ function buildDrawer(host) {
       { key: "data", label: "Data", sortKey: "data", render: (r) => fmt.date(r.data) },
       { key: "endereco", label: "Endereço" },
       { key: "complemento", label: "Compl.", render: (r) => r.complemento ?? "" },
-      { key: "tipo", label: "Tipo", render: (r) => TIPO_NOME[r.tipo] ?? r.tipo ?? "" },
+      { key: "tipo", label: "Tipo", render: (r) => `${TIPO_NOME[r.tipo] ?? r.tipo ?? ""}${r.na_planta ? " (na planta)" : ""}` },
       // mesma área da ordenação `area` da API: construída, ou a do terreno para terrenos
       { key: "area", label: "Área (m²)", num: true, sortKey: "area", render: (r) => formatArea(r.tipo === "terreno" ? r.area_terreno : r.area_construida) },
       { key: "valor", label: "Valor", num: true, sortKey: "valor", render: (r) => fmt.brl(r.valor) },
@@ -1127,6 +1241,7 @@ function buildDrawer(host) {
       page = next;
       void loadTable();
     },
+    rowLabel: "Ver no mapa",
     onRowClick: (row) => {
       if (row.lon != null && row.lat != null && ctx) {
         ctx.map.flyTo({ center: [row.lon, row.lat], zoom: Math.max(ctx.map.getZoom(), 17) });
@@ -1224,6 +1339,8 @@ function addLayers() {
   repaint();
   drawRegiao();
   setPoints();
+  // estilo novo (troca de tema) no meio de um desenho: recria o terra-draw na mesma ferramenta
+  if ((state.ferramenta === "polygon" || state.ferramenta === "rectangle") && !draw) void startDrawing(state.ferramenta);
 }
 
 /** @param {ViewContext} context */
@@ -1391,6 +1508,7 @@ function renderLegend() {
       nodataLabel: "Sem R$/m² (garagem, na planta…)",
     });
   } else if (!state.regiao) {
+    const longe = Boolean(ctx && ctx.map.getZoom() < TILE_MIN_ZOOM);
     legend.render({
       title: "Densidade de transações",
       colors: ramp.slice(1),
@@ -1398,7 +1516,11 @@ function renderLegend() {
       format: () => "",
       labels: ["menos", "mais"],
       nodataLabel: "Desenhe uma região para ver cada venda",
-      note: hasValueFilters() ? "O mapa não aplica os filtros de valor e área" : undefined,
+      note: longe
+        ? "Aproxime o mapa para ver a densidade"
+        : hasValueFilters()
+          ? "O mapa não aplica os filtros de valor e área"
+          : undefined,
     });
   } else {
     legend.hide();
@@ -1419,15 +1541,17 @@ async function openPopup(id, lngLat, count = 1) {
     .addTo(ctx.map);
   popup = current;
   try {
-    const t = await api(`/itbi/transacao/${encodeURIComponent(String(id))}`);
+    const t = await api(`/itbi/transacao/${encodeURIComponent(String(id))}`, { signal: scoped() });
     if (popup !== current) return; // outro clique abriu outro popup
     // `endereco` já traz o número ("Rua Pamplona, 834"; "s/n" quando não há)
     const titulo = t.endereco ?? ([t.logradouro, t.numero_raw ?? t.numero].filter(Boolean).join(", ") || "Endereço não informado");
     const cep = t.cep ? `CEP ${String(t.cep).replace(/^(\d{5})(\d{3})$/, "$1-$2")}` : "";
+    // na planta / fração < 10%: a área construída do IPTU é a do lote inteiro, não a da unidade
+    const areaDoLote = t.na_planta || (t.proporcao_pct != null && t.proporcao_pct < 10);
     const rows = [
       ["Data", fmt.date(t.data_transacao)],
       ["Valor", fmt.brl(t.valor_transacao)],
-      ["Área construída", t.area_construida_m2 ? `${fmt.int(t.area_construida_m2)} m²` : "—"],
+      ["Área construída", areaDoLote ? "— (IPTU do lote)" : t.area_construida_m2 ? `${fmt.int(t.area_construida_m2)} m²` : "—"],
       ["Área do terreno", t.area_terreno_m2 ? `${fmt.int(t.area_terreno_m2)} m²` : "—"],
       ["R$/m²", fmt.brl(t.rs_m2)],
       ["Tipo", `${TIPO_NOME[t.tipo] ?? t.tipo ?? "—"}${t.na_planta ? " (na planta)" : ""}`],
@@ -1503,13 +1627,19 @@ function bindMapEvents(context) {
     if (state.ferramenta === "none") map.getCanvas().style.cursor = "";
     hideTooltip();
   };
+  // abaixo do zoom dos tiles o heatmap some: a legenda avisa
+  const onZoom = () => {
+    if (!state.regiao) renderLegend();
+  };
   map.on("click", onClick);
+  map.on("zoomend", onZoom);
   for (const layer of ["itbi-points", "itbi-tile-points"]) {
     map.on("mousemove", layer, onMove);
     map.on("mouseleave", layer, onLeave);
   }
   cleanups.push(() => {
     map.off("click", onClick);
+    map.off("zoomend", onZoom);
     for (const layer of ["itbi-points", "itbi-tile-points"]) {
       map.off("mousemove", layer, onMove);
       map.off("mouseleave", layer, onLeave);

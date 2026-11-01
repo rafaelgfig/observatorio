@@ -9,7 +9,7 @@ import { api, isAbort, latest } from "../api.js";
 import { createAutocomplete } from "../components/autocomplete.js";
 import { columnChart, hideTooltip, horizontalBars, showTooltip } from "../components/charts.js";
 import { createLegend, cssRamp, cssVar, stepExpression } from "../components/legend.js";
-import { el, fmt, icon, MONTHS } from "../dom.js";
+import { el, errorNotice, fmt, icon, MONTHS, preserveFocus, statusRegion } from "../dom.js";
 
 /** @typedef {import("../main.js").ViewContext} ViewContext */
 
@@ -93,6 +93,16 @@ let ctx = null;
 let cleanups = [];
 /** @type {AbortController | null} */
 let controller = null;
+/** Nº da montagem atual: respostas de uma montagem anterior são descartadas. */
+let generation = 0;
+
+/**
+ * Sinal da requisição combinado com o da montagem (desmontar cancela tudo o que está no ar).
+ * @param {AbortSignal} signal
+ */
+function scoped(signal) {
+  return controller ? AbortSignal.any([signal, controller.signal]) : signal;
+}
 
 /** @type {State} */
 let state = {
@@ -123,6 +133,7 @@ let hoveredCod = /** @type {string | number | null} */ (null);
 /** @param {ViewContext} context */
 export function mount(context) {
   ctx = context;
+  generation += 1;
   controller = new AbortController();
   state = stateFromParams(context.params());
   buildPanel(context.panel);
@@ -135,7 +146,9 @@ export function mount(context) {
 }
 
 export function unmount() {
+  generation += 1;
   controller?.abort();
+  controller = null;
   cleanups.forEach((fn) => fn());
   cleanups = [];
   hideTooltip();
@@ -187,12 +200,14 @@ function syncParams() {
 }
 
 async function start() {
+  const gen = generation;
   try {
     meta = await api("/aneel/meta", { signal: controller?.signal });
   } catch (error) {
-    if (!isAbort(error)) showError(error);
+    if (!isAbort(error) && gen === generation) showError(error);
     return;
   }
+  if (gen !== generation) return;
   const anos = meta.anos.map((/** @type {any} */ a) => a.ano);
   if (!state.ano || !anos.includes(state.ano)) state.ano = Math.max(...anos);
   clampMonths();
@@ -237,12 +252,26 @@ function buildPanel(panel) {
   ui.scope = el("div", { className: "row" });
 
   ui.filters = el("div", { className: "section" });
+  ui.status = statusRegion();
+  // erros do mapa à parte: o resumo, ao chegar, limpa só os avisos dele
+  ui.mapError = el("div");
   ui.notice = el("div");
   ui.kpis = el("div", { className: "tiles" });
   ui.monthlyTitle = el("h2", { className: "section-title" });
+  ui.monthlyHint = el("p", { className: "section-subtitle" });
+  ui.monthlyReset = el("button", { className: "btn btn-ghost btn-sm", type: "button", textContent: "Ano inteiro" });
+  ui.monthlyReset.hidden = true;
+  ui.monthlyReset.addEventListener("click", () => {
+    const meses = monthsAvailable();
+    state.mesIni = Math.min(...meses);
+    state.mesFim = Math.max(...meses);
+    renderFilters();
+    refreshAll();
+  });
   ui.monthly = el("div");
   ui.causes = el("div");
   ui.ranking = el("ol", { className: "rank-list" });
+  ui.rankingError = el("div");
   ui.rankingTitle = el("h2", { className: "section-title" });
   ui.extra = el("div", { className: "section" });
   ui.interruptions = el("div");
@@ -250,17 +279,23 @@ function buildPanel(panel) {
 
   panel.append(
     header,
+    ui.status,
     el("div", { className: "section" }, [combobox, ui.scope]),
     ui.filters,
+    ui.mapError,
     ui.notice,
     el("section", { className: "section", "aria-label": "Indicadores" }, [ui.kpis]),
-    el("section", { className: "section" }, [ui.monthlyTitle, ui.monthly]),
+    el("section", { className: "section" }, [
+      el("div", { className: "row row--between" }, [ui.monthlyTitle, ui.monthlyReset]),
+      ui.monthly,
+      ui.monthlyHint,
+    ]),
     el("section", { className: "section" }, [
       el("h2", { className: "section-title", textContent: "Causas" }),
       el("p", { className: "section-subtitle", textContent: "Participação no consumidor-hora interrompido" }),
       ui.causes,
     ]),
-    el("section", { className: "section" }, [ui.rankingTitle, ui.ranking]),
+    el("section", { className: "section" }, [ui.rankingTitle, ui.rankingError, ui.ranking]),
     ui.extra,
     el("section", { className: "section" }, [
       el("h2", { className: "section-title", textContent: "Maiores interrupções" }),
@@ -296,6 +331,11 @@ function buildPanel(panel) {
   });
 }
 
+function fullYear() {
+  const meses = monthsAvailable();
+  return !meses.length || (state.mesIni <= Math.min(...meses) && state.mesFim >= Math.max(...meses));
+}
+
 function metric() {
   return METRIC_BY_ID[state.metrica] ?? METRICS[0];
 }
@@ -320,6 +360,12 @@ function clampMonths() {
 
 function renderFilters() {
   if (!meta) return;
+  preserveFocus(ui.filters, buildFilters);
+  renderScopeChip();
+}
+
+/** Recria os controles de filtro (cada um com `data-focus-key`, ver `preserveFocus`). */
+function buildFilters() {
   const anos = meta.anos.map((/** @type {any} */ a) => a.ano).sort();
   const yearSeg = el(
     "div",
@@ -327,7 +373,7 @@ function renderFilters() {
     anos.map((/** @type {number} */ ano) => {
       const info = meta.anos.find((/** @type {any} */ a) => a.ano === ano);
       const partial = info && info.meses.length < 12 ? ` (até ${MONTHS[Math.max(...info.meses) - 1]})` : "";
-      const inputEl = el("input", { type: "radio", name: "ano", value: String(ano), checked: ano === state.ano });
+      const inputEl = el("input", { type: "radio", name: "ano", value: String(ano), checked: ano === state.ano, dataset: { focusKey: `ano-${ano}` } });
       inputEl.addEventListener("change", () => {
         state.ano = ano;
         state.mesIni = 1;
@@ -344,7 +390,7 @@ function renderFilters() {
   const monthSelect = (/** @type {number} */ value, /** @type {(v: number) => void} */ onChange, /** @type {string} */ label) => {
     const select = el(
       "select",
-      { className: "select", "aria-label": label },
+      { className: "select", "aria-label": label, dataset: { focusKey: label } },
       meses.map((m) => el("option", { value: String(m), textContent: MONTH_NAMES[m - 1], selected: m === value })),
     );
     select.addEventListener("change", () => onChange(Number(select.value)));
@@ -365,12 +411,14 @@ function renderFilters() {
 
   const metricSel = el(
     "select",
-    { className: "select", "aria-label": "Métrica" },
+    { className: "select", "aria-label": "Métrica", dataset: { focusKey: "metrica" } },
     METRICS.map((m) => el("option", { value: m.id, textContent: m.nome, selected: m.id === state.metrica })),
   );
+  const metricHelp = el("p", { className: "section-subtitle", textContent: metric().descricao });
   metricSel.addEventListener("change", () => {
+    // só o texto de ajuda muda: o <select> continua o mesmo (e com o foco)
     state.metrica = metricSel.value;
-    renderFilters();
+    metricHelp.textContent = metric().descricao;
     refreshAll();
   });
 
@@ -381,17 +429,23 @@ function renderFilters() {
       state.criterio = on ? "regulatorio" : "todas";
       refreshAll();
     },
+    "criterio",
   );
-  const progSwitch = switchControl("Incluir interrupções programadas", state.programadas, (on) => {
-    state.programadas = on;
-    refreshAll();
-  });
+  const progSwitch = switchControl(
+    "Incluir interrupções programadas",
+    state.programadas,
+    (on) => {
+      state.programadas = on;
+      refreshAll();
+    },
+    "programadas",
+  );
 
   const causeChips = el(
     "div",
     { className: "chips", role: "group", "aria-label": "Causas" },
     meta.causas.map((/** @type {string} */ causa) => {
-      const box = el("input", { type: "checkbox", checked: state.causas.includes(causa), value: causa });
+      const box = el("input", { type: "checkbox", checked: state.causas.includes(causa), value: causa, dataset: { focusKey: `causa-${causa}` } });
       box.addEventListener("change", () => {
         state.causas = box.checked ? [...state.causas, causa] : state.causas.filter((c) => c !== causa);
         refreshAll();
@@ -400,7 +454,7 @@ function renderFilters() {
     }),
   );
   const causesDetails = el("details", { open: state.causas.length > 0 }, [
-    el("summary", { className: "field-label", textContent: "Filtrar por causa (todas por padrão)" }),
+    el("summary", { className: "field-label", textContent: "Filtrar por causa (todas por padrão)", dataset: { focusKey: "causas" } }),
     causeChips,
   ]);
 
@@ -408,12 +462,11 @@ function renderFilters() {
     yearSeg,
     el("div", { className: "grid-2" }, [field("De", fromSel), field("Até", toSel)]),
     field("Métrica", metricSel),
-    el("p", { className: "section-subtitle", textContent: metric().descricao }),
+    metricHelp,
     regSwitch,
     progSwitch,
     causesDetails,
   );
-  renderScopeChip();
 }
 
 /**
@@ -428,9 +481,10 @@ function field(label, control) {
  * @param {string} label
  * @param {boolean} checked
  * @param {(on: boolean) => void} onChange
+ * @param {string} focusKey
  */
-function switchControl(label, checked, onChange) {
-  const box = el("input", { type: "checkbox", checked });
+function switchControl(label, checked, onChange, focusKey) {
+  const box = el("input", { type: "checkbox", checked, dataset: { focusKey } });
   box.addEventListener("change", () => onChange(box.checked));
   return el("label", { className: "switch" }, [box, el("span", { textContent: label })]);
 }
@@ -509,41 +563,48 @@ const fetchMap = latest((signal) =>
       metrica: state.metrica,
       agente: state.escopo.tipo === "distribuidora" ? state.escopo.id : undefined,
     },
-    signal,
+    signal: scoped(signal),
   }),
 );
 
 async function loadMap() {
+  const gen = generation;
   ctx?.mapWrap.classList.add("is-loading-map");
   try {
-    mapData = await fetchMap();
+    const data = await fetchMap();
+    if (gen !== generation) return;
+    mapData = data;
+    ui.mapError.replaceChildren();
     paintValues();
     renderLegend();
   } catch (error) {
-    if (!isAbort(error)) showError(error);
+    if (!isAbort(error) && gen === generation) ui.mapError.replaceChildren(errorNotice(error, "Mapa: "));
   } finally {
-    ctx?.mapWrap.classList.remove("is-loading-map");
+    if (gen === generation) ctx?.mapWrap.classList.remove("is-loading-map");
   }
 }
 
+// série do ano inteiro: o gráfico destaca o período em vez de encolher para ele
 const fetchSummary = latest((signal) =>
-  api("/aneel/resumo", { params: { ...baseParams(), ...scopeParams() }, signal }),
+  api("/aneel/resumo", { params: { ...baseParams(), ...scopeParams(), serie: "ano" }, signal: scoped(signal) }),
 );
 
 async function loadSummary() {
+  const gen = generation;
   setLoading([ui.kpis, ui.monthly, ui.causes, ui.extra], true);
   try {
     const data = await fetchSummary();
+    if (gen !== generation) return;
     if (state.escopo.tipo !== "brasil" && data.escopo?.nome) {
       state.escopo = { ...state.escopo, nome: data.escopo.nome };
       renderScopeChip();
     }
+    ui.notice.replaceChildren(); // antes: renderSummary escreve os avisos deste resumo
     renderSummary(data);
-    ui.notice.replaceChildren();
   } catch (error) {
-    if (!isAbort(error)) showError(error);
+    if (!isAbort(error) && gen === generation) showError(error);
   } finally {
-    setLoading([ui.kpis, ui.monthly, ui.causes, ui.extra], false);
+    if (gen === generation) setLoading([ui.kpis, ui.monthly, ui.causes, ui.extra], false);
   }
 }
 
@@ -559,34 +620,43 @@ const fetchRanking = latest((signal) => {
       ordem: "desc",
       limite: 15,
     },
-    signal,
+    signal: scoped(signal),
   });
 });
 
 async function loadRanking() {
+  const gen = generation;
   setLoading([ui.ranking], true);
   try {
     const rows = await fetchRanking();
+    if (gen !== generation) return;
+    ui.rankingError.replaceChildren();
     renderRanking(rows);
   } catch (error) {
-    if (!isAbort(error)) ui.ranking.replaceChildren();
+    if (isAbort(error) || gen !== generation) return;
+    ui.ranking.replaceChildren();
+    ui.rankingError.replaceChildren(errorNotice(error, "Não foi possível carregar o ranking: "));
   } finally {
-    setLoading([ui.ranking], false);
+    if (gen === generation) setLoading([ui.ranking], false);
   }
 }
 
 const fetchInterruptions = latest((signal) =>
-  api("/aneel/interrupcoes", { params: { ...baseParams(), ...scopeParams(), limite: 10 }, signal }),
+  api("/aneel/interrupcoes", { params: { ...baseParams(), ...scopeParams(), limite: 10 }, signal: scoped(signal) }),
 );
 
 async function loadInterruptions() {
+  const gen = generation;
   setLoading([ui.interruptions], true);
   try {
-    renderInterruptions(await fetchInterruptions());
+    const rows = await fetchInterruptions();
+    if (gen !== generation) return;
+    renderInterruptions(rows);
   } catch (error) {
-    if (!isAbort(error)) ui.interruptions.replaceChildren();
+    if (isAbort(error) || gen !== generation) return;
+    ui.interruptions.replaceChildren(errorNotice(error, "Não foi possível carregar as interrupções: "));
   } finally {
-    setLoading([ui.interruptions], false);
+    if (gen === generation) setLoading([ui.interruptions], false);
   }
 }
 
@@ -600,8 +670,7 @@ function setLoading(nodes, on) {
 
 /** @param {unknown} error */
 function showError(error) {
-  const message = error instanceof Error ? error.message : String(error);
-  ui.notice.replaceChildren(el("div", { className: "notice notice--error", textContent: message }));
+  ui.notice.replaceChildren(errorNotice(error));
 }
 
 // ------------------------------------------------------------------ render
@@ -624,25 +693,44 @@ function renderSummary(data) {
   ];
   ui.kpis.replaceChildren(...tiles.filter(Boolean).slice(0, 7).map((t) => /** @type {HTMLElement} */ (t)));
 
+  /** @type {HTMLElement[]} */
+  const notices = [];
   if (data.estimado) {
-    ui.notice.replaceChildren(
+    notices.push(
       el("div", {
         className: "notice",
         textContent:
-          "Os dados de 2025 não trazem o município: os valores municipais são estimados distribuindo cada conjunto elétrico pelos municípios que ele atende (erro típico de ~20%).",
+          "Os dados de 2025 não trazem o município: os valores municipais são estimados distribuindo cada conjunto elétrico pelos municípios que ele atende (erro típico de 25–30%).",
       }),
     );
   }
+  const lacunas = /** @type {number[]} */ (data.meses_lacuna ?? []);
+  if (lacunas.length) {
+    notices.push(
+      el("div", {
+        className: "notice",
+        textContent: `Faltam dados de distribuidoras em ${lacunas.map((mes) => MONTHS[mes - 1]).join(", ")}/${state.ano}: esses meses ficam fora da conta e os indicadores do período são parciais.`,
+      }),
+    );
+  }
+  ui.notice.replaceChildren(...notices);
 
   ui.monthlyTitle.textContent = `${m.nome} por mês`;
   const byMonth = new Map((data.mensal ?? []).map((/** @type {any} */ r) => [r.mes, r]));
+  const whole = fullYear();
   monthly?.update(
     monthsAvailable().map((mes) => ({
       label: MONTHS[mes - 1],
-      title: `${MONTH_NAMES[mes - 1]} de ${state.ano}`,
+      title: `${MONTH_NAMES[mes - 1]} de ${state.ano}${lacunas.includes(mes) ? " (sem dados de parte das distribuidoras)" : ""}`,
       value: byMonth.get(mes)?.[m.id] ?? null,
+      selected: !whole && mes >= state.mesIni && mes <= state.mesFim,
     })),
   );
+  ui.monthlyReset.hidden = whole;
+  ui.monthlyHint.textContent = whole
+    ? "Clique numa coluna (ou Enter no gráfico) para ver só aquele mês."
+    : `Destaque: ${periodLabel()}. Clique noutra coluna ou em “Ano inteiro”.`;
+  ui.status.announce(`${m.nome} ${periodLabel()}: ${m.format(heroValue)} · ${state.escopo.tipo === "brasil" ? "Brasil" : state.escopo.nome || state.escopo.id}`);
 
   horizontalBars(
     ui.causes,
@@ -745,17 +833,13 @@ function renderRanking(rows) {
   ui.rankingTitle.textContent = `Municípios com maior ${metric().nome} · ${where}`;
   ui.ranking.replaceChildren(
     ...rows.map((r) => {
-      const item = el("li", { className: "rank-item", tabIndex: 0 }, [
+      const button = el("button", { className: "rank-button", type: "button" }, [
         el("span", { className: "rank-name" }, [r.nome, " ", el("small", { textContent: r.uf })]),
         el("span", { className: "rank-value", textContent: metric().format(r.valor) }),
       ]);
-      if (e.tipo === "municipio" && String(r.cod) === e.id) item.setAttribute("aria-current", "true");
-      const choose = () => selectMunicipio(String(r.cod), `${r.nome} – ${r.uf}`, r.uf);
-      item.addEventListener("click", choose);
-      item.addEventListener("keydown", (ev) => {
-        if (ev.key === "Enter") choose();
-      });
-      return item;
+      if (e.tipo === "municipio" && String(r.cod) === e.id) button.setAttribute("aria-current", "true");
+      button.addEventListener("click", () => selectMunicipio(String(r.cod), `${r.nome} – ${r.uf}`, r.uf));
+      return el("li", { className: "rank-item" }, [button]);
     }),
   );
   if (!rows.length) ui.ranking.replaceChildren(el("li", { className: "muted", textContent: "Sem dados." }));
@@ -775,13 +859,14 @@ function renderInterruptions(rows) {
       "ul",
       { className: "rank-list" },
       rows.map((r) =>
-        el("li", { className: "hbar", title: [r.detalhe, r.conjunto, r.alimentador].filter(Boolean).join(" · ") }, [
+        el("li", { className: "hbar" }, [
           el("span", { className: "hbar-label" }, [
             el("strong", { textContent: `${fmt.date(r.inicio)} · ${fmt.hours(r.duracao)}` }),
             " ",
             el("span", { className: "muted", textContent: `${r.sigla ?? ""} · ${r.causa ?? ""}${r.programada ? " · programada" : ""}` }),
           ]),
           el("span", { className: "hbar-value", textContent: `${fmt.compact(r.consumidores)} cons.` }),
+          el("span", { className: "hbar-detail", textContent: [r.detalhe, r.conjunto, r.alimentador].filter(Boolean).join(" · ") }),
         ]),
       ),
     ),
@@ -887,7 +972,16 @@ const UF_BY_CODE = {
 
 const SRC_MUN = "apagoes-mun";
 const SRC_UF = "apagoes-uf";
-const LAYERS = ["apagoes-fill", "apagoes-line", "apagoes-uf-line", "apagoes-hover", "apagoes-selected"];
+const LAYERS = ["apagoes-fill", "apagoes-line", "apagoes-unstable", "apagoes-uf-line", "apagoes-hover", "apagoes-selected"];
+// valor instável (base pequena ou meses sem dados): preenchimento um pouco mais claro, ainda
+// na rampa, e contorno tracejado — com item próprio na legenda
+const UNSTABLE_OPACITY = 0.6;
+const STABLE_OPACITY = 0.85;
+
+/** Largura do contorno tracejado: `width` nos municípios instáveis, 0 nos demais. */
+function unstableWidth(/** @type {number} */ width) {
+  return ["case", ["boolean", ["feature-state", "instavel"], false], width, 0];
+}
 
 function addLayers() {
   if (!ctx) return;
@@ -911,6 +1005,22 @@ function addLayers() {
         type: "line",
         source: SRC_MUN,
         paint: { "line-color": bg, "line-width": ["interpolate", ["linear"], ["zoom"], 3, 0.1, 6, 0.5, 10, 1] },
+      },
+      before,
+    );
+  }
+  if (!map.getLayer("apagoes-unstable")) {
+    map.addLayer(
+      {
+        id: "apagoes-unstable",
+        type: "line",
+        source: SRC_MUN,
+        paint: {
+          "line-color": cssVar("--text-secondary"),
+          "line-dasharray": [2, 2],
+          // zoom só pode ficar no topo da expressão: o "case" vai dentro de cada parada
+          "line-width": ["interpolate", ["linear"], ["zoom"], 3, unstableWidth(0.4), 8, unstableWidth(1.2)],
+        },
       },
       before,
     );
@@ -973,6 +1083,7 @@ function repaint() {
   if (!map.getLayer("apagoes-fill")) return;
   map.setPaintProperty("apagoes-line", "line-color", cssVar("--bg"));
   map.setPaintProperty("apagoes-uf-line", "line-color", cssVar("--text-muted"));
+  map.setPaintProperty("apagoes-unstable", "line-color", cssVar("--text-secondary"));
   map.setPaintProperty("apagoes-hover", "line-color", cssVar("--text-primary"));
   map.setPaintProperty("apagoes-selected", "line-color", cssVar("--accent"));
   paintValues();
@@ -992,7 +1103,7 @@ function paintValues() {
     nodata,
     stepExpression(["feature-state", "v"], colors, breaks),
   ]);
-  map.setPaintProperty("apagoes-fill", "fill-opacity", ["case", ["boolean", ["feature-state", "pouca"], false], 0.35, 0.85]);
+  map.setPaintProperty("apagoes-fill", "fill-opacity", ["case", ["boolean", ["feature-state", "instavel"], false], UNSTABLE_OPACITY, STABLE_OPACITY]);
 
   const e = state.escopo;
   map.setFilter("apagoes-selected", ["==", ["get", "cod"], e.tipo === "municipio" ? Number(e.id) : -1]);
@@ -1001,8 +1112,10 @@ function paintValues() {
     if (!ctx || !mapData) return;
     map.removeFeatureState({ source: SRC_MUN });
     const pouca = new Set((mapData.pouca_base ?? []).map(String));
+    const lacuna = new Set((mapData.lacuna ?? []).map(String));
     for (const [cod, v] of Object.entries(mapData.valores ?? {})) {
-      map.setFeatureState({ source: SRC_MUN, id: Number(cod) }, { v, pouca: pouca.has(cod) });
+      const flags = { pouca: pouca.has(cod), lacuna: lacuna.has(cod) };
+      map.setFeatureState({ source: SRC_MUN, id: Number(cod) }, { v, ...flags, instavel: flags.pouca || flags.lacuna });
     }
   };
   if (map.isSourceLoaded(SRC_MUN)) apply();
@@ -1026,6 +1139,10 @@ function renderLegend() {
     breaks: mapData.quebras ?? [],
     format: (v) => (m.tick ?? m.format)(v),
     note: mapData.estimado ? "Valores municipais estimados" : undefined,
+    marks:
+      (mapData.pouca_base ?? []).length || (mapData.lacuna ?? []).length
+        ? [{ className: "legend-mark--unstable", label: "Base < 2 mil consumidores ou meses sem dados: valor instável" }]
+        : [],
   });
   renderGaps();
 }
@@ -1045,7 +1162,13 @@ function bindMapEvents(context) {
     map.getCanvas().style.cursor = "pointer";
     const v = feature.state?.v;
     const name = `${feature.properties.nome} – ${feature.properties.uf}`;
-    const extra = feature.state?.pouca ? "Base pequena: valor instável" : mapData?.estimado ? "Estimado" : undefined;
+    const extra = feature.state?.lacuna
+      ? "Meses sem dados da distribuidora: valor parcial"
+      : feature.state?.pouca
+        ? "Base pequena: valor instável"
+        : mapData?.estimado
+          ? "Estimado"
+          : undefined;
     showTooltip(ev.originalEvent.clientX, ev.originalEvent.clientY, v == null ? "Sem dados" : metric().format(v), name, extra);
   };
   const onLeave = () => {

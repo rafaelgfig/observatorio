@@ -1,5 +1,8 @@
 // @ts-check
-/** Tabela de dados com ordenação no servidor e paginação simples. */
+/**
+ * Tabela de dados com ordenação no servidor e paginação simples. Cabeçalhos ordenáveis são
+ * botões (com `aria-sort` no `th`); com `onRowClick`, a 1ª célula de cada linha é um botão.
+ */
 
 import { el, fmt } from "../dom.js";
 
@@ -18,6 +21,7 @@ import { el, fmt } from "../dom.js";
  * @property {(sortKey: string, direction: "asc" | "desc") => void} [onSort]
  * @property {(page: number) => void} [onPage]
  * @property {(row: any) => void} [onRowClick]
+ * @property {string} [rowLabel]                 dica do botão de cada linha (ex.: "Ver no mapa")
  * @property {string} [caption]
  */
 
@@ -26,7 +30,7 @@ import { el, fmt } from "../dom.js";
  * @param {TableOptions} options
  */
 export function createTable(container, options) {
-  const { columns, onSort, onPage, onRowClick, caption } = options;
+  const { columns, onSort, onPage, onRowClick, caption, rowLabel = "Abrir" } = options;
   let sortKey = "";
   /** @type {"asc" | "desc"} */
   let direction = "desc";
@@ -43,11 +47,11 @@ export function createTable(container, options) {
   table.append(thead, tbody);
 
   for (const col of columns) {
-    const th = el("th", { scope: "col", textContent: col.label, className: col.num ? "num" : "" });
+    const th = el("th", { scope: "col", className: col.num ? "num" : "" });
     if (col.sortKey && onSort) {
-      th.tabIndex = 0;
       th.setAttribute("aria-sort", "none");
-      const activate = () => {
+      const button = el("button", { className: "th-sort", type: "button", textContent: col.label });
+      button.addEventListener("click", () => {
         if (sortKey === col.sortKey) direction = direction === "desc" ? "asc" : "desc";
         else {
           sortKey = /** @type {string} */ (col.sortKey);
@@ -55,15 +59,10 @@ export function createTable(container, options) {
         }
         syncSort();
         onSort(sortKey, direction);
-      };
-      th.addEventListener("click", activate);
-      th.addEventListener("keydown", (e) => {
-        if (e.key === "Enter" || e.key === " ") {
-          e.preventDefault();
-          activate();
-        }
       });
+      th.append(button);
     } else {
+      th.textContent = col.label;
       th.style.cursor = "default";
     }
     th.dataset.sortKey = col.sortKey ?? "";
@@ -100,21 +99,22 @@ export function createTable(container, options) {
           const tr = el(
             "tr",
             {},
-            columns.map((col) =>
-              el("td", {
-                className: col.num ? "num" : "",
-                textContent: col.render ? col.render(row) : String(row[col.key] ?? "—"),
-              }),
-            ),
+            columns.map((col, i) => {
+              const text = col.render ? col.render(row) : String(row[col.key] ?? "—");
+              if (i > 0 || !onRowClick) return el("td", { className: col.num ? "num" : "", textContent: text });
+              // ponto de teclado da linha: botão na 1ª célula (Enter/Espaço nativos)
+              const button = el("button", { className: "row-action", type: "button", textContent: text, title: rowLabel });
+              button.addEventListener("click", (event) => {
+                event.stopPropagation();
+                onRowClick(row);
+              });
+              return el("td", { className: col.num ? "num" : "" }, [button]);
+            }),
           );
           if (row.id != null && row.id === selectedId) tr.classList.add("is-selected");
           if (onRowClick) {
             tr.style.cursor = "pointer";
-            tr.tabIndex = 0;
             tr.addEventListener("click", () => onRowClick(row));
-            tr.addEventListener("keydown", (e) => {
-              if (e.key === "Enter") onRowClick(row);
-            });
           }
           return tr;
         }),
@@ -137,6 +137,16 @@ export function createTable(container, options) {
     /** @param {number | string | null} id */
     select(id) {
       selectedId = id;
+    },
+    /**
+     * Esvazia o corpo e mostra uma mensagem (erro ou vazio) no rodapé.
+     * @param {string} message
+     */
+    clear(message) {
+      tbody.replaceChildren();
+      info.textContent = message;
+      prev.disabled = true;
+      next.disabled = true;
     },
   };
 }

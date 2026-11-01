@@ -5,6 +5,11 @@ para cada mês, Σ CHI regulatório ÷ Σ base de consumidores dos municípios d
 período é a soma dos meses. FEC idem com consumidores afetados. Com ``criterio = todas`` o
 numerador inclui todas as interrupções, sobre a mesma base. Com filtro de distribuidora, a base
 é só a dela.
+
+Distribuidora-mês com lacuna conhecida (``agente_mes.lacuna``: mês sem registros ou com DEC
+muito abaixo do oficial) sai do numerador **e** da base — senão contaria como DEC/FEC 0. O mês
+em que toda a base do recorte está em lacuna fica sem valor; municípios com mais de
+:data:`LACUNA_MAX` da base do período em lacuna vêm em ``lacuna`` no mapa e ficam fora do ranking.
 """
 
 from __future__ import annotations
@@ -25,6 +30,7 @@ type Ordem = Literal["desc", "asc"]
 type TipoEscopo = Literal["brasil", "uf", "distribuidora", "municipio"]
 
 POUCA_BASE = 2000  # consumidores: abaixo disso DEC/FEC municipais são instáveis
+LACUNA_MAX = 0.2  # fração da base do período em lacuna acima da qual o valor é parcial
 ESTIMADO_MIN = 0.5  # fração de consumidores afetados vinda de alocação para marcar "estimado"
 N_QUEBRAS = 6  # limites → 7 classes de cor
 MAX_DISTRIBUIDORAS = 20
@@ -213,37 +219,91 @@ def _valor_sql(metrica: Metrica) -> str:
     }[metrica]
 
 
-def _por_municipio_sql(filtro: FiltroAneel, ano: int) -> tuple[str, list[Any]]:
-    """CTE ``m``: métricas do período por município (DEC/FEC somando as razões mensais)."""
+# Distribuidora-mês com lacuna conhecida (parâmetro: ano); sai do numerador e da base.
+_LACUNAS = "lac AS (SELECT cnpj, mes FROM aneel_agente_mes WHERE ano = ? AND lacuna)"
+
+
+def _por_mes_sql(
+    filtro: FiltroAneel, ano: int, *, por_municipio: bool, eventos: str = "eventos"
+) -> tuple[str, list[Any]]:
+    """CTEs (sem ``WITH``) que terminam em ``pm``: numerador e base por mês (e município).
+
+    Linhas de distribuidora-mês em lacuna saem do numerador e da base. Um mês com mais de
+    :data:`LACUNA_MAX` da base em lacuna fica ``incompleto``: sem base nem numerador (o DEC
+    desse mês não é calculável — com o resto da base seria instável). ``total`` é a base com as
+    lacunas, para medir quanto do período ficou sem dados.
+    """
+    chave = "cod_mun, mes" if por_municipio else "mes"
     num = _where_mun(filtro, ano, numerador=True)
     base = _where_mun(filtro, ano, numerador=False)
     sql = f"""
-        WITH n AS (
-            SELECT cod_mun, mes, sum(chi) AS chi, sum(consumidores) AS consumidores,
-                   sum(eventos) AS eventos,
+        {_LACUNAS},
+        n AS (
+            SELECT {chave}, sum(chi) AS chi, sum(consumidores) AS consumidores,
+                   sum({eventos}) AS eventos,
                    coalesce(sum(consumidores) FILTER (WHERE estimado), 0) AS cons_estimado
-            FROM aneel_mun_mes WHERE {num.sql}
-            GROUP BY cod_mun, mes
+            FROM aneel_mun_mes ANTI JOIN lac USING (cnpj, mes) WHERE {num.sql}
+            GROUP BY {chave}
         ),
         b AS (
-            SELECT cod_mun, mes, sum(base) AS base
-            FROM aneel_mun_base WHERE {base.sql}
-            GROUP BY cod_mun, mes
+            SELECT {chave}, sum(base) AS total,
+                   coalesce(sum(base) FILTER (WHERE lac.cnpj IS NOT NULL), 0) AS em_lacuna
+            FROM aneel_mun_base LEFT JOIN lac USING (cnpj, mes) WHERE {base.sql}
+            GROUP BY {chave}
         ),
-        m AS (
-            SELECT cod_mun,
-                   sum(coalesce(n.chi, 0) / nullif(b.base, 0)) AS dec,
-                   sum(coalesce(n.consumidores, 0) / nullif(b.base, 0)) AS fec,
-                   coalesce(sum(n.chi), 0) AS chi,
-                   coalesce(sum(n.consumidores), 0) AS consumidores,
-                   coalesce(sum(n.eventos), 0) AS eventos,
-                   coalesce(sum(n.cons_estimado), 0) AS cons_estimado,
-                   avg(b.base) AS base
-            FROM b FULL JOIN n USING (cod_mun, mes)
-            GROUP BY cod_mun
+        bn AS (
+            SELECT {chave}, coalesce(b.em_lacuna > {LACUNA_MAX} * b.total, false) AS incompleto,
+                   b.total, b.em_lacuna, n.chi, n.consumidores, n.eventos, n.cons_estimado
+            FROM b FULL JOIN n USING ({chave})
+        ),
+        pm AS (
+            SELECT {chave}, incompleto, total,
+                   CASE WHEN NOT incompleto THEN total - em_lacuna END AS base,
+                   CASE WHEN NOT incompleto THEN chi END AS chi,
+                   CASE WHEN NOT incompleto THEN consumidores END AS consumidores,
+                   CASE WHEN NOT incompleto THEN eventos END AS eventos,
+                   CASE WHEN NOT incompleto THEN cons_estimado END AS cons_estimado
+            FROM bn
         )
     """
-    return sql, [*num.params, *base.params]
+    return sql, [ano, *num.params, *base.params]
+
+
+def _por_municipio_sql(filtro: FiltroAneel, ano: int) -> tuple[str, list[Any]]:
+    """CTE ``m``: métricas do período por município (DEC/FEC somando as razões mensais).
+
+    ``fracao_lacuna`` = parte da base do período (município × mês) em meses incompletos (ver
+    :func:`_por_mes_sql`); com todos os meses incompletos as métricas ficam nulas (sem dados,
+    não zero).
+    """
+    meses, params = _por_mes_sql(filtro, ano, por_municipio=True)
+    sql = f"""
+        WITH {meses},
+        j AS (
+            SELECT cod_mun,
+                   sum(coalesce(chi, 0) / nullif(base, 0)) AS dec,
+                   sum(coalesce(consumidores, 0) / nullif(base, 0)) AS fec,
+                   coalesce(sum(chi), 0) AS chi,
+                   coalesce(sum(consumidores), 0) AS consumidores,
+                   coalesce(sum(eventos), 0) AS eventos,
+                   coalesce(sum(cons_estimado), 0) AS cons_estimado,
+                   avg(base) AS base,
+                   coalesce(sum(total) FILTER (WHERE incompleto) / nullif(sum(total), 0), 0)
+                       AS fracao_lacuna,
+                   bool_and(incompleto) AS sem_dados
+            FROM pm GROUP BY cod_mun
+        ),
+        m AS (
+            SELECT cod_mun, cons_estimado, base, fracao_lacuna,
+                   CASE WHEN NOT sem_dados THEN dec END AS dec,
+                   CASE WHEN NOT sem_dados THEN fec END AS fec,
+                   CASE WHEN NOT sem_dados THEN chi END AS chi,
+                   CASE WHEN NOT sem_dados THEN consumidores END AS consumidores,
+                   CASE WHEN NOT sem_dados THEN eventos END AS eventos
+            FROM j
+        )
+    """
+    return sql, params
 
 
 # ------------------------------------------------------------------ rotas
@@ -277,7 +337,8 @@ def mapa(db: Database, filtro: FiltroAneel, metrica: Metrica) -> dict[str, Any]:
     ano = resolve_ano(db, filtro)
     cte, params = _por_municipio_sql(filtro, ano)
     rows = db.fetch_dicts(
-        f"SELECT cod_mun, {_valor_sql(metrica)} AS valor, base, consumidores, cons_estimado"
+        f"SELECT cod_mun, {_valor_sql(metrica)} AS valor, base, consumidores, cons_estimado,"
+        f" fracao_lacuna > {LACUNA_MAX} AS lacuna"
         f" FROM ({cte} SELECT * FROM m) WHERE valor IS NOT NULL",
         params,
     )
@@ -285,15 +346,19 @@ def mapa(db: Database, filtro: FiltroAneel, metrica: Metrica) -> dict[str, Any]:
     valores = {str(r["cod_mun"]): round(float(r["valor"]), casas) for r in rows}
     total = sum(float(r["consumidores"]) for r in rows)
     estimado = sum(float(r["cons_estimado"]) for r in rows)
+    lacuna = {str(r["cod_mun"]) for r in rows if r["lacuna"]}
+    # valores parciais (meses sem dados) puxariam as classes de cor para baixo
+    completos = [v for cod, v in valores.items() if v > 0 and cod not in lacuna]
     return {
         "metrica": metrica,
         "unidade": METRICAS[metrica]["unidade"],
         "estimado": total > 0 and estimado / total >= ESTIMADO_MIN,
         "valores": valores,
-        "quebras": quebras([v for v in valores.values() if v > 0], casas),
+        "quebras": quebras(completos, casas),
         "pouca_base": sorted(
             str(r["cod_mun"]) for r in rows if r["base"] is None or r["base"] < POUCA_BASE
         ),
+        "lacuna": sorted(lacuna),
         "n": len(valores),
     }
 
@@ -317,7 +382,8 @@ def ranking(
     limite: int,
     min_consumidores: float,
 ) -> list[dict[str, Any]]:
-    """Municípios ordenados pela métrica, só os com base média ≥ ``min_consumidores``."""
+    """Municípios ordenados pela métrica, só os com base média ≥ ``min_consumidores`` e sem
+    lacuna relevante nos dados do período (valor parcial não disputa o ranking)."""
     ano = resolve_ano(db, filtro)
     cte, params = _por_municipio_sql(filtro, ano)
     direcao = "DESC" if ordem == "desc" else "ASC"
@@ -329,6 +395,7 @@ def ranking(
                round(m.base) AS consumidores_base
         FROM m JOIN municipios mu ON mu.cod = m.cod_mun
         WHERE m.base >= ? AND {_valor_sql(metrica)} IS NOT NULL
+          AND m.fracao_lacuna <= {LACUNA_MAX}
         ORDER BY valor {direcao}, m.base DESC
         LIMIT ?
         """,
@@ -362,17 +429,27 @@ def escopo(db: Database, filtro: FiltroAneel) -> Escopo:
     return Escopo("brasil", None, "Brasil")
 
 
-def resumo(db: Database, filtro: FiltroAneel) -> dict[str, Any]:
+def resumo(db: Database, filtro: FiltroAneel, *, serie_anual: bool = False) -> dict[str, Any]:
     """Painel do recorte. ``estimado`` só se aplica a município (UFs quase não cruzam
-    conjuntos); DEC/FEC oficiais só fora do município e com filtros comparáveis."""
+    conjuntos); DEC/FEC oficiais só fora do município e com filtros comparáveis.
+
+    ``meses_lacuna``: meses do período com mais de :data:`LACUNA_MAX` da base em lacuna; eles
+    ficam sem valor e os KPIs somam só os outros (DEC/FEC parciais). Com ``serie_anual``,
+    ``mensal`` traz o ano
+    inteiro (para o gráfico destacar o período sem perder os outros meses); os KPIs continuam
+    sendo do período.
+    """
     ano = resolve_ano(db, filtro)
     alvo = escopo(db, filtro)
     mensal = _mensal(db, filtro, ano, alvo)
-    chi = sum(m["chi"] for m in mensal)
-    consumidores = sum(m["consumidores"] for m in mensal)
+    chi = sum(m["chi"] or 0.0 for m in mensal)
+    consumidores = sum(m["consumidores"] or 0.0 for m in mensal)
     bases = [m["base"] for m in mensal if m["base"]]
     oficial = _oficial(db, filtro, ano) if alvo.tipo != "municipio" else None
     estimado_cons = sum(m["cons_estimado"] for m in mensal)
+    serie = mensal
+    if serie_anual and (filtro.mes_ini, filtro.mes_fim) != (1, 12):
+        serie = _mensal(db, filtro.model_copy(update={"mes_ini": 1, "mes_fim": 12}), ano, alvo)
     return {
         "escopo": {"tipo": alvo.tipo, "id": alvo.id, "nome": alvo.nome},
         "estimado": alvo.tipo == "municipio"
@@ -383,15 +460,16 @@ def resumo(db: Database, filtro: FiltroAneel) -> dict[str, Any]:
             "fec": _soma_opcional(m["fec"] for m in mensal),
             "chi": chi,
             "consumidores": consumidores,
-            "eventos": sum(m["eventos"] for m in mensal),
+            "eventos": sum(m["eventos"] or 0 for m in mensal),
             "duracao": chi / consumidores if consumidores else None,
             "consumidores_base": sum(bases) / len(bases) if bases else None,
             "dec_oficial": oficial["dec"] if oficial else None,
             "fec_oficial": oficial["fec"] if oficial else None,
         },
+        "meses_lacuna": [m["mes"] for m in mensal if m["incompleto"]],
         "mensal": [
             {k: m[k] for k in ("mes", "dec", "fec", "chi", "consumidores", "eventos")}
-            for m in mensal
+            for m in serie
         ],
         "causas": _causas(db, filtro, ano, chi),
         "distribuidoras": _distribuidoras(db, filtro, ano, chi),
@@ -405,31 +483,25 @@ def _soma_opcional(valores: Iterable[float | None]) -> float | None:
 
 
 def _mensal(db: Database, filtro: FiltroAneel, ano: int, alvo: Escopo) -> list[dict[str, Any]]:
+    """Série mensal sem as distribuidora-mês em lacuna; mês incompleto → valores nulos."""
     # Num município conta-se cada evento que o atingiu; em recortes maiores, eventos distintos.
     eventos = "eventos" if alvo.tipo == "municipio" else "eventos_frac"
-    num = _where_mun(filtro, ano, numerador=True)
-    base = _where_mun(filtro, ano, numerador=False)
+    meses, params = _por_mes_sql(filtro, ano, por_municipio=False, eventos=eventos)
     return db.fetch_dicts(
         f"""
-        WITH n AS (
-            SELECT mes, sum(chi) AS chi, sum(consumidores) AS consumidores,
-                   sum({eventos}) AS eventos,
-                   coalesce(sum(consumidores) FILTER (WHERE estimado), 0) AS cons_estimado
-            FROM aneel_mun_mes WHERE {num.sql} GROUP BY mes
-        ),
-        b AS (SELECT mes, sum(base) AS base FROM aneel_mun_base WHERE {base.sql} GROUP BY mes)
+        WITH {meses}
         SELECT mes,
-               coalesce(n.chi, 0) / nullif(b.base, 0) AS dec,
-               coalesce(n.consumidores, 0) / nullif(b.base, 0) AS fec,
-               coalesce(n.chi, 0) AS chi,
-               coalesce(n.consumidores, 0) AS consumidores,
-               round(coalesce(n.eventos, 0))::BIGINT AS eventos,
-               coalesce(n.cons_estimado, 0) AS cons_estimado,
-               b.base
-        FROM b FULL JOIN n USING (mes)
+               coalesce(chi, 0) / nullif(base, 0) AS dec,
+               coalesce(consumidores, 0) / nullif(base, 0) AS fec,
+               CASE WHEN NOT incompleto THEN coalesce(chi, 0) END AS chi,
+               CASE WHEN NOT incompleto THEN coalesce(consumidores, 0) END AS consumidores,
+               CASE WHEN NOT incompleto THEN round(coalesce(eventos, 0))::BIGINT END AS eventos,
+               coalesce(cons_estimado, 0) AS cons_estimado,
+               base, incompleto
+        FROM pm
         ORDER BY mes
         """,
-        [*num.params, *base.params],
+        params,
     )
 
 
@@ -468,10 +540,12 @@ def _causas(db: Database, filtro: FiltroAneel, ano: int, total: float) -> list[d
     num = _where_mun(filtro, ano, numerador=True)
     rows = db.fetch_dicts(
         f"""
-        SELECT causa, sum(chi) AS chi FROM aneel_mun_mes WHERE {num.sql}
+        WITH {_LACUNAS}
+        SELECT causa, sum(chi) AS chi
+        FROM aneel_mun_mes ANTI JOIN lac USING (cnpj, mes) WHERE {num.sql}
         GROUP BY causa HAVING sum(chi) > 0 ORDER BY chi DESC
         """,
-        num.params,
+        [ano, *num.params],
     )
     return [{**r, "pct": r["chi"] / total if total else 0.0} for r in rows]
 
@@ -482,21 +556,24 @@ def _distribuidoras(
     num = _where_mun(filtro, ano, numerador=True)
     rows = db.fetch_dicts(
         f"""
-        WITH d AS (
-            SELECT cnpj, sum(chi) AS chi FROM aneel_mun_mes WHERE {num.sql}
+        WITH {_LACUNAS},
+        d AS (
+            SELECT cnpj, sum(chi) AS chi
+            FROM aneel_mun_mes ANTI JOIN lac USING (cnpj, mes) WHERE {num.sql}
             GROUP BY cnpj HAVING sum(chi) > 0
         )
         SELECT d.cnpj, s.sigla, d.chi
         FROM d LEFT JOIN ({_SIGLAS}) s USING (cnpj)
         ORDER BY d.chi DESC LIMIT ?
         """,
-        [*num.params, MAX_DISTRIBUIDORAS],
+        [ano, *num.params, MAX_DISTRIBUIDORAS],
     )
     return [{**r, "pct": r["chi"] / total if total else 0.0} for r in rows]
 
 
 def _conjuntos(db: Database, filtro: FiltroAneel, ano: int, alvo: Escopo) -> list[dict[str, Any]]:
-    """Conjuntos do recorte com DEC/FEC calculados (com os filtros) e oficiais (se comparáveis)."""
+    """Conjuntos do recorte com DEC/FEC calculados (com os filtros) e oficiais (se comparáveis),
+    ambos só nos meses sem lacuna da distribuidora."""
     if alvo.tipo == "brasil":
         return []
     conds, params = _periodo(filtro, ano)
@@ -520,7 +597,8 @@ def _conjuntos(db: Database, filtro: FiltroAneel, ano: int, alvo: Escopo) -> lis
     )
     return db.fetch_dicts(
         f"""
-        WITH c AS (SELECT * FROM aneel_conj_mes WHERE {alvo_sql}),
+        WITH {_LACUNAS},
+        c AS (SELECT * FROM aneel_conj_mes ANTI JOIN lac USING (cnpj, mes) WHERE {alvo_sql}),
         f AS (
             SELECT conj, mes, sum(chi) AS chi, sum(consumidores) AS consumidores
             FROM aneel_fato
@@ -538,7 +616,7 @@ def _conjuntos(db: Database, filtro: FiltroAneel, ano: int, alvo: Escopo) -> lis
         ORDER BY dec DESC NULLS LAST, c.conj
         LIMIT ?
         """,
-        [*params, *num.params, MAX_CONJUNTOS],
+        [ano, *params, *num.params, MAX_CONJUNTOS],
     )
 
 

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sys
 from typing import Annotated
 
@@ -103,6 +104,11 @@ def serve(
     """Sobe a API + site em http://HOST:PORT."""
     import uvicorn
 
+    if host:
+        # o app (fábrica, possivelmente em outro processo com --reload) lê o host da
+        # configuração para aceitar esse nome no cabeçalho Host
+        os.environ["OBSERVATORIO_HOST"] = host
+        get_settings.cache_clear()
     settings = get_settings()
     uvicorn.run(
         "observatorio.api.app:create_app",

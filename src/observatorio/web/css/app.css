@@ -16,7 +16,7 @@
   /* tinta */
   --text-primary: #f0efec;
   --text-secondary: #c3c2b7;
-  --text-muted: #898781;
+  --text-muted: #9a9891; /* ≥ 4,8:1 em surface-1…3 e na faixa de destaque */
   --text-on-accent: #ffffff;
 
   /* linhas */
@@ -29,6 +29,7 @@
   --accent: #3987e5;
   --accent-hover: #5598e7;
   --accent-wash: rgba(57, 135, 229, 0.16);
+  --link: #5598e7; /* ≥ 5:1 em surface-1/2 */
   --series-1: #3987e5;
   --series-2: #d95926;
   --series-3: #199e70;
@@ -80,7 +81,7 @@
 
   --text-primary: #0b0b0b;
   --text-secondary: #52514e;
-  --text-muted: #6f6d68;
+  --text-muted: #64625d; /* ≥ 4,8:1 em surface-1…3 */
 
   --border: rgba(11, 11, 11, 0.1);
   --border-strong: rgba(11, 11, 11, 0.2);
@@ -90,6 +91,7 @@
   --accent: #2a78d6;
   --accent-hover: #256abf;
   --accent-wash: rgba(42, 120, 214, 0.12);
+  --link: #1f6bc4; /* o acento (#2a78d6) fica em 4,3:1 no fundo claro */
   --series-1: #2a78d6;
   --series-2: #eb6834;
   --series-3: #1baf7a;
@@ -124,7 +126,7 @@ body {
 }
 
 a {
-  color: var(--accent);
+  color: var(--link);
 }
 
 button,
@@ -380,6 +382,16 @@ select {
 
 .input::placeholder {
   color: var(--text-muted);
+}
+
+.row--between {
+  justify-content: space-between;
+}
+
+.btn-sm {
+  height: 28px;
+  padding: 0 var(--space-2);
+  font-size: var(--fs-sm);
 }
 
 .btn {
@@ -723,6 +735,51 @@ input[type="range"] {
   fill: var(--accent-hover);
 }
 
+/* fora do período filtrado / ainda incompleto: mesma cor, mais clara (o rótulo diz qual) */
+.chart .bar.is-dim {
+  opacity: 0.35;
+}
+
+.chart .bar.is-partial {
+  opacity: 0.45;
+}
+
+.chart .bar.is-partial.is-hover {
+  opacity: 0.7;
+}
+
+.chart .line.is-partial {
+  stroke-dasharray: 4 3;
+  opacity: 0.7;
+}
+
+/* alvo de teclado do gráfico (role="slider"): o contorno marca a área do gráfico */
+.chart .chart-focus:focus {
+  outline: none;
+}
+
+.chart .chart-focus:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.chart-table {
+  margin-top: var(--space-1);
+  font-size: var(--fs-xs);
+  color: var(--text-muted);
+}
+
+.chart-table summary {
+  cursor: pointer;
+  width: max-content;
+}
+
+.chart-table .table th {
+  position: static;
+  font-weight: 400;
+  cursor: default;
+}
+
 .chart .line {
   fill: none;
   stroke: var(--series-1);
@@ -771,6 +828,31 @@ input[type="range"] {
   background: var(--surface-2);
 }
 
+/* linha clicável: botão de verdade (Enter e Espaço), com a aparência da linha */
+button.hbar {
+  width: 100%;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  font-size: var(--fs-sm);
+  text-align: left;
+  cursor: pointer;
+}
+
+.hbar-detail {
+  grid-column: 1 / -1;
+  color: var(--text-muted);
+  font-size: var(--fs-xs);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.hbar-detail:empty {
+  display: none;
+}
+
 .hbar-label {
   overflow: hidden;
   text-overflow: ellipsis;
@@ -784,11 +866,13 @@ input[type="range"] {
 }
 
 .hbar-track {
+  display: block;
   grid-column: 1 / -1;
   height: 6px;
 }
 
 .hbar-fill {
+  display: block;
   height: 100%;
   background: var(--series-1);
   border-radius: 0 3px 3px 0;
@@ -828,25 +912,35 @@ input[type="range"] {
 
 .rank-item {
   counter-increment: rank;
+}
+
+.rank-button {
   display: grid;
   grid-template-columns: 22px minmax(0, 1fr) auto;
   gap: var(--space-2);
   align-items: baseline;
+  width: 100%;
   padding: 6px 4px;
+  border: 0;
   border-radius: 4px;
-  cursor: pointer;
+  background: none;
+  color: inherit;
+  font: inherit;
   font-size: var(--fs-sm);
+  text-align: left;
+  cursor: pointer;
 }
 
-.rank-item::before {
+.rank-button::before {
   content: counter(rank);
   color: var(--text-muted);
   font-variant-numeric: tabular-nums;
   text-align: right;
 }
 
-.rank-item:hover,
-.rank-item:focus-visible {
+.rank-button:hover,
+.rank-button:focus-visible,
+.rank-button[aria-current="true"] {
   background: var(--surface-2);
 }
 
@@ -907,13 +1001,31 @@ input[type="range"] {
   flex: 1;
 }
 
+/* cada rótulo fica na fronteira entre duas classes (left = posição do limite na rampa) */
 .legend-ticks {
-  display: flex;
-  justify-content: space-between;
+  position: relative;
+  height: 14px;
   color: var(--text-muted);
   font-size: 10px;
   font-variant-numeric: tabular-nums;
   margin-top: 2px;
+}
+
+.legend-ticks span {
+  position: absolute;
+  top: 0;
+  transform: translateX(-50%);
+  white-space: nowrap;
+}
+
+.legend-ticks--ends {
+  display: flex;
+  justify-content: space-between;
+}
+
+.legend-ticks--ends span {
+  position: static;
+  transform: none;
 }
 
 .legend-nodata {
@@ -930,6 +1042,18 @@ input[type="range"] {
   height: 8px;
   border-radius: 2px;
   background: var(--nodata);
+}
+
+/* amostra de "valor instável": cor do meio da rampa, mais clara, com contorno tracejado */
+.legend-nodata i.legend-mark--unstable {
+  height: 10px;
+  background: #c65e0b;
+  opacity: 0.75;
+  border: 1px dashed var(--text-secondary);
+}
+
+:root[data-theme="light"] .legend-nodata i.legend-mark--unstable {
+  background: #ec7622;
 }
 
 .map-toolbar {
@@ -1015,12 +1139,29 @@ input[type="range"] {
   user-select: none;
 }
 
-.table th[aria-sort="ascending"]::after {
+.table th[aria-sort="ascending"] .th-sort::after {
   content: " ▲";
 }
 
-.table th[aria-sort="descending"]::after {
+.table th[aria-sort="descending"] .th-sort::after {
   content: " ▼";
+}
+
+/* botões dentro da tabela com a aparência do texto da célula */
+.th-sort,
+.row-action {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: inherit;
+  cursor: pointer;
+}
+
+.row-action {
+  text-decoration: underline dotted var(--text-muted);
+  text-underline-offset: 3px;
 }
 
 .table td.num,

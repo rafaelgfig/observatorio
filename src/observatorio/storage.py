@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import gzip
 import shutil
+import time
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -26,6 +27,26 @@ _COPY_OPTIONS: dict[Format, str] = {
 }
 
 
+# No Windows, substituir um arquivo que outro processo está lendo (a API, no meio de uma consulta)
+# falha com PermissionError; a leitura termina em milissegundos, então vale tentar de novo.
+REPLACE_ATTEMPTS = 20
+REPLACE_WAIT_S = (0.05, 0.5)  # espera inicial e máxima entre tentativas (dobra a cada uma)
+
+
+def replace_file(src: Path, dest: Path) -> None:
+    """``src.replace(dest)``, repetindo por alguns segundos enquanto ``dest`` estiver em uso."""
+    wait, max_wait = REPLACE_WAIT_S
+    for attempt in range(REPLACE_ATTEMPTS):
+        try:
+            src.replace(dest)
+            return
+        except PermissionError:
+            if attempt == REPLACE_ATTEMPTS - 1:
+                raise
+            time.sleep(wait)
+            wait = min(wait * 2, max_wait)
+
+
 @contextmanager
 def atomic_path(dest: Path) -> Iterator[Path]:
     """Entrega um caminho temporário (ainda inexistente); ao sair sem erro, substitui ``dest``."""
@@ -33,7 +54,7 @@ def atomic_path(dest: Path) -> Iterator[Path]:
     tmp = dest.with_name(f".{dest.name}.{uuid.uuid4().hex[:8]}.tmp")
     try:
         yield tmp
-        tmp.replace(dest)
+        replace_file(tmp, dest)
     finally:
         tmp.unlink(missing_ok=True)
 

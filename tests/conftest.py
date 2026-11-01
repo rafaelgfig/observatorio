@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -10,7 +11,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from observatorio.api.app import create_app
-from observatorio.config import Settings
+from observatorio.config import Settings, get_settings
 
 PLACES_SCHEMA = {
     "escopo": pl.String,
@@ -32,6 +33,18 @@ PLACES_SCHEMA = {
 def write_places(path: Path, rows: list[dict[str, object]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     pl.DataFrame(rows, schema=PLACES_SCHEMA).write_parquet(path)
+
+
+@pytest.fixture(autouse=True)
+def _configuracao_isolada(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Os testes não leem a configuração do desenvolvedor (``OBSERVATORIO_*`` e ``.env``)."""
+    for name in list(os.environ):
+        if name.upper().startswith("OBSERVATORIO_"):
+            monkeypatch.delenv(name)
+    monkeypatch.setitem(Settings.model_config, "env_file", None)
+    get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()
 
 
 @pytest.fixture

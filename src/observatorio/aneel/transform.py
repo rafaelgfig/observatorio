@@ -33,12 +33,18 @@ Saídas em ``processed/aneel/`` (todas Parquet ZSTD, gravadas atomicamente):
     gerado_em DATE          data de geração do arquivo pela ANEEL
 
 ``conj_mun_pesos.parquet`` — ``conj BIGINT, cod_mun INTEGER, w DOUBLE, fonte VARCHAR,
-principal BOOLEAN``: fração de cada conjunto em cada município (soma 1 por conjunto).
-``fonte = 'observado'``: participação nos consumidores afetados dos registros com município
-válido; ``'indqual_populacao'``: lista do IndQual ponderada pela população do município dividida
-pelo nº de conjuntos a que pertence. ``principal``: o vínculo é relevante (≥ VINCULO_MIN do
-conjunto no município ou ≥ VINCULO_MIN da base do município vinda do conjunto) — usado para
-listar conjuntos e interrupções de um município quando não há município observado.
+principal BOOLEAN``: fração de cada conjunto em cada município (soma 1 por conjunto) — a base
+municipal é a do conjunto × ``w``. ``fonte = 'observado'``: soma, por município, do tamanho de
+cada alimentador (maior nº de consumidores de uma interrupção, limitado ao tamanho do conjunto),
+medido só em interrupções regulatórias, internas e que não derrubaram ``MASSA_ALIMENTADORES``
+alimentadores no mesmo minuto — não depende da frequência das interrupções;
+``'indqual_populacao'`` (conjunto sem esse dado): lista do IndQual ponderada pela população do
+município dividida pelo nº de conjuntos a que pertence; sem IndQual, o tamanho medido nos demais
+registros (``'observado'``). Base implícita acima de ``CONSUMIDORES_POR_HABITANTE_MAX`` × a
+população é cortada (:func:`_limit_pesos`). ``principal``: o vínculo é relevante
+(≥ VINCULO_MIN do conjunto no município ou ≥ VINCULO_MIN da base do município vinda do
+conjunto) — usado para listar conjuntos e interrupções de um município quando não há município
+observado.
 
 ``mun_mes.parquet`` — ``ano, mes, cod_mun, uf, cnpj, programada, causa, regulatorio, estimado,
 consumidores DOUBLE, chi DOUBLE, eventos DOUBLE, eventos_frac DOUBLE``. Registros com município
@@ -153,6 +159,11 @@ DETALHES_ALIASES: dict[str, str] = {
     "atuacao d": "Atuação de Sistema Especial de Proteção – SEP",
 }
 
+# Versão das regras de transformação: incremente ao mudar qualquer regra que altere as saídas — a
+# ingestão grava a versão no manifesto e refaz tudo (inclusive o fato de anos já ingeridos)
+# quando ela muda.
+TRANSFORM_VERSION = 2
+
 DURACAO_MIN_REGULATORIA_S = 180  # 3 minutos
 TENSOES_INVALIDAS = (0, 9999, 999999)
 
@@ -164,6 +175,13 @@ CELG_SEM_PREFIXO_UF: dict[int, int] = {2026: 5}  # ano → mês
 AREA_ATUACAO_MIN = 0.1
 # Vínculo conjunto↔município relevante (ver ``principal`` em conj_mun_pesos).
 VINCULO_MIN = 0.1
+# Interrupção que derruba ao menos tantos alimentadores no mesmo minuto é um evento maciço
+# (subestação, suprimento): não ensina o tamanho dos alimentadores de cada município.
+MASSA_ALIMENTADORES = 3
+# Base estimada acima disto × a população do município é erro de codificação (a mediana é ~0,44
+# unidade consumidora por habitante; cidades de veraneio passam de 1): o excesso volta para os
+# outros municípios do conjunto.
+CONSUMIDORES_POR_HABITANTE_MAX = 1.5
 # Abaixo desta razão entre DEC calculado e oficial, o mês da distribuidora é uma lacuna.
 COBERTURA_MIN = 0.5
 # NumCon oficial fora desta faixa em relação ao tamanho do conjunto no arquivo é descartado.
@@ -268,6 +286,12 @@ def fato_path(out_dir: Path, year: int) -> Path:
     return out_dir / "fato" / f"ano={year}.parquet"
 
 
+def fato_years(out_dir: Path) -> list[int]:
+    """Anos com ``fato/ano=AAAA.parquet`` em disco."""
+    anos = (p.stem.removeprefix("ano=") for p in (out_dir / "fato").glob("ano=*.parquet"))
+    return sorted(int(a) for a in anos if a.isdigit())
+
+
 def outputs_exist(out_dir: Path, years: list[int]) -> bool:
     """Todas as saídas (fato dos anos pedidos + agregados) estão em disco?"""
     return all(fato_path(out_dir, y).exists() for y in years) and all(
@@ -304,7 +328,7 @@ def load_reference(con: duckdb.DuckDBPyConnection, inputs: Inputs) -> None:
     con.execute(
         f"""
         CREATE TABLE municipios AS
-        SELECT cod, uf, populacao, lon, lat, bbox_w, bbox_s, bbox_e, bbox_n
+        SELECT cod, nome, uf, populacao, lon, lat, bbox_w, bbox_s, bbox_e, bbox_n
         FROM read_parquet({sql_path(inputs.municipios)})
         """
     )
@@ -630,6 +654,7 @@ def build_aggregates(con: duckdb.DuckDBPyConnection, out_dir: Path) -> None:
     _build_agentes(con)
     _build_pesos(con)
     _build_conj_mes(con)
+    _limit_pesos(con)
     _mark_principal(con)
     _build_mun_tables(con)
     _build_agente_mes(con)
@@ -657,19 +682,38 @@ def _build_agentes(con: duckdb.DuckDBPyConnection) -> None:
 
 
 def _build_pesos(con: duckdb.DuckDBPyConnection) -> None:
+    """Pesos conjunto→município (fontes e regras em ``conj_mun_pesos``, no topo do módulo)."""
     con.execute(
-        """
+        f"""
         CREATE OR REPLACE TABLE pesos AS
-        WITH obs AS (
-            SELECT conj, cod_mun, sum(greatest(consumidores, 0)) AS afetados, count(*) AS linhas
-            FROM fato WHERE cod_mun IS NOT NULL AND conj > 0
-            GROUP BY conj, cod_mun
+        WITH alimentadores AS (
+            -- tamanho de cada alimentador em cada município: o maior nº de consumidores de uma
+            -- só interrupção, limitado ao tamanho do conjunto. Não depende de quantas vezes o
+            -- alimentador caiu (somar os afetados faria o FEC municipal repetir o do conjunto).
+            SELECT conj, cod_mun, alimentador, limpo,
+                   max(least(consumidores, coalesce(nullif(consumidores_conjunto, 0),
+                                                    consumidores)))::DOUBLE AS tamanho
+            FROM (
+                -- eventos maciços (vários alimentadores no mesmo minuto, origem externa,
+                -- expurgos) às vezes vêm codificados num só município e com mais consumidores
+                -- que o conjunto: só valem como reserva
+                SELECT *,
+                       regulatorio AND origem IS DISTINCT FROM 'Externa'
+                       AND count(DISTINCT alimentador) OVER (
+                               PARTITION BY ano, cnpj, date_trunc('minute', inicio)
+                           ) < {MASSA_ALIMENTADORES} AS limpo
+                FROM fato
+                WHERE cod_mun IS NOT NULL AND conj > 0 AND duracao IS NOT NULL
+                  AND consumidores > 0
+            )
+            GROUP BY ALL
+        ),
+        obs AS (
+            SELECT conj, cod_mun, limpo, sum(tamanho) AS tamanho FROM alimentadores GROUP BY ALL
         ),
         observado AS (
-            SELECT conj, cod_mun,
-                   coalesce(afetados / nullif(sum(afetados) OVER (PARTITION BY conj), 0),
-                            linhas / sum(linhas) OVER (PARTITION BY conj)) AS w
-            FROM obs
+            SELECT conj, cod_mun, tamanho / sum(tamanho) OVER (PARTITION BY conj) AS w
+            FROM obs WHERE limpo
         ),
         iq AS (
             SELECT i.conj, i.cod_mun, m.populacao
@@ -686,10 +730,20 @@ def _build_pesos(con: duckdb.DuckDBPyConnection) -> None:
                    coalesce(p / nullif(sum(p) OVER (PARTITION BY conj), 0),
                             1.0 / count(*) OVER (PARTITION BY conj)) AS w
             FROM candidatos
+        ),
+        -- conjunto fora do IndQual e só com registros "sujos": melhor que nenhum peso
+        reserva AS (
+            SELECT conj, cod_mun, tamanho / sum(tamanho) OVER (PARTITION BY conj) AS w
+            FROM obs
+            WHERE NOT limpo
+              AND conj NOT IN (SELECT conj FROM observado)
+              AND conj NOT IN (SELECT conj FROM candidatos)
         )
         SELECT conj, cod_mun::INTEGER AS cod_mun, w, 'observado' AS fonte FROM observado
         UNION ALL
         SELECT conj, cod_mun::INTEGER, w, 'indqual_populacao' FROM populacao
+        UNION ALL
+        SELECT conj, cod_mun::INTEGER, w, 'observado' FROM reserva
         """
     )
     con.execute(
@@ -794,16 +848,87 @@ def _build_conj_mes(con: duckdb.DuckDBPyConnection) -> None:
         )
 
 
+_BASE_CONJ_SQL = """
+    WITH ultimo AS (SELECT conj, max(ano) AS ano FROM conj_mes WHERE base > 0 GROUP BY conj)
+    SELECT c.conj, avg(c.base) AS base
+    FROM conj_mes c JOIN ultimo USING (conj, ano) GROUP BY c.conj
+"""
+
+
+def _limit_pesos(con: duckdb.DuckDBPyConnection, passes: int = 3) -> None:
+    """Limita a base implícita de cada município a ``CONSUMIDORES_POR_HABITANTE_MAX`` × população.
+
+    Um município acima do limite tem os pesos encolhidos na mesma proporção em todos os seus
+    conjuntos, e o excesso vai para os demais municípios de cada conjunto (proporcional aos
+    pesos deles); conjunto sem outro município abaixo do limite fica como está. Repete até
+    ``passes`` vezes, porque a redistribuição pode empurrar um vizinho para cima do limite.
+    """
+    con.execute(f"CREATE OR REPLACE TEMP TABLE base_conj AS {_BASE_CONJ_SQL}")
+    implicita = """
+        SELECT p.cod_mun, m.nome, m.uf, m.populacao, sum(p.w * b.base) AS base
+        FROM pesos p JOIN base_conj b USING (conj) JOIN municipios m ON m.cod = p.cod_mun
+        WHERE m.populacao > 0
+        GROUP BY ALL
+    """
+    acima = con.execute(
+        f"SELECT count(*) FILTER (WHERE base > populacao),"
+        f" count(*) FILTER (WHERE base > {CONSUMIDORES_POR_HABITANTE_MAX} * populacao)"
+        f" FROM ({implicita})"
+    ).fetchall()[0]
+    if acima[1]:
+        exemplos = con.execute(
+            f"SELECT nome, uf, round(base / populacao, 1) FROM ({implicita})"
+            f" WHERE base > {CONSUMIDORES_POR_HABITANTE_MAX} * populacao"
+            " ORDER BY base / populacao DESC LIMIT 10"
+        ).fetchall()
+        log.warning(
+            "aneel: %d municípios com base estimada acima de %g× a população (limitados): %s",
+            acima[1],
+            CONSUMIDORES_POR_HABITANTE_MAX,
+            ", ".join(f"{n}/{uf} ({r}×)" for n, uf, r in exemplos),
+        )
+    if acima[0]:
+        log.info("aneel: %d municípios com base estimada acima da população", acima[0])
+    for _ in range(passes):
+        con.execute(
+            f"""
+            CREATE OR REPLACE TABLE pesos AS
+            WITH fator AS (
+                SELECT cod_mun,
+                       least(1.0, {CONSUMIDORES_POR_HABITANTE_MAX} * populacao / base) AS f
+                FROM ({implicita}) WHERE base > 0
+            ),
+            p AS (
+                SELECT p.*, coalesce(f.f, 1.0) AS f
+                FROM pesos p LEFT JOIN fator f USING (cod_mun)
+            ),
+            c AS (
+                SELECT conj, sum(w * (1 - f)) AS excesso,
+                       coalesce(sum(w) FILTER (WHERE f >= 1), 0) AS livre
+                FROM p GROUP BY conj
+            )
+            SELECT p.conj, p.cod_mun,
+                   CASE WHEN c.livre <= 0 THEN p.w
+                        WHEN p.f < 1 THEN p.w * p.f
+                        ELSE p.w + c.excesso * p.w / c.livre END AS w,
+                   p.fonte
+            FROM p JOIN c USING (conj)
+            """
+        )
+        restantes = con.execute(
+            f"SELECT count(*) FROM ({implicita})"
+            f" WHERE base > {CONSUMIDORES_POR_HABITANTE_MAX} * populacao * 1.001"
+        ).fetchall()[0][0]
+        if not restantes:
+            break
+
+
 def _mark_principal(con: duckdb.DuckDBPyConnection) -> None:
     """Marca os vínculos conjunto↔município relevantes (base média do último ano de cada um)."""
     con.execute(
         f"""
         CREATE OR REPLACE TABLE pesos AS
-        WITH ultimo AS (SELECT conj, max(ano) AS ano FROM conj_mes WHERE base > 0 GROUP BY conj),
-        base_conj AS (
-            SELECT c.conj, avg(c.base) AS base
-            FROM conj_mes c JOIN ultimo USING (conj, ano) GROUP BY c.conj
-        ),
+        WITH base_conj AS ({_BASE_CONJ_SQL}),
         parcela AS (
             SELECT p.conj, p.cod_mun, p.w * coalesce(b.base, 0) AS base_mun
             FROM pesos p LEFT JOIN base_conj b USING (conj)

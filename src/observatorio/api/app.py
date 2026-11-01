@@ -15,8 +15,10 @@ from typing import Any
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from observatorio import __version__
 from observatorio.aneel import api as aneel_api
@@ -40,6 +42,72 @@ GEO_DATASETS = (
 GEO_FILES = {"municipios.geojson", "ufs.geojson"}
 
 RELOAD_INTERVAL_S = 5.0
+
+# Maior corpo aceito em /api (o maior legítimo, um polígono de 5.000 vértices, tem ~200 KB):
+# acima disso o FastAPI montaria o JSON inteiro em memória antes de qualquer validação.
+MAX_BODY_BYTES = 1 << 20
+# Interfaces "qualquer endereço": o Host de quem acessa não é conhecido de antemão.
+_WILDCARD_BINDS = {"0.0.0.0", "::"}  # noqa: S104 - só para comparar com a configuração
+
+
+class _BodyLimit:
+    """Responde 413 a corpos de ``/api`` maiores que ``max_bytes`` (``Content-Length`` ou fluxo).
+
+    O corpo (pequeno, por definição) é lido aqui e repassado inteiro à aplicação.
+    """
+
+    def __init__(self, app: ASGIApp, max_bytes: int = MAX_BODY_BYTES) -> None:
+        self.app = app
+        self.max_bytes = max_bytes
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http" or not str(scope["path"]).startswith("/api/"):
+            await self.app(scope, receive, send)
+            return
+        headers = dict(scope.get("headers") or [])
+        length = headers.get(b"content-length", b"").decode("latin-1")
+        if length.isdigit() and int(length) > self.max_bytes:
+            await self._too_large(scope, receive, send)
+            return
+        if not length and b"transfer-encoding" not in headers:
+            await self.app(scope, receive, send)  # sem corpo (GET)
+            return
+        chunks: list[bytes] = []
+        size = 0
+        while True:
+            message = await receive()
+            if message["type"] != "http.request":  # cliente desconectou
+                return
+            body = message.get("body", b"")
+            size += len(body)
+            if size > self.max_bytes:
+                await self._too_large(scope, receive, send)
+                return
+            chunks.append(body)
+            if not message.get("more_body", False):
+                break
+        replayed = False
+
+        async def replay() -> Message:
+            nonlocal replayed
+            if not replayed:
+                replayed = True
+                return {"type": "http.request", "body": b"".join(chunks), "more_body": False}
+            return await receive()
+
+        await self.app(scope, replay, send)
+
+    async def _too_large(self, scope: Scope, receive: Receive, send: Send) -> None:
+        detail = f"corpo da requisição grande demais (máximo {self.max_bytes // 1024} KiB)"
+        await JSONResponse({"detail": detail}, status_code=413)(scope, receive, send)
+
+
+def allowed_hosts(settings: Settings) -> list[str]:
+    """Valores aceitos no cabeçalho ``Host`` (proteção contra DNS rebinding)."""
+    hosts = list(settings.allowed_hosts)
+    if settings.host not in _WILDCARD_BINDS and settings.host not in hosts:
+        hosts.append(settings.host)
+    return hosts
 
 
 class _RevalidatingStaticFiles(StaticFiles):
@@ -85,8 +153,11 @@ class _VersionWatcher:
     def start(self) -> None:
         self._thread.start()
 
-    def stop(self) -> None:
+    def stop(self, timeout: float = 30.0) -> None:
+        """Para de observar e espera uma recarga em andamento terminar (antes do ``db.close``)."""
         self._stop.set()
+        if self._thread.is_alive():
+            self._thread.join(timeout)
 
 
 async def _validation_error(request: Request, exc: Exception) -> JSONResponse:
@@ -124,6 +195,16 @@ def create_app(settings: Settings | None = None, *, watch: bool = True) -> FastA
     )
     # nível 5: quase a mesma taxa do 9 em metade do tempo (GeoJSON de 20 mil pontos ~3,8 MB)
     app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=5)
+    app.add_middleware(_BodyLimit)
+    # por último = mais externo: Host desconhecido nem chega às rotas
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=allowed_hosts(settings))
+    if settings.host in _WILDCARD_BINDS:
+        log.warning(
+            "servidor em %s: só os hosts %s são aceitos; inclua o nome/IP usado para acessar "
+            "em OBSERVATORIO_ALLOWED_HOSTS",
+            settings.host,
+            ", ".join(settings.allowed_hosts),
+        )
     app.add_exception_handler(RequestValidationError, _validation_error)
 
     app.include_router(meta.router)

@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from datetime import date, datetime
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, HTTPException, Query, status
 from pydantic import BaseModel
@@ -70,6 +70,7 @@ class Mapa(BaseModel):
     valores: dict[str, float]
     quebras: list[float]
     pouca_base: list[str]
+    lacuna: list[str]
     n: int
 
 
@@ -95,9 +96,9 @@ class Mes(BaseModel):
     mes: int
     dec: float | None
     fec: float | None
-    chi: float
-    consumidores: float
-    eventos: int
+    chi: float | None
+    consumidores: float | None
+    eventos: int | None
 
 
 class ParcelaCausa(BaseModel):
@@ -127,6 +128,7 @@ class Resumo(BaseModel):
     escopo: EscopoInfo
     estimado: bool
     kpis: Kpis
+    meses_lacuna: list[int]
     mensal: list[Mes]
     causas: list[ParcelaCausa]
     distribuidoras: list[ParcelaDistribuidora]
@@ -187,10 +189,21 @@ def mapa(db: DB, filtro: Filtro, metrica: Metrica = "dec") -> dict[str, Any]:
 
 
 @router.get("/resumo", response_model=Resumo)
-def resumo(db: DB, filtro: Filtro) -> dict[str, Any]:
+def resumo(
+    db: DB,
+    filtro: Filtro,
+    serie: Annotated[
+        Literal["periodo", "ano"],
+        Query(description="`ano`: série mensal do ano inteiro (KPIs continuam do período)."),
+    ] = "periodo",
+) -> dict[str, Any]:
     """Painel do recorte: KPIs, série mensal, causas, distribuidoras e conjuntos."""
     names = (*_MUNICIPAL, "aneel_conj_mes", "aneel_conj_mun_pesos", "aneel_fato")
-    return _run(db, (*names, "municipios", "ufs"), lambda: queries.resumo(db, filtro))
+    return _run(
+        db,
+        (*names, "municipios", "ufs"),
+        lambda: queries.resumo(db, filtro, serie_anual=serie == "ano"),
+    )
 
 
 @router.get("/ranking", response_model=list[ItemRanking])

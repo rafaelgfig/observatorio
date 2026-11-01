@@ -333,3 +333,50 @@ def test_parametros_invalidos_422(
     resp = client.get(f"/api/aneel/{rota}", params=params)
     assert resp.status_code == 422
     assert trecho in resp.text
+
+
+@pytest.mark.usefixtures("dados_aneel")
+class TestLacunas:
+    """LIGHT (Rio de Janeiro) não tem registros em fev/2025, com DEC oficial 0,5 (lacuna)."""
+
+    def test_mes_em_lacuna_fica_sem_valor_e_nao_zero(self, client: TestClient) -> None:
+        fevereiro = get(client, "mapa", ano=2025, mes_ini=2, mes_fim=2)
+        assert str(RIO) not in fevereiro["valores"]
+        assert fevereiro["valores"][str(SAO_PAULO)] == pytest.approx(0.1)
+        ranking = get(client, "ranking", ano=2025, mes_ini=2, mes_fim=2, min_consumidores=0)
+        assert str(RIO) not in [r["cod"] for r in ranking]
+
+    def test_periodo_parcial_vai_para_lacuna_e_sai_do_ranking(self, client: TestClient) -> None:
+        mapa = get(client, "mapa", ano=2025)
+        # metade da base do período (jan + fev) em lacuna: valor só de janeiro, marcado
+        assert mapa["valores"][str(RIO)] == pytest.approx(0.05)
+        assert mapa["lacuna"] == [str(RIO)]
+        ranking = get(client, "ranking", ano=2025, min_consumidores=0, ordem="asc")
+        assert str(RIO) not in [r["cod"] for r in ranking]
+        assert len(ranking) == 5
+
+    def test_resumo_marca_meses_em_lacuna(self, client: TestClient) -> None:
+        resumo = get(client, "resumo", ano=2025, uf="RJ")
+        assert resumo["meses_lacuna"] == [2]
+        fevereiro = next(m for m in resumo["mensal"] if m["mes"] == 2)
+        assert (fevereiro["dec"], fevereiro["chi"], fevereiro["eventos"]) == (None, None, None)
+        assert resumo["kpis"]["dec"] == pytest.approx(0.05)
+        assert resumo["kpis"]["consumidores_base"] == pytest.approx(200)
+        # recorte maior com a lacuna diluída (< 20% da base): mês calculado sem a LIGHT
+        brasil = get(client, "resumo", ano=2025, mes_ini=2, mes_fim=2)
+        assert brasil["meses_lacuna"] == []
+        assert brasil["kpis"]["dec"] == pytest.approx(100 / 1800)
+
+    def test_conjunto_em_lacuna_sai_da_comparacao_com_o_oficial(self, client: TestClient) -> None:
+        conjuntos = get(client, "resumo", ano=2025, uf="RJ")["conjuntos"]
+        assert [(c["id"], c["dec"], c["dec_oficial"]) for c in conjuntos] == [
+            (301, pytest.approx(0.05), pytest.approx(0.05))
+        ]
+
+
+@pytest.mark.usefixtures("dados_aneel")
+def test_serie_do_ano_inteiro_com_kpis_do_periodo(client: TestClient) -> None:
+    resumo = get(client, "resumo", ano=2026, mes_ini=1, mes_fim=1, serie="ano")
+    assert [m["mes"] for m in resumo["mensal"]] == [1, 2, 5]
+    assert resumo["kpis"]["dec"] == pytest.approx(450 / 2000)  # só janeiro
+    assert [m["mes"] for m in get(client, "resumo", ano=2026, mes_fim=1)["mensal"]] == [1]

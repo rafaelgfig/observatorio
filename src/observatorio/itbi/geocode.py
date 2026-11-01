@@ -56,6 +56,10 @@ from observatorio.text import TITLES, expand_street, search_key
 log = logging.getLogger(__name__)
 
 OUTPUTS = ("geocode.parquet", "areas.parquet", "places.parquet")
+# Versão das regras (cascata, áreas, lugares): incremente ao mudar qualquer regra que altere as
+# saídas. Fica num arquivo ao lado delas; versão diferente refaz a geocodificação.
+GEOCODE_VERSION = 1
+VERSION_SIDECAR = ".geocode-version"
 PRECISOES = ("lote", "condominio", "quadra", "setor")
 
 # Simplificação das áreas (graus; ~5 m): distritos + subprefeituras ficam com ~0,55 MB.
@@ -204,11 +208,23 @@ def run(settings: Settings, *, force: bool = False, refresh_geosampa: bool = Fal
 
     out_dir = settings.processed_dir / "itbi"
     outputs = [out_dir / name for name in OUTPUTS]
-    if not force and _is_current(outputs, [*_tree(transacoes), *lookups.paths()]):
+    em_dia = _version(out_dir) == GEOCODE_VERSION and _is_current(
+        outputs, [*_tree(transacoes), *lookups.paths()]
+    )
+    if not force and em_dia:
         log.info("itbi: geocodificação em dia (nada mudou nas transações nem no GeoSampa)")
         return
     build(transacoes, lookups, out_dir)
+    (out_dir / VERSION_SIDECAR).write_text(str(GEOCODE_VERSION), encoding="utf-8")
     touch_version(settings.processed_dir)
+
+
+def _version(out_dir: Path) -> int | None:
+    """Versão das regras que gravou as saídas atuais (``None`` se não houver registro)."""
+    try:
+        return int((out_dir / VERSION_SIDECAR).read_text(encoding="utf-8").strip())
+    except (FileNotFoundError, ValueError):
+        return None
 
 
 def _tree(root: Path) -> list[Path]:

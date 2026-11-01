@@ -383,3 +383,22 @@ def test_force_refaz_sem_baixar_o_geosampa(
     geocode.run(settings, refresh_geosampa=True)
 
     assert chamadas == [(False, True), (True, False)]
+
+
+def test_regras_novas_refazem_a_geocodificacao(
+    settings: Settings, lookups: Lookups, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(geosampa, "ensure", lambda settings, *, force=False, rebuild=False: lookups)
+    write_transacoes(settings.processed_dir / "itbi" / "transacoes")
+    out = settings.processed_dir / "itbi"
+    geocode.run(settings)
+    versao = out / geocode.VERSION_SIDECAR
+    assert versao.read_text(encoding="utf-8") == str(geocode.GEOCODE_VERSION)
+    gravado = (out / "geocode.parquet").stat().st_mtime_ns
+
+    # saídas gravadas por regras antigas (ou sem registro): refaz mesmo sem dados novos
+    versao.write_text("0", encoding="utf-8")
+    geocode.run(settings)
+
+    assert (out / "geocode.parquet").stat().st_mtime_ns != gravado
+    assert versao.read_text(encoding="utf-8") == str(geocode.GEOCODE_VERSION)

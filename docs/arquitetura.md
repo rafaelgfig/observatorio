@@ -18,7 +18,11 @@ fontes abertas ──(observatorio ingest …)──► data/raw ──► data/
   último processamento. Só reprocessa o que mudou. Ao terminar, grava
   `data/processed/.version` — a API observa esse arquivo e recarrega sozinha.
 * **API** abre um DuckDB **em memória** com views sobre os Parquet (`observatorio.db.Database`).
-  Nunca grava nada; a ingestão substitui arquivos de forma atômica (`storage.atomic_path`).
+  Nunca grava nada; a ingestão substitui arquivos de forma atômica (`storage.atomic_path`, que
+  repete a troca por alguns segundos quando o Windows recusa substituir um arquivo em leitura).
+  Na recarga, a conexão antiga só é fechada quando a última consulta em andamento nela termina.
+* **Servidor local**: só aceita os `Host` de `allowed_hosts` (`127.0.0.1`, `localhost`, `[::1]`
+  e o `host` configurado; contra DNS rebinding) e corpos de até 1 MiB em `/api` (413 acima).
 * **Frontend** sem etapa de build: ES modules + import map com versões fixas (jsDelivr),
   MapLibre GL 6, terra-draw, estilo escuro do OpenFreeMap (sem chave de API).
 
@@ -61,7 +65,10 @@ Cada domínio expõe em `<dominio>/api.py`:
 * Downloads: `downloads.fetch(client, key=…, url=…, dest=…, manifest=…)`; depois de processar
   com sucesso, `manifest.mark_processed(key, **extra)`; no fim de cada `run`, `touch_version`.
 * **Dados pessoais**: linhas corrompidas na origem do ITBI trazem nomes de partes — são
-  descartadas e só (arquivo, aba, linha) vai para o log. Nada disso é persistido.
+  descartadas e só (arquivo, aba, linha) vai para o log. CPFs (com dígitos verificadores
+  válidos) e CNPJs formatados nos textos livres de linhas íntegras viram `[removido]`, também
+  só com (aba, linha) no log. Nada disso é persistido; a rota de detalhe devolve uma lista
+  fechada de colunas (`queries.COLUNAS_TRANSACAO`).
 * Busca: cada domínio grava `processed/<dominio>/places.parquet` com o esquema abaixo; a coluna
   `norm` usa a macro SQL `norm_text()` (equivalente a `text.search_key`).
 
@@ -104,13 +111,25 @@ Regras validadas contra o DEC/FEC oficial (erro < 2% em 97,5% dos conjunto-mês 
 * DEC = Σ(consumidores × horas) / consumidores do conjunto; FEC = Σ consumidores / base;
 * contagem de **eventos** comparável entre anos: `count(DISTINCT (cnpj, alimentador, minuto(início)))`;
 * municípios: 2026 tem `CodMunicipioIBGE`; 2025 é **estimado** distribuindo cada conjunto pelos
-  municípios com pesos aprendidos em 2026 (fallback IndQual × população). Erro típico ~20%:
-  a UI sinaliza "estimado".
+  municípios com os pesos abaixo (cada município herda o DEC/FEC do conjunto). Erro típico de
+  25–30% no CHI municipal: a UI sinaliza "estimado";
+* pesos conjunto→município (a **base** de cada município): soma, por município, do tamanho de
+  cada alimentador — o maior nº de consumidores de uma só interrupção regulatória, de origem
+  interna, que não derrubou ≥ 3 alimentadores no mesmo minuto, limitado ao tamanho do conjunto.
+  Não depende de quantas vezes o alimentador caiu (somar os afetados faria o FEC municipal
+  repetir o do conjunto). Conjunto sem esse dado: IndQual × população; sem IndQual: os demais
+  registros. Base implícita acima de 1,5× a população é cortada e o excesso vai para os outros
+  municípios do conjunto (aviso no log);
+* distribuidora-mês com **lacuna** (`agente_mes.lacuna`) sai do numerador e da base nas consultas;
+  mês com mais de 20% da base do recorte em lacuna fica sem valor (não conta como 0);
+* `transform.TRANSFORM_VERSION` fica no manifesto: mudou, a ingestão refaz o fato de todos os
+  anos em disco (a partir dos brutos) e os agregados.
 
 Tabelas (detalhes de colunas em `aneel/transform.py`):
 
 * `fato/ano=YYYY.parquet` — interrupções limpas e unificadas (ambos os layouts);
-* `conj_mun_pesos.parquet` — `conj, cod_mun, w, fonte, principal` (`principal`: o vínculo
+* `conj_mun_pesos.parquet` — `conj, cod_mun, w, fonte, principal` (`fonte`: `observado` ou
+  `indqual_populacao`, ver os pesos acima; `principal`: o vínculo
   responde por ≥ 10% do conjunto ou da base do município — usado para listar conjuntos e
   interrupções de um município estimado sem incluir "transbordos" marginais);
 * `mun_mes.parquet` — agregado município × mês × dimensões (programada, causa, regulatório,
@@ -127,10 +146,12 @@ Tabelas (detalhes de colunas em `aneel/transform.py`):
 
 * `transacoes/ref_year=YYYY/ref_month=MM/part.parquet` — uma linha por guia paga
   (esquema na seção ITBI abaixo); um mês só é regravado quando o conteúdo normalizado muda
-  (impressão digital por mês no manifesto). `parse.PARSER_VERSION` no manifesto faz a
+  (impressão digital por mês no manifesto). `parse.PARSER_VERSION` (3: remoção de CPF/CNPJ)
+  no manifesto faz a
   ingestão reprocessar sozinha quando as regras de normalização mudam.
 * `geocode.parquet` — `sql, logradouro, numero, cep → lon, lat, precisao, tier` (uma linha por
-  chave; junção *null-safe* com `transacoes`). `precisao` ∈ `lote`, `condominio`, `quadra`,
+  chave; junção *null-safe* com `transacoes`). `geocode.GEOCODE_VERSION` fica em
+  `itbi/.geocode-version`; versão diferente refaz a geocodificação. `precisao` ∈ `lote`, `condominio`, `quadra`,
   `setor`; `tier` 1–9:
 
   | tier | regra | precisão típica (p50/p90 vs. CNEFE) |
@@ -235,17 +256,22 @@ Métricas (`metrica`): `dec` (h/consumidor), `fec` (interrupções/consumidor), 
    "valores": {"3550308": 5.54, "...": 0.0},
    "quebras": [0.5, 1.2, 2.0, 3.4, 5.9, 10.1],
    "pouca_base": ["1100015"],
+   "lacuna": ["1100023"],
    "n": 5521}
   ```
+  `lacuna` = municípios com mais de 20% da base do período em meses sem dados da distribuidora
+  (valor parcial: a UI marca, ficam fora das quebras e do ranking).
   `quebras` = 6 limites (quantis 1/7…6/7) → 7 classes de cor. `pouca_base` = municípios com
   base estimada < 2.000 consumidores (DEC/FEC instáveis; a UI esmaece).
-* `GET /api/aneel/resumo?{filtro}` → painel do escopo (Brasil, UF, município ou distribuidora):
+* `GET /api/aneel/resumo?{filtro}&serie=periodo|ano` → painel do escopo (Brasil, UF, município
+  ou distribuidora); com `serie=ano`, `mensal` traz o ano inteiro (os KPIs seguem o período):
   ```json
   {"escopo": {"tipo": "municipio", "id": "3550308", "nome": "São Paulo – SP"},
    "estimado": false,
    "kpis": {"dec": 3.1, "fec": 1.9, "chi": 2.1e7, "consumidores": 1.3e7,
             "eventos": 48211, "duracao": 1.6, "consumidores_base": 7.1e6,
             "dec_oficial": 3.0, "fec_oficial": 1.8},
+   "meses_lacuna": [],
    "mensal": [{"mes": 1, "dec": 0.4, "fec": 0.3, "chi": 2.9e6, "consumidores": 2.1e6,
                "eventos": 6100}],
    "causas": [{"causa": "Meio ambiente", "chi": 9.0e6, "pct": 0.43}],
@@ -253,9 +279,12 @@ Métricas (`metrica`): `dec` (h/consumidor), `fec` (interrupções/consumidor), 
    "conjuntos": [{"id": 12345, "nome": "...", "sigla": "ENEL SP", "dec": 4.2,
                   "dec_oficial": 4.1, "fec": 2.1, "fec_oficial": 2.0}]}
   ```
+  `meses_lacuna`: meses do período com > 20% da base em lacuna — ficam com valores nulos em
+  `mensal` e os KPIs somam só os demais (DEC/FEC parciais; o oficial continua o do período).
   `dec_oficial`/`fec_oficial` só quando houver indicador oficial comparável (nulo caso contrário);
   `distribuidoras` e `conjuntos` podem vir vazios conforme o escopo.
-* `GET /api/aneel/ranking?{filtro}&metrica=dec&ordem=desc&limite=20&min_consumidores=2000` →
+* `GET /api/aneel/ranking?{filtro}&metrica=dec&ordem=desc&limite=20&min_consumidores=2000`
+  (sem os municípios em `lacuna`) →
   `[{"cod": "3550308", "nome": "São Paulo", "uf": "SP", "valor": 3.1, "consumidores_base": 7.1e6}]`
 * `GET /api/aneel/interrupcoes?{filtro}&limite=20` → maiores interrupções (por CHI) do escopo:
   ```json
@@ -283,21 +312,30 @@ Corpo comum das consultas (POST), modelo `ConsultaItbi`:
 `area` (opcional, um de):
 
 * `{"tipo": "circulo", "lon": -46.6, "lat": -23.5, "raio_m": 500}` (raio 50 m … 20 km);
-* `{"tipo": "poligono", "geometria": {GeoJSON Polygon|MultiPolygon}}` (desenhado);
+* `{"tipo": "poligono", "geometria": {GeoJSON Polygon|MultiPolygon}}` (desenhado; ≤ 5.000
+  vértices e ≤ 20 partes, também depois da correção de autointerseções);
 * `{"tipo": "distrito" | "subprefeitura", "id": "..."}`.
 
 `precisao`: `lote` (só lote/condomínio exato), `quadra` (padrão: até centroide de quadra) ou
 `qualquer`. `tipos`/`naturezas` vazios ou nulos = todos. Datas filtram `data_transacao`.
+`area_min`/`area_max` usam a área construída (terrenos: a do terreno); nas unidades na planta e
+nas frações < 10% de um lote a área do IPTU é a do lote inteiro, então a guia fica sem área
+(fora do filtro, da mediana e no fim da ordenação por área).
 
 Observações para a implementação: `natureza` código 5 tem dois rótulos ao longo dos anos
 ("Excesso de meação…" até 2020, "Adjudicação compulsória" a partir de 2021) — agrupe por
 (código, rótulo); `data_transacao` começa em 1994 (guias pagas em 2015+ com escritura antiga).
 
 * `GET /api/itbi/meta` →
-  `{"periodo": {"min": "2015-01-02", "max": "2026-09-07"}, "atualizado_em": "...",
+  `{"periodo": {"min": "1994-06-24", "max": "2026-09-07", "pago_ate": "2026-08-31",
+                 "completo_ate": "2026-07-31"}, "atualizado_em": "...",
     "tipos": [{"id": "apartamento", "nome": "Apartamento"}],
     "naturezas": [{"cod": 1, "nome": "Compra e venda", "n": 1490420}],
     "total": 1672712}`
+
+  `min`/`max` = datas de transação; `pago_ate` = fim do último mês de pagamento publicado;
+  `completo_ate` = fim do mês anterior a ele (~20% das guias são pagas no mês seguinte ao da
+  transação: os meses depois de `completo_ate` ainda vão crescer e a UI os marca como parciais).
 * `POST /api/itbi/resumo` →
   ```json
   {"total": 1234, "valor_total": 6.1e8, "valor_mediano": 420000, "rs_m2_mediano": 7850,
@@ -314,10 +352,12 @@ Observações para a implementação: `natureza` código 5 tem dois rótulos ao 
 * `POST /api/itbi/transacoes` com `{"consulta": {...}, "pagina": 1, "por_pagina": 50,
   "ordem": "data|valor|rs_m2|area", "direcao": "desc|asc"}` →
   `{"total": 1234, "linhas": [{"id", "data", "endereco", "complemento", "bairro", "cep",
-  "tipo", "uso", "padrao", "area_construida", "area_terreno", "valor", "rs_m2", "natureza",
+  "tipo", "na_planta", "uso", "padrao", "area_construida", "area_terreno", "valor", "rs_m2",
+  "natureza",
   "financiamento", "acc_ano", "precisao", "lon", "lat"}]}`
 * `POST /api/itbi/exportar` → CSV (`;`, UTF-8 com BOM) com as linhas filtradas.
-* `GET /api/itbi/transacao/{id}` → todas as colunas de uma transação.
+* `GET /api/itbi/transacao/{id}` → as colunas do esquema de `transacoes` de uma guia (lista
+  fechada `COLUNAS_TRANSACAO`), com `lon`, `lat`, `precisao`, `tier` e `endereco`.
 * `GET /api/itbi/area/{tipo}/{id}` → `{"tipo", "id", "nome", "geometria": GeoJSON, "bbox"}`.
 * `GET /api/itbi/tiles/{z}/{x}/{y}.mvt?data_ini=&data_fim=&tipo=&natureza=&valor_min=&valor_max=&area_min=&area_max=&logradouro=&cep=&precisao=`
   → vector tile (z 9–18; `tipo`/`natureza` repetíveis; mesmos filtros de `ConsultaItbi`, sem
@@ -328,7 +368,8 @@ Observações para a implementação: `natureza` código 5 tem dois rótulos ao 
 * `POST /api/itbi/pontos`: `total` conta as guias filtradas **com coordenada**.
 * `POST /api/itbi/exportar`: no máximo 500 mil linhas (as mais recentes); cabeçalhos
   `X-Total-Linhas`, `X-Linhas-Exportadas`, `X-Limite-Linhas`, `X-Truncado`. CEP sai como
-  `01452-000` e textos que começam com `= + - @` ganham apóstrofo (proteção contra fórmulas).
+  `01452-000`, `Na planta` como `sim`/`não`, a área construída fica vazia quando a do IPTU é a
+  do lote, e textos que começam com `= + - @` ganham apóstrofo (proteção contra fórmulas).
 
 ## Frontend
 
@@ -340,5 +381,8 @@ Observações para a implementação: `natureza` código 5 tem dois rótulos ao 
 * Tema escuro padrão; tokens CSS em `css/app.css`. Cores de dados: rampa sequencial única por
   métrica (`--seq-outage` laranja para apagões, `--seq-price` azul para preços), "sem dados" em
   cinza; status nunca carrega significado sozinho.
-* Acessibilidade: textos de dados via `textContent`, foco visível, combobox ARIA, tabela como
-  alternativa aos gráficos.
+* Acessibilidade: textos de dados via `textContent`, foco visível, combobox ARIA; filtros
+  recriados devolvem o foco ao mesmo controle (`dom.preserveFocus`); um `role="status"` por view
+  anuncia só o resumo de cada atualização (o painel não é região viva) e erros saem com
+  `role="alert"`; gráficos de colunas com um só ponto de tabulação (setas, Home/End,
+  Enter/Espaço) e valor anunciado; tabela como alternativa aos gráficos.

@@ -69,8 +69,13 @@ class NaturezaInfo(BaseModel):
     n: int
 
 
+class PeriodoMeta(Periodo):
+    pago_ate: date | None
+    completo_ate: date | None
+
+
 class MetaItbi(BaseModel):
-    periodo: Periodo
+    periodo: PeriodoMeta
     atualizado_em: str | None
     tipos: list[TipoInfo]
     naturezas: list[NaturezaInfo]
@@ -118,6 +123,7 @@ class LinhaTransacao(BaseModel):
     bairro: str | None
     cep: str | None
     tipo: str | None
+    na_planta: bool | None
     uso: str | None
     padrao: str | None
     area_construida: float | None
@@ -166,7 +172,7 @@ def _dados(consulta: ConsultaItbi) -> tuple[str, ...]:
 
 @router.get("/meta", response_model=MetaItbi)
 def meta(db: DB, settings: AppSettings) -> dict[str, Any]:
-    """Período, data de atualização, tipos, naturezas (código × rótulo) e total de guias."""
+    """Período (transações e último mês completo), atualização, tipos, naturezas e total."""
     atualizado = queries.atualizado_em(
         settings.manifest_path("itbi"), settings.processed_dir / "itbi"
     )

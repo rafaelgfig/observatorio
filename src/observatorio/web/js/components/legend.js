@@ -12,6 +12,7 @@ import { el } from "../dom.js";
  * @property {string} [nodataLabel]
  * @property {string} [note]            observação curta (ex.: "valores estimados")
  * @property {string[]} [labels]        rótulos fixos sob a rampa (ex.: ["menos", "mais"])
+ * @property {{ className: string, label: string }[]} [marks]  amostras extras (ex.: valor instável)
  */
 
 /**
@@ -26,21 +27,31 @@ export function createLegend(host) {
   return {
     /** @param {LegendOptions} options */
     render(options) {
-      const { title, colors, breaks, format, nodataLabel = "Sem dados", note, labels } = options;
+      const { title, colors, breaks, format, nodataLabel = "Sem dados", note, labels, marks = [] } = options;
       const ramp = el("div", { className: "legend-ramp" }, colors.map((c) => el("span", { style: `background:${c}` })));
-      // rótulos: início, limites intermediários selecionados e fim
-      const ticks = el("div", { className: "legend-ticks" });
+      /** @type {HTMLElement} */
+      let ticks;
       if (labels) {
-        ticks.append(...labels.map((text) => el("span", { textContent: text })));
+        ticks = el("div", { className: "legend-ticks legend-ticks--ends" }, labels.map((text) => el("span", { textContent: text })));
       } else {
-        const picks = breaks.length > 4 ? [breaks[1], breaks[3], breaks[5] ?? breaks[breaks.length - 1]] : breaks;
-        ticks.append(el("span", { textContent: "0" }), ...picks.map((b) => el("span", { textContent: format(b) })));
+        // cada limite fica na fronteira real entre duas classes (i + 1 de colors.length); com
+        // muitos limites, rótulo em 1 a cada 2 (sem mudar a posição dos que ficam)
+        const step = breaks.length > 4 ? 2 : 1;
+        ticks = el(
+          "div",
+          { className: "legend-ticks" },
+          breaks
+            .map((b, i) => ({ b, i }))
+            .filter(({ i }) => breaks.length <= 4 || i % step === 1)
+            .map(({ b, i }) => el("span", { textContent: format(b), style: `left:${((i + 1) / colors.length) * 100}%` })),
+        );
       }
       card.replaceChildren(
         el("div", { className: "legend-title", textContent: title }),
         ramp,
         ticks,
         el("div", { className: "legend-nodata" }, [el("i"), el("span", { textContent: nodataLabel })]),
+        ...marks.map((m) => el("div", { className: "legend-nodata" }, [el("i", { className: m.className }), el("span", { textContent: m.label })])),
       );
       if (note) card.append(el("div", { className: "legend-nodata", textContent: note }));
       card.hidden = false;

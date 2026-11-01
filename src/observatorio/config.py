@@ -33,7 +33,7 @@ class Settings(BaseSettings):
     itbi_min_year: int = 2015
 
     # GeoSampa (WFS da Prefeitura de SP) — lotes, quadras, distritos para geocodificar o ITBI
-    geosampa_wfs_url: str = "http://wfs.geosampa.prefeitura.sp.gov.br/geoserver/geoportal/wfs"
+    geosampa_wfs_url: str = "https://wfs.geosampa.prefeitura.sp.gov.br/geoserver/geoportal/wfs"
     geosampa_max_age_days: int = Field(
         default=30, description="Rebaixa as camadas do GeoSampa após este número de dias."
     )
@@ -51,6 +51,11 @@ class Settings(BaseSettings):
     # Servidor
     host: str = "127.0.0.1"
     port: int = 8000
+    # Cabeçalho Host aceito (contra DNS rebinding); ``host`` entra sozinho quando não é
+    # 0.0.0.0/::. "testserver" é o Host do TestClient (nome sem domínio, não resolve fora daqui).
+    allowed_hosts: list[str] = Field(
+        default_factory=lambda: ["127.0.0.1", "localhost", "[::1]", "testserver"]
+    )
 
     @property
     def raw_dir(self) -> Path:
