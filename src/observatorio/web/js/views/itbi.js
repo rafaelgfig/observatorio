@@ -29,6 +29,27 @@ const PRECISAO_NOME = { lote: "lote", condominio: "condomínio", quadra: "quadra
 const POINT_LIMIT = 20000;
 const PAGE_SIZE = 50;
 const DEFAULT_RADIUS = 500;
+const RADIUS_MIN = 100;
+const RADIUS_MAX = 3000;
+const RADIUS_STEP = 50;
+const YM = /^\d{4}-(0[1-9]|1[0-2])$/;
+const AREA_ID = /^[0-9A-Za-z]{1,8}$/;
+
+/**
+ * Calibração do heatmap (camada `itbi_agg`, uma célula de 1/32 do tile): p90 de `n` por zoom na
+ * cidade inteira, medido nos dados reais com os filtros padrão (2 anos, compra e venda, sem
+ * garagem, precisão até a quadra → HEAT_REF_TOTAL guias). O peso é √(n / p90), limitado a 1, com
+ * o p90 escalado pelo total do filtro atual — sem isso o centro satura em qualquer período.
+ */
+const HEAT_REF_TOTAL = 374_366;
+const HEAT_RADIUS = 22; // px no zoom inteiro (~1,4 × o vão de 16 px entre células)
+const HEAT_P90 = /** @type {[number, number][]} */ ([
+  [9, 4200],
+  [10, 1200],
+  [11, 360],
+  [12, 90],
+  [13, 26],
+]);
 
 /**
  * @typedef {object} Regiao
@@ -51,9 +72,15 @@ const DEFAULT_RADIUS = 500;
  * @property {number | null} areaMin    m²
  * @property {number | null} areaMax
  * @property {"lote" | "quadra" | "qualquer"} precisao
- * @property {string | null} logradouro  id do logradouro selecionado na busca
- * @property {boolean} soLogradouro
+ * @property {Via | null} via         logradouro ou CEP escolhido na busca (centro do raio)
+ * @property {boolean} soVia          filtrar só esse logradouro/CEP dentro da região
  * @property {"none" | "raio" | "polygon" | "rectangle"} ferramenta
+ */
+
+/**
+ * @typedef {object} Via
+ * @property {"logradouro" | "cep"} tipo
+ * @property {string} id   nome como na fonte (`R ISIDORO FARINA`) ou CEP com 8 dígitos
  */
 
 /** @type {ViewContext | null} */
@@ -84,6 +111,12 @@ let sort = { key: "data", dir: /** @type {"asc" | "desc"} */ ("desc") };
 let draw = null;
 /** @type {any} */
 let popup = null;
+/** Caixa [w, s, e, n] do logradouro/CEP escolhido (para o raio cobrir a rua inteira). */
+let viaBbox = /** @type {[number, number, number, number] | null} */ (null);
+/** URL atual dos vector tiles (evita recarregar os tiles quando os filtros deles não mudam). */
+let tilesUrl = "";
+/** Fator do p90 do heatmap (total do filtro / HEAT_REF_TOTAL). */
+let heatScale = 1;
 
 /** @returns {State} */
 function defaultState() {
@@ -99,8 +132,8 @@ function defaultState() {
     areaMin: null,
     areaMax: null,
     precisao: "quadra",
-    logradouro: null,
-    soLogradouro: false,
+    via: null,
+    soVia: false,
     ferramenta: "none",
   };
 }
@@ -140,6 +173,9 @@ export function unmount() {
   priceChart = countChart = null;
   table = null;
   points = null;
+  viaBbox = null;
+  tilesUrl = "";
+  heatScale = 1;
   ctx = null;
 }
 
@@ -151,49 +187,100 @@ async function start(params) {
     if (!isAbort(error)) showError(error);
     return;
   }
+  if (!ctx) return; // a view foi desmontada enquanto o /meta carregava
   const max = String(meta.periodo?.max ?? "").slice(0, 7);
+  const min = String(meta.periodo?.min ?? "").slice(0, 7);
   state.dataFim = max;
   state.dataIni = shiftMonth(max, -23);
+  if (min && state.dataIni < min) state.dataIni = min;
   await applyParams(params);
-  ctx?.setFreshness(`ITBI até ${fmt.date(meta.periodo?.max)}`);
+  if (!ctx) return;
+  ctx.setFreshness(`ITBI até ${fmt.date(meta.periodo?.max)}`);
+  // a região vinda da URL precisa aparecer no painel (senão fica "Sem região")
+  renderTools();
+  renderRegiao();
   renderFilters();
   refresh();
 }
 
-/** @param {URLSearchParams} p */
+/**
+ * Estado a partir da URL compartilhada; valores fora do formato ou do intervalo são ignorados
+ * (a API responderia 422).
+ * @param {URLSearchParams} p
+ */
 async function applyParams(p) {
-  if (p.get("di")) state.dataIni = String(p.get("di"));
-  if (p.get("df")) state.dataFim = String(p.get("df"));
-  if (p.get("t")) state.tipos = String(p.get("t")).split(",").filter((t) => t in TIPO_NOME);
+  const min = String(meta?.periodo?.min ?? "").slice(0, 7);
+  const max = String(meta?.periodo?.max ?? "").slice(0, 7);
+  const month = (/** @type {string | null} */ v) => (v && YM.test(v) && (!min || v >= min) && (!max || v <= max) ? v : null);
+  state.dataIni = month(p.get("di")) ?? state.dataIni;
+  state.dataFim = month(p.get("df")) ?? state.dataFim;
+  if (state.dataIni > state.dataFim) [state.dataIni, state.dataFim] = [state.dataFim, state.dataIni];
+  if (p.get("t")) {
+    const tipos = String(p.get("t"))
+      .split(",")
+      .filter((t, i, all) => t in TIPO_NOME && all.indexOf(t) === i);
+    if (tipos.length) state.tipos = tipos;
+  }
   if (p.get("nat") === "todas") state.natureza = "todas";
   state.valorMin = numOrNull(p.get("vmin"));
   state.valorMax = numOrNull(p.get("vmax"));
   state.areaMin = numOrNull(p.get("amin"));
   state.areaMax = numOrNull(p.get("amax"));
+  normalizeRanges();
   const prec = p.get("prec");
   if (prec === "lote" || prec === "qualquer") state.precisao = prec;
-  if (p.get("lg")) {
-    state.logradouro = String(p.get("lg"));
-    state.soLogradouro = p.get("so") === "1";
-  }
+  const lg = p.get("lg");
+  const cep = p.get("cep");
+  if (lg) state.via = { tipo: "logradouro", id: lg };
+  else if (cep && /^\d{8}$/.test(cep)) state.via = { tipo: "cep", id: cep };
+  state.soVia = Boolean(state.via) && p.get("so") === "1";
   const c = p.get("c");
+  const d = p.get("d");
+  const s = p.get("s");
   if (c) {
     const [lon, lat, r] = c.split(",").map(Number);
-    if ([lon, lat, r].every(Number.isFinite)) {
-      state.raio = r;
-      setCircle(lon, lat, p.get("cl") ?? "Ponto no mapa", false);
+    if ([lon, lat, r].every(Number.isFinite) && Math.abs(lon) <= 180 && Math.abs(lat) <= 85) {
+      state.raio = clampRadius(r);
+      setCircle(lon, lat, p.get("cl") ?? "Ponto no mapa", true);
     }
-  } else if (p.get("d") || p.get("s")) {
-    const tipo = p.get("d") ? "distrito" : "subprefeitura";
-    await setDistrict(tipo, String(p.get("d") ?? p.get("s")), false);
+  } else if ((d && AREA_ID.test(d)) || (s && AREA_ID.test(s))) {
+    const tipo = d && AREA_ID.test(d) ? "distrito" : "subprefeitura";
+    await setDistrict(tipo, String(tipo === "distrito" ? d : s), true);
+  }
+  // logradouro/CEP só fazem sentido como centro de um raio
+  if (state.regiao?.tipo !== "circulo") {
+    state.via = null;
+    state.soVia = false;
   }
 }
 
-/** @param {string | null} v */
+/** @param {string | null} v  número não negativo, ou nulo */
 function numOrNull(v) {
   if (v == null || v === "") return null;
   const n = Number(v);
-  return Number.isFinite(n) ? n : null;
+  return Number.isFinite(n) && n >= 0 ? n : null;
+}
+
+/** @param {number} r metros */
+function clampRadius(r) {
+  return Math.min(RADIUS_MAX, Math.max(RADIUS_MIN, Math.round(r / RADIUS_STEP) * RADIUS_STEP));
+}
+
+/**
+ * Troca mínimo e máximo invertidos (a API recusa com 422). Devolve se algo mudou.
+ * @returns {boolean}
+ */
+function normalizeRanges() {
+  let changed = false;
+  if (state.valorMin != null && state.valorMax != null && state.valorMin > state.valorMax) {
+    [state.valorMin, state.valorMax] = [state.valorMax, state.valorMin];
+    changed = true;
+  }
+  if (state.areaMin != null && state.areaMax != null && state.areaMin > state.areaMax) {
+    [state.areaMin, state.areaMax] = [state.areaMax, state.areaMin];
+    changed = true;
+  }
+  return changed;
 }
 
 function syncParams() {
@@ -214,8 +301,9 @@ function syncParams() {
     amin: state.areaMin,
     amax: state.areaMax,
     prec: state.precisao === "quadra" ? null : state.precisao,
-    lg: state.logradouro,
-    so: state.soLogradouro ? "1" : null,
+    lg: state.via?.tipo === "logradouro" ? state.via.id : null,
+    cep: state.via?.tipo === "cep" ? state.via.id : null,
+    so: state.soVia ? "1" : null,
   });
 }
 
@@ -256,8 +344,8 @@ function consulta() {
     valor_max: state.valorMax != null ? state.valorMax * 1000 : null,
     area_min: state.areaMin,
     area_max: state.areaMax,
-    logradouro: state.soLogradouro ? state.logradouro : null,
-    cep: null,
+    logradouro: state.soVia && state.via?.tipo === "logradouro" ? state.via.id : null,
+    cep: state.soVia && state.via?.tipo === "cep" ? state.via.id : null,
     precisao: state.precisao,
   };
 }
@@ -289,6 +377,8 @@ function buildPanel(panel) {
   ui.tools = el("div", { className: "section" });
   ui.filters = el("div", { className: "section" });
   ui.notice = el("div");
+  // aviso de pontos cortados: separado de `notice` (que o resumo limpa ao chegar)
+  ui.pointsNote = el("div");
   ui.kpis = el("div", { className: "tiles" });
   ui.price = el("div");
   ui.count = el("div");
@@ -307,6 +397,7 @@ function buildPanel(panel) {
     ui.regiao,
     ui.filters,
     ui.notice,
+    ui.pointsNote,
     el("section", { className: "section", "aria-label": "Indicadores" }, [ui.kpis]),
     el("section", { className: "section" }, [
       el("h2", { className: "section-title", textContent: "R$/m² mediano por mês" }),
@@ -403,7 +494,14 @@ function renderRegiao() {
   ];
   if (r.tipo === "circulo") {
     const value = el("span", { className: "muted", textContent: formatRadius(state.raio) });
-    const slider = el("input", { type: "range", min: "100", max: "3000", step: "50", value: String(state.raio), "aria-label": "Raio em metros" });
+    const slider = el("input", {
+      type: "range",
+      min: String(RADIUS_MIN),
+      max: String(RADIUS_MAX),
+      step: String(RADIUS_STEP),
+      value: String(state.raio),
+      "aria-label": "Raio em metros",
+    });
     const apply = debounce(() => refresh(), 250);
     slider.addEventListener("input", () => {
       state.raio = Number(slider.value);
@@ -416,13 +514,24 @@ function renderRegiao() {
     });
     children.push(el("div", { className: "field" }, [el("div", { className: "row" }, [el("span", { className: "field-label", textContent: "Raio" }), value]), slider]));
   }
-  if (state.logradouro) {
-    const box = el("input", { type: "checkbox", checked: state.soLogradouro });
+  if (state.via && r.tipo === "circulo") {
+    const box = el("input", { type: "checkbox", checked: state.soVia });
     box.addEventListener("change", () => {
-      state.soLogradouro = box.checked;
+      state.soVia = box.checked;
+      // a rua (ou o CEP) pode passar do raio: amplia o círculo para cobrir a caixa da busca
+      if (state.soVia && viaBbox && state.regiao?.tipo === "circulo") {
+        const { lon, lat } = state.regiao.payload;
+        const needed = clampRadius(Math.ceil((radiusToCover(viaBbox, lon, lat) * 1.05) / RADIUS_STEP) * RADIUS_STEP);
+        if (needed > state.raio) {
+          state.raio = needed;
+          setCircle(lon, lat, state.regiao.label, true);
+          renderRegiao();
+        }
+      }
       refresh();
     });
-    children.push(el("label", { className: "switch" }, [box, el("span", { textContent: "Somente este logradouro" })]));
+    const label = state.via.tipo === "cep" ? "Somente este CEP" : "Somente este logradouro";
+    children.push(el("label", { className: "switch" }, [box, el("span", { textContent: label })]));
   }
   ui.regiao.replaceChildren(...children.filter(Boolean).map((c) => /** @type {HTMLElement} */ (c)));
 }
@@ -430,6 +539,22 @@ function renderRegiao() {
 /** @param {number} m */
 function formatRadius(m) {
   return m >= 1000 ? `${fmt.dec1(m / 1000)} km` : `${fmt.int(m)} m`;
+}
+
+/**
+ * Distância (m) do centro ao canto mais distante da caixa — aproximação plana, basta na cidade.
+ * @param {[number, number, number, number]} bbox  [w, s, e, n]
+ * @param {number} lon
+ * @param {number} lat
+ */
+function radiusToCover(bbox, lon, lat) {
+  const kx = 111320 * Math.cos((lat * Math.PI) / 180);
+  const ky = 110540;
+  let r = 0;
+  for (const x of [bbox[0], bbox[2]]) {
+    for (const y of [bbox[1], bbox[3]]) r = Math.max(r, Math.hypot((x - lon) * kx, (y - lat) * ky));
+  }
+  return r;
 }
 
 function renderFilters() {
@@ -442,7 +567,8 @@ function renderFilters() {
     }
   }
   const onDates = () => {
-    if (!ini.value || !fim.value) return;
+    // sem suporte a type="month" (Firefox/Safari) o campo vira texto: só aceita AAAA-MM
+    if (!YM.test(ini.value) || !YM.test(fim.value)) return;
     state.dataIni = ini.value <= fim.value ? ini.value : fim.value;
     state.dataFim = ini.value <= fim.value ? fim.value : ini.value;
     renderFilters();
@@ -513,6 +639,8 @@ function renderFilters() {
     const node = el("input", { className: "input", type: "number", min: "0", inputMode: "numeric", value: value == null ? "" : String(value), placeholder: label, "aria-label": label });
     node.addEventListener("change", () => {
       set(numOrNull(node.value));
+      // negativo ou inválido vira vazio; mínimo > máximo é trocado
+      if (normalizeRanges() || (node.value !== "" && numOrNull(node.value) == null)) renderFilters();
       refresh();
     });
     return node;
@@ -545,8 +673,7 @@ function field(label, control) {
 
 /** @param {unknown} error */
 function showError(error) {
-  const message = error instanceof Error ? error.message : String(error);
-  ui.notice.replaceChildren(el("div", { className: "notice notice--error", textContent: message }));
+  ui.notice.replaceChildren(el("div", { className: "notice notice--error", textContent: (error instanceof Error ? error.message : String(error)) }));
 }
 
 // ------------------------------------------------------------------ região
@@ -554,13 +681,18 @@ function showError(error) {
 /** @param {any} place */
 async function selectPlace(place) {
   stopDrawing();
+  state.ferramenta = "none";
+  if (ctx) ctx.map.getCanvas().style.cursor = "";
   if (place.tipo === "distrito" || place.tipo === "subprefeitura") {
-    state.logradouro = null;
-    state.soLogradouro = false;
+    state.via = null;
+    state.soVia = false;
+    viaBbox = null;
     await setDistrict(place.tipo, String(place.id), true);
   } else if (place.lon != null && place.lat != null) {
-    state.logradouro = place.tipo === "logradouro" ? String(place.id) : null;
-    state.soLogradouro = false;
+    const tipo = place.tipo === "logradouro" || place.tipo === "cep" ? place.tipo : null;
+    state.via = tipo ? { tipo, id: String(place.id) } : null;
+    state.soVia = false;
+    viaBbox = tipo && Array.isArray(place.bbox) ? place.bbox : null;
     setCircle(place.lon, place.lat, place.rotulo, true);
   } else {
     return;
@@ -607,8 +739,9 @@ async function setDistrict(tipo, id, fit) {
 /** @param {any} geometry GeoJSON Polygon */
 function setPolygon(geometry) {
   state.regiao = { tipo: "poligono", payload: { tipo: "poligono", geometria: geometry }, label: "Área desenhada", geometry };
-  state.logradouro = null;
-  state.soLogradouro = false;
+  state.via = null;
+  state.soVia = false;
+  viaBbox = null;
   drawRegiao();
   renderTools();
   renderRegiao();
@@ -618,9 +751,11 @@ function setPolygon(geometry) {
 function clearRegiao() {
   stopDrawing();
   state.regiao = null;
-  state.logradouro = null;
-  state.soLogradouro = false;
+  state.via = null;
+  state.soVia = false;
+  viaBbox = null;
   state.ferramenta = "none";
+  if (ctx) ctx.map.getCanvas().style.cursor = "";
   drawRegiao();
   renderTools();
   renderRegiao();
@@ -736,8 +871,9 @@ async function loadSummary() {
   const busy = [ui.kpis, ui.price, ui.count, ui.tipos];
   busy.forEach((n) => n.classList.add("is-loading"));
   try {
-    renderSummary(await fetchSummary());
+    const data = await fetchSummary();
     ui.notice.replaceChildren();
+    renderSummary(data);
   } catch (error) {
     if (!isAbort(error)) showError(error);
   } finally {
@@ -784,41 +920,105 @@ async function loadTable() {
 
 /** @param {any} data */
 function renderSummary(data) {
+  const total = Number(data.total ?? 0);
   const p = data.precisao ?? {};
   const located = (p.lote ?? 0) + (p.quadra ?? 0) + (p.aproximado ?? 0);
-  const exact = data.total ? ((p.lote ?? 0) / data.total) * 100 : 0;
+  const exact = total ? ((p.lote ?? 0) / total) * 100 : null;
   ui.kpis.replaceChildren(
-    tile("Transações", fmt.int(data.total), state.regiao ? state.regiao.label : "cidade inteira", true),
+    tile("Transações", fmt.int(total), state.regiao ? state.regiao.label : "cidade inteira", true),
     tile("Valor mediano", fmt.brlCompact(data.valor_mediano)),
     tile("R$/m² mediano", fmt.brl(data.rs_m2_mediano)),
     tile("Área mediana", data.area_mediana == null ? "—" : `${fmt.int(data.area_mediana)} m²`),
-    tile("Volume total", fmt.brlCompact(data.valor_total)),
-    tile("Localização exata", `${fmt.int(exact)}%`, located < data.total ? `${fmt.int(data.total - located)} sem coordenada` : "no lote ou condomínio"),
+    tile("Volume total", total ? fmt.brlCompact(data.valor_total) : "—"),
+    tile(
+      "Localização exata",
+      exact == null ? "—" : `${fmt.int(exact)}%`,
+      !total ? null : located < total ? `${fmt.int(total - located)} sem coordenada` : "no lote ou condomínio",
+    ),
   );
+  if (!total) {
+    ui.notice.replaceChildren(el("div", { className: "notice", textContent: "Nenhuma transação com esses filtros nesta região e período." }));
+  }
 
-  const mensal = data.mensal ?? [];
-  const long = mensal.length > 24;
-  const datums = mensal.map((/** @type {any} */ r) => {
+  const mensal = fillMonths(data.mensal ?? []);
+  const count = mensal.length;
+  const datums = mensal.map((r) => {
     const [y, m] = String(r.mes).split("-").map(Number);
     return {
-      label: long ? (m === 1 ? String(y) : "") : `${MONTHS[m - 1]}`,
-      title: `${MONTHS[m - 1]}/${y} · ${fmt.int(r.n)} transações`,
+      label: monthLabel(y, m, count),
+      title: `${MONTHS[m - 1]}/${y} · ${fmt.int(r.n)} ${r.n === 1 ? "transação" : "transações"}`,
       value: r.rs_m2_mediano,
       n: r.n,
     };
   });
   priceChart?.update(datums);
-  countChart?.update(datums.map((/** @type {any} */ d) => ({ ...d, value: d.n })));
+  countChart?.update(datums.map((d) => ({ ...d, value: d.n })));
 
   horizontalBars(
     ui.tipos,
     (data.por_tipo ?? []).map((/** @type {any} */ t) => ({
       label: TIPO_NOME[t.tipo] ?? t.tipo,
       value: t.n,
-      detail: `Mediana: ${fmt.brlCompact(t.valor_mediano)} · ${fmt.brl(t.rs_m2_mediano)}/m²`,
+      detail: [`Mediana: ${fmt.brlCompact(t.valor_mediano)}`, t.rs_m2_mediano == null ? null : `${fmt.brl(t.rs_m2_mediano)}/m²`]
+        .filter(Boolean)
+        .join(" · "),
     })),
     (v) => fmt.int(v),
   );
+
+  // o heatmap (sem região) usa os mesmos filtros de período/tipo/natureza/precisão dos tiles;
+  // com filtro de valor ou área o total não corresponde aos tiles e a escala fica a do período
+  if (!state.regiao) {
+    heatScale = hasValueFilters() ? monthsBetween(state.dataIni, state.dataFim) / 24 : total / HEAT_REF_TOTAL;
+    paintHeat();
+    renderLegend();
+  }
+}
+
+/** Filtros que a API de tiles não aplica (o mapa sem região os ignora). */
+function hasValueFilters() {
+  return [state.valorMin, state.valorMax, state.areaMin, state.areaMax].some((v) => v != null);
+}
+
+/**
+ * Nº de meses de `ini` a `fim` (inclusive), ambos YYYY-MM.
+ * @param {string} ini
+ * @param {string} fim
+ */
+function monthsBetween(ini, fim) {
+  const [y0, m0] = ini.split("-").map(Number);
+  const [y1, m1] = fim.split("-").map(Number);
+  const n = (y1 - y0) * 12 + (m1 - m0) + 1;
+  return Number.isFinite(n) && n > 0 ? n : 24;
+}
+
+/**
+ * Série mensal contínua de `dataIni` a `dataFim`: a API omite meses sem transações, o que
+ * encolheria o eixo X (meses vazios entram com n = 0 e mediana nula, uma lacuna na linha).
+ * @param {{ mes: string, n: number, valor_mediano: number | null, rs_m2_mediano: number | null }[]} mensal
+ */
+function fillMonths(mensal) {
+  if (!YM.test(state.dataIni) || !YM.test(state.dataFim) || state.dataIni > state.dataFim) return mensal;
+  const byMonth = new Map(mensal.map((r) => [r.mes, r]));
+  const out = [];
+  for (let ym = state.dataIni; ym <= state.dataFim; ym = shiftMonth(ym, 1)) {
+    out.push(byMonth.get(ym) ?? { mes: ym, n: 0, valor_mediano: null, rs_m2_mediano: null });
+  }
+  return out;
+}
+
+/**
+ * Rótulo do eixo X sem sobreposição no painel (~320 px de área útil, fonte de 10 px):
+ * até 12 meses, todos; até 3 anos, trimestres (o ano em janeiro); depois, só os anos.
+ * @param {number} y
+ * @param {number} m
+ * @param {number} count  meses na série
+ */
+function monthLabel(y, m, count) {
+  if (count <= 12) return MONTHS[m - 1];
+  if (count <= 36) return m === 1 ? String(y) : m % 3 === 1 ? MONTHS[m - 1] : "";
+  if (count <= 96) return m === 1 ? String(y) : "";
+  return m === 1 && y % 2 === 0 ? String(y) : "";
 }
 
 /**
@@ -835,22 +1035,52 @@ function tile(label, value, note, hero = false) {
   ]);
 }
 
-async function exportCsv() {
+/**
+ * Baixa o CSV (POST, por isso fetch + blob). A cidade inteira em 2 anos dá ~90 MB / ~375 mil
+ * linhas; acima de `X-Limite-Linhas` a API corta nas mais recentes e avisa em `X-Truncado`.
+ * @param {HTMLButtonElement} button
+ */
+async function exportCsv(button) {
+  if (button.disabled) return;
+  button.disabled = true;
+  button.setAttribute("aria-busy", "true");
   try {
     const response = await fetch("/api/itbi/exportar", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(consulta()),
     });
-    if (!response.ok) throw new Error(`Falha ao exportar (${response.status})`);
+    if (!response.ok) {
+      let detail = `Falha ao exportar (${response.status})`;
+      try {
+        const payload = await response.json();
+        if (payload?.detail) detail = typeof payload.detail === "string" ? payload.detail : JSON.stringify(payload.detail);
+      } catch {
+        /* corpo não-JSON */
+      }
+      throw new Error(detail);
+    }
     const blob = await response.blob();
     const link = el("a", { href: URL.createObjectURL(blob), download: `itbi-sp-${state.dataIni}-${state.dataFim}.csv` });
     document.body.append(link);
     link.click();
     link.remove();
     setTimeout(() => URL.revokeObjectURL(link.href), 10_000);
+    if (response.headers.get("X-Truncado") === "true") {
+      const total = Number(response.headers.get("X-Total-Linhas"));
+      const linhas = Number(response.headers.get("X-Linhas-Exportadas"));
+      ui.notice.replaceChildren(
+        el("div", {
+          className: "notice",
+          textContent: `O CSV traz as ${fmt.int(linhas)} transações mais recentes de ${fmt.int(total)} (limite da exportação). Reduza o período ou a região para obter todas.`,
+        }),
+      );
+    }
   } catch (error) {
     showError(error);
+  } finally {
+    button.disabled = false;
+    button.removeAttribute("aria-busy");
   }
 }
 
@@ -861,7 +1091,7 @@ function buildDrawer(host) {
   ui.drawerTitle = el("span", { className: "drawer-title", textContent: "Transações" });
   const toggle = el("button", { className: "btn btn-ghost btn-icon", type: "button", "aria-expanded": "false", "aria-label": "Mostrar tabela" }, [icon("chevron")]);
   const exportBtn = el("button", { className: "btn btn-ghost", type: "button", title: "Exportar CSV" }, [icon("download"), "CSV"]);
-  exportBtn.addEventListener("click", () => void exportCsv());
+  exportBtn.addEventListener("click", () => void exportCsv(exportBtn));
   ui.drawerBody = el("div", { className: "drawer-body" });
   const drawer = el("section", { className: "drawer is-collapsed", "aria-label": "Tabela de transações" }, [
     el("div", { className: "drawer-head" }, [ui.drawerTitle, exportBtn, toggle]),
@@ -883,7 +1113,8 @@ function buildDrawer(host) {
       { key: "endereco", label: "Endereço" },
       { key: "complemento", label: "Compl.", render: (r) => r.complemento ?? "" },
       { key: "tipo", label: "Tipo", render: (r) => TIPO_NOME[r.tipo] ?? r.tipo ?? "" },
-      { key: "area_construida", label: "Área (m²)", num: true, sortKey: "area", render: (r) => fmt.int(r.area_construida) },
+      // mesma área da ordenação `area` da API: construída, ou a do terreno para terrenos
+      { key: "area", label: "Área (m²)", num: true, sortKey: "area", render: (r) => formatArea(r.tipo === "terreno" ? r.area_terreno : r.area_construida) },
       { key: "valor", label: "Valor", num: true, sortKey: "valor", render: (r) => fmt.brl(r.valor) },
       { key: "rs_m2", label: "R$/m²", num: true, sortKey: "rs_m2", render: (r) => fmt.brl(r.rs_m2) },
     ],
@@ -906,6 +1137,11 @@ function buildDrawer(host) {
   table.setSort(sort.key, sort.dir);
 }
 
+/** Área em m² (a fonte usa 0 para "não informada"). */
+function formatArea(/** @type {number | null | undefined} */ v) {
+  return v ? fmt.int(v) : "—";
+}
+
 // ------------------------------------------------------------------ mapa
 
 const SRC_TILES = "itbi-tiles";
@@ -913,9 +1149,16 @@ const SRC_POINTS = "itbi-points";
 const SRC_AREA = "itbi-area";
 const LAYERS = ["itbi-heat", "itbi-tile-points", "itbi-points", "itbi-area-fill", "itbi-area-line"];
 
+/** URL dos tiles com os filtros que a API de tiles aceita (`FiltroTile`). */
 function tileUrl() {
   const c = consulta();
-  const query = toQuery({ data_ini: c.data_ini, data_fim: c.data_fim, tipo: c.tipos ?? undefined, natureza: c.naturezas ?? undefined });
+  const query = toQuery({
+    data_ini: c.data_ini,
+    data_fim: c.data_fim,
+    tipo: c.tipos ?? undefined,
+    natureza: c.naturezas ?? undefined,
+    precisao: c.precisao === "quadra" ? undefined : c.precisao,
+  });
   return `${location.origin}/api/itbi/tiles/{z}/{x}/{y}.mvt${query}`;
 }
 
@@ -923,7 +1166,10 @@ function addLayers() {
   if (!ctx) return;
   const { map } = ctx;
   const before = ctx.labelLayerId();
-  if (!map.getSource(SRC_TILES)) map.addSource(SRC_TILES, { type: "vector", tiles: [tileUrl()], minzoom: 9, maxzoom: 16 });
+  if (!map.getSource(SRC_TILES)) {
+    tilesUrl = tileUrl();
+    map.addSource(SRC_TILES, { type: "vector", tiles: [tilesUrl], minzoom: 9, maxzoom: 16 });
+  }
   if (!map.getSource(SRC_POINTS)) map.addSource(SRC_POINTS, { type: "geojson", data: emptyFc() });
   if (!map.getSource(SRC_AREA)) map.addSource(SRC_AREA, { type: "geojson", data: emptyFc() });
 
@@ -936,9 +1182,10 @@ function addLayers() {
         "source-layer": "itbi_agg",
         maxzoom: 14,
         paint: {
-          "heatmap-weight": ["interpolate", ["linear"], ["get", "n"], 0, 0, 50, 1],
-          "heatmap-intensity": ["interpolate", ["linear"], ["zoom"], 9, 0.6, 13, 1.4],
-          "heatmap-radius": ["interpolate", ["linear"], ["zoom"], 9, 6, 13, 18],
+          "heatmap-weight": /** @type {any} */ (heatWeight()),
+          // com raio = 1,4 × o vão, célula no p90 → densidade ~0,9; mediana → ~0,2
+          "heatmap-intensity": 1.8,
+          "heatmap-radius": /** @type {any} */ (heatRadius()),
           "heatmap-opacity": 0.85,
         },
       },
@@ -946,17 +1193,15 @@ function addLayers() {
     );
   }
   if (!map.getLayer("itbi-tile-points")) {
-    map.addLayer(
-      {
-        id: "itbi-tile-points",
-        type: "circle",
-        source: SRC_TILES,
-        "source-layer": "itbi",
-        minzoom: 14,
-        paint: { "circle-radius": ["interpolate", ["linear"], ["zoom"], 14, 2.5, 17, 5], "circle-opacity": 0.85, "circle-stroke-width": 1 },
-      },
-      before,
-    );
+    // no topo, como `itbi-points` (círculos pequenos não escondem rótulos)
+    map.addLayer({
+      id: "itbi-tile-points",
+      type: "circle",
+      source: SRC_TILES,
+      "source-layer": "itbi",
+      minzoom: 14,
+      paint: { "circle-radius": ["interpolate", ["linear"], ["zoom"], 14, 2.5, 17, 5], "circle-opacity": 0.85, "circle-stroke-width": 1 },
+    });
   }
   if (!map.getLayer("itbi-area-fill")) {
     map.addLayer({ id: "itbi-area-fill", type: "fill", source: SRC_AREA, paint: { "fill-opacity": 0.07 } }, before);
@@ -1004,7 +1249,7 @@ function repaint() {
     ["linear"],
     ["heatmap-density"],
     0,
-    "rgba(0,0,0,0)",
+    transparent(ramp[1]), // não "rgba(0,0,0,0)": interpolar a partir do preto acinzenta a borda no tema claro
     0.15,
     ramp[1],
     0.35,
@@ -1021,7 +1266,44 @@ function repaint() {
   map.setPaintProperty("itbi-area-fill", "fill-color", accent);
   map.setPaintProperty("itbi-area-line", "line-color", accent);
   map.setPaintProperty("itbi-points", "circle-stroke-color", surface);
+  paintHeat();
   paintPoints();
+}
+
+/** `#rrggbb` → a mesma cor com alfa 0 (fallback: transparente). */
+function transparent(/** @type {string | undefined} */ hex) {
+  const m = /^#([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i.exec((hex ?? "").trim());
+  return m ? `rgba(${parseInt(m[1], 16)},${parseInt(m[2], 16)},${parseInt(m[3], 16)},0)` : "rgba(0,0,0,0)";
+}
+
+/**
+ * Peso de cada célula de `itbi_agg`: √(n / p90 do zoom), limitado a 1. `step` no zoom acompanha
+ * a troca de tiles (o vector tile de zoom z vale até z + 1).
+ */
+function heatWeight() {
+  const k = Math.max(heatScale, 0.02);
+  const weight = (/** @type {number} */ p90) => ["min", 1, ["/", ["get", "n"], p90 * k]];
+  /** @type {unknown[]} */
+  const expr = ["step", ["zoom"], weight(HEAT_P90[0][1])];
+  for (const [z, p90] of HEAT_P90.slice(1)) expr.push(z, weight(p90));
+  return expr;
+}
+
+/**
+ * Raio proporcional ao vão da grade: 32 células por tile de 512 px = 16 px no zoom inteiro,
+ * dobrando até o próximo (quando o tile troca). Raio fixo faria a densidade variar 4× dentro
+ * de cada nível de zoom.
+ */
+function heatRadius() {
+  /** @type {unknown[]} */
+  const expr = ["interpolate", ["exponential", 2], ["zoom"]];
+  for (let z = HEAT_P90[0][0]; z <= HEAT_P90[HEAT_P90.length - 1][0]; z++) expr.push(z, HEAT_RADIUS, z + 0.999, HEAT_RADIUS * 2);
+  return expr;
+}
+
+function paintHeat() {
+  if (!ctx?.map.getLayer("itbi-heat")) return;
+  ctx.map.setPaintProperty("itbi-heat", "heatmap-weight", /** @type {any} */ (heatWeight()));
 }
 
 function paintPoints() {
@@ -1051,14 +1333,16 @@ function setPoints() {
     7,
   );
   paintPoints();
-  if (points?.truncado) {
-    ui.notice.replaceChildren(
-      el("div", {
-        className: "notice",
-        textContent: `Mostrando ${fmt.int(points.features.length)} de ${fmt.int(points.total)} transações no mapa (as mais recentes). Os indicadores consideram todas.`,
-      }),
-    );
-  }
+  ui.pointsNote.replaceChildren(
+    ...(points?.truncado
+      ? [
+          el("div", {
+            className: "notice",
+            textContent: `Mostrando ${fmt.int(points.features.length)} de ${fmt.int(points.total)} transações no mapa (as mais recentes). Os indicadores consideram todas.`,
+          }),
+        ]
+      : []),
+  );
 }
 
 function drawRegiao() {
@@ -1072,7 +1356,10 @@ function drawRegiao() {
 function updateTiles() {
   if (!ctx) return;
   const src = /** @type {any} */ (ctx.map.getSource(SRC_TILES));
-  src?.setTiles([tileUrl()]);
+  const url = tileUrl();
+  if (!src || url === tilesUrl) return;
+  tilesUrl = url;
+  src.setTiles([url]);
 }
 
 /**
@@ -1111,6 +1398,7 @@ function renderLegend() {
       format: () => "",
       labels: ["menos", "mais"],
       nodataLabel: "Desenhe uma região para ver cada venda",
+      note: hasValueFilters() ? "O mapa não aplica os filtros de valor e área" : undefined,
     });
   } else {
     legend.hide();
@@ -1120,13 +1408,22 @@ function renderLegend() {
 /**
  * @param {number | string} id
  * @param {[number, number]} lngLat
+ * @param {number} [count]  guias no mesmo ponto (tiles: o id é o da mais recente)
  */
-async function openPopup(id, lngLat) {
+async function openPopup(id, lngLat, count = 1) {
   if (!ctx) return;
   popup?.remove();
-  popup = new ctx.maplibregl.Popup({ maxWidth: "320px", closeButton: true }).setLngLat(lngLat).setDOMContent(el("div", { className: "muted", textContent: "Carregando…" })).addTo(ctx.map);
+  const current = new ctx.maplibregl.Popup({ maxWidth: "320px", closeButton: true })
+    .setLngLat(lngLat)
+    .setDOMContent(el("div", { className: "muted", textContent: "Carregando…" }))
+    .addTo(ctx.map);
+  popup = current;
   try {
     const t = await api(`/itbi/transacao/${encodeURIComponent(String(id))}`);
+    if (popup !== current) return; // outro clique abriu outro popup
+    // `endereco` já traz o número ("Rua Pamplona, 834"; "s/n" quando não há)
+    const titulo = t.endereco ?? ([t.logradouro, t.numero_raw ?? t.numero].filter(Boolean).join(", ") || "Endereço não informado");
+    const cep = t.cep ? `CEP ${String(t.cep).replace(/^(\d{5})(\d{3})$/, "$1-$2")}` : "";
     const rows = [
       ["Data", fmt.date(t.data_transacao)],
       ["Valor", fmt.brl(t.valor_transacao)],
@@ -1140,15 +1437,17 @@ async function openPopup(id, lngLat) {
       ["Financiamento", t.financiamento ?? "—"],
       ["Localização", PRECISAO_NOME[/** @type {keyof typeof PRECISAO_NOME} */ (t.precisao)] ?? t.precisao ?? "—"],
     ];
-    popup?.setDOMContent(
+    current.setDOMContent(
       el("div", {}, [
-        el("div", { className: "popup-title", textContent: [t.endereco ?? t.logradouro, t.numero].filter(Boolean).join(", ") }),
-        el("div", { className: "muted", textContent: [t.complemento, t.cep ? `CEP ${String(t.cep).replace(/(\d{5})(\d{3})/, "$1-$2")}` : ""].filter(Boolean).join(" · ") }),
+        el("div", { className: "popup-title", textContent: titulo }),
+        el("div", { className: "muted", textContent: [t.complemento, t.bairro, cep].filter(Boolean).join(" · ") }),
+        count > 1 ? el("div", { className: "muted", textContent: `A mais recente de ${fmt.int(count)} transações neste ponto` }) : null,
         el("div", { className: "popup-grid" }, rows.flatMap(([k, v]) => [el("span", { textContent: k }), el("b", { textContent: v })])),
+        t.possivel_duplicata ? el("div", { className: "muted", textContent: "Possível duplicata de outra guia da mesma planilha" }) : null,
       ]),
     );
   } catch (error) {
-    popup?.setDOMContent(el("div", { className: "notice notice--error", textContent: error instanceof Error ? error.message : String(error) }));
+    if (popup === current) current.setDOMContent(el("div", { className: "notice notice--error", textContent: (error instanceof Error ? error.message : String(error)) }));
   }
 }
 
@@ -1158,20 +1457,35 @@ function bindMapEvents(context) {
   /** @param {any} ev */
   const onClick = (ev) => {
     if (state.ferramenta === "raio") {
+      state.via = null;
+      state.soVia = false;
+      viaBbox = null;
       setCircle(ev.lngLat.lng, ev.lngLat.lat, "Ponto no mapa", false);
       state.ferramenta = "none";
       map.getCanvas().style.cursor = "";
-      state.logradouro = null;
-      state.soLogradouro = false;
       renderTools();
       renderRegiao();
       refresh();
       return;
     }
     if (state.ferramenta !== "none") return;
-    const feature = map.queryRenderedFeatures(ev.point, { layers: ["itbi-points", "itbi-tile-points"].filter((id) => map.getLayer(id)) })[0];
-    if (feature?.id != null) void openPopup(/** @type {number} */ (feature.id), [ev.lngLat.lng, ev.lngLat.lat]);
-    else if (feature?.properties?.id != null) void openPopup(feature.properties.id, [ev.lngLat.lng, ev.lngLat.lat]);
+    // folga de 4 px: os círculos têm 2,5–5 px de raio
+    const { x, y } = ev.point;
+    const layers = ["itbi-points", "itbi-tile-points"].filter((id) => map.getLayer(id));
+    const feature = layers.length
+      ? map.queryRenderedFeatures(
+          [
+            [x - 4, y - 4],
+            [x + 4, y + 4],
+          ],
+          { layers },
+        )[0]
+      : undefined;
+    if (!feature) return;
+    // GeoJSON (`pontos`): id da feição; MVT (`itbi`): sem id de feição, vai em properties.id
+    const id = feature.id ?? feature.properties?.id;
+    const coords = feature.geometry?.type === "Point" ? /** @type {[number, number]} */ (feature.geometry.coordinates) : [ev.lngLat.lng, ev.lngLat.lat];
+    if (id != null) void openPopup(/** @type {number} */ (id), /** @type {[number, number]} */ (coords), Number(feature.properties?.n ?? 1));
   };
   /** @param {any} ev */
   const onMove = (ev) => {
@@ -1179,7 +1493,11 @@ function bindMapEvents(context) {
     if (!f || state.ferramenta !== "none") return;
     map.getCanvas().style.cursor = "pointer";
     const p = f.properties;
-    showTooltip(ev.originalEvent.clientX, ev.originalEvent.clientY, fmt.brl(p.v), `${TIPO_NOME[p.t] ?? p.t ?? ""}${p.d ? ` · ${fmt.date(p.d)}` : ""}`, p.m2 != null ? `${fmt.brl(p.m2)}/m²` : undefined);
+    // tiles (z ≥ 14): uma feição por ponto — valor/tipo/data da guia mais recente, `m2` mediano
+    const n = Number(p.n ?? 1);
+    const m2 = p.m2 != null ? `${fmt.brl(p.m2)}/m²` : null;
+    const extra = n > 1 ? `Mais recente de ${fmt.int(n)} no ponto${m2 ? ` · mediana ${m2}` : ""}` : m2;
+    showTooltip(ev.originalEvent.clientX, ev.originalEvent.clientY, fmt.brl(p.v), `${TIPO_NOME[p.t] ?? p.t ?? ""}${p.d ? ` · ${fmt.date(p.d)}` : ""}`, extra ?? undefined);
   };
   const onLeave = () => {
     if (state.ferramenta === "none") map.getCanvas().style.cursor = "";
