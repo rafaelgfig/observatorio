@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="pt-BR" data-theme="dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark light" />
+    <title>Observatório · Apagões e ITBI</title>
+    <meta
+      name="description"
+      content="Explore interrupções de energia (ANEEL) e transações imobiliárias (ITBI São Paulo) em mapa."
+    />
+    <link rel="icon" href="/static/favicon.svg" type="image/svg+xml" />
+    <script>
+      // Aplica o tema salvo antes do primeiro paint (padrão: escuro).
+      try {
+        if (localStorage.getItem("observatorio:theme") === "light") {
+          document.documentElement.dataset.theme = "light";
+        }
+      } catch (_) {}
+    </script>
+    <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@MAPLIBRE_VERSION/dist/maplibre-gl.css" />
+    <link rel="stylesheet" href="/static/css/app.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="brand" href="#/apagoes" aria-label="Observatório — início">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+          <path d="M13 2 4 14h7l-1 8 9-12h-7z" />
+        </svg>
+        Observatório
+      </a>
+      <nav class="tabs" aria-label="Seções">
+        <a class="tab" href="#/apagoes" data-route="apagoes">Apagões</a>
+        <a class="tab" href="#/itbi" data-route="itbi">ITBI · São Paulo</a>
+      </nav>
+      <div class="topbar-actions">
+        <span class="freshness" id="freshness"></span>
+        <button class="btn btn-ghost btn-icon" id="theme-toggle" type="button"></button>
+      </div>
+    </header>
+
+    <main class="layout">
+      <aside class="panel" id="panel" aria-live="polite"></aside>
+      <section class="map-wrap" id="map-wrap" aria-label="Mapa">
+        <div id="map"></div>
+      </section>
+    </main>
+
+    <script type="module" src="/static/js/main.js"></script>
+  </body>
+</html>
