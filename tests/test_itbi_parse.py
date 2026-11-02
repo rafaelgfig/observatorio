@@ -566,3 +566,228 @@ def test_cpf_valido() -> None:
     assert not parse.cpf_valid("52998224726")
     assert not parse.cpf_valid("11111111111")  # repetidos passam na conta, mas não existem
     assert not parse.cpf_valid("5299822472")
+
+
+# ---------------------------------------------------------------- unidade, bloco, vagas, edifício
+
+
+@pytest.mark.parametrize(
+    ("complemento", "unidade", "bloco", "vagas"),
+    [
+        # exemplos reais (2015-2026)
+        ("BL 1 AP 44", "44", "1", None),
+        ("AP 01 BL D", "1", "D", None),
+        ("AP 72 BL 3 E", "72", "3", None),  # "E" (de "E VG", cortado) não é bloco
+        ("APT 112 TORR", "112", None, None),  # "TORRE" cortada, sem identificador
+        ("AP 44 E 4VGS", "44", None, 4),
+        ("AP 101 E 2VG", "101", None, 2),
+        ("AP 16 E VG", "16", None, 1),
+        ("VG 45", None, None, 1),  # a vaga nº 45: uma vaga
+        ("AP: 306 BL: 02", "306", "2", None),
+        ("TORRE 9 APTO 92", "92", "9", None),
+        ("A11 APTO 1104", "1104", None, None),  # A11 = 11º andar
+        ("AN 13 AP 133", "133", None, None),
+        ("AP 91 T2 A MAIOR", "91", "2", None),
+        ("AP 302 TA", "302", "A", None),
+        ("TA , AP 2313", "2313", "A", None),
+        ("AP 101 4 VG", "101", None, 4),
+        ("AP 162 E 2 V", "162", None, 2),  # "V" de vaga, cortado
+        ("AP 83 E VG B", "83", None, 1),
+        ("AP 4 E BOX", "4", None, 1),
+        ("AP 12 VG 45", "12", None, 1),  # o 12 é o apartamento, não o nº de vagas
+        ("APTO 1205 TORRE 2 E 2 VAGAS", "1205", "2", 2),
+        ("AP 9 E VGS", "9", None, None),  # vagas sem contagem
+        ("AP 12 E 145 VG", "12", None, 1),  # 145 não é contagem plausível
+        ("AP 12 BLOCO II", "12", "II", None),
+        ("BL. T2 , APTO 601", "601", "T2", None),
+        ("Ap.12 Bl:B", "12", "B", None),
+        ("AP 9A", "9A", None, None),
+        ("AP 131 E 132", "131", None, None),
+        ("AP 213 DEP 83", "213", None, None),
+        ("STUDIO NR 9", "9", None, None),
+        ("Studio R nº 12", "12", None, None),
+        ("UNIDADE 1209", "1209", None, None),
+        ("SALA 217", "217", None, None),
+        ("CJ 45 T 1", "45", "1", None),
+        ("LOJA", None, None, None),
+        ("CASA Nº 12", "12", None, None),
+        ("511 TORRE 1", "511", "1", None),
+        ("BL9-12", "12", "9", None),
+        ("1603 A", "1603", "A", None),
+        ("MARAB A 803", "803", "A", None),
+        ("TRBAP2307", "2307", None, None),
+        ("12", "12", None, None),
+        ("177 E 179", None, None, None),  # dois números de porta
+        # "E" + número é a conjunção dos números de porta, nunca a torre E
+        ("E 1341", None, None, None),
+        ("E 1560 FD", None, None, None),
+        ("E 241 247", None, None, None),
+        ("472 FD E 476", None, None, None),
+        ("100A E 100 FDS", None, None, None),
+        ("AP 203E TORRE E", "203E", "E", None),  # com a palavra, a torre E vale
+        ("CASA VERDE", None, None, None),
+        ("AP 12 TORRE E VG", "12", None, 1),  # "E" seguido de vaga é conjunção
+        ("T 9", None, None, None),  # "T" sozinho só vale com unidade
+        ("AP 0", "0", None, None),
+    ],
+)
+def test_analisa_complemento(
+    complemento: str, unidade: str | None, bloco: str | None, vagas: int | None
+) -> None:
+    assert parse.analisa_complemento(complemento) == parse.Unidade(unidade, bloco, vagas)
+
+
+@pytest.mark.parametrize(
+    ("referencia", "edificio", "bloco"),
+    [
+        ("RES JARDIM DOS YPES", "Residencial Jardim dos Ypes", None),
+        ("ED PLACE VERSAILLES", "Edifício Place Versailles", None),
+        ("CD RES AIRY", "Condomínio Residencial Airy", None),
+        ("COND SOLAR DOS NUNES", "Condomínio Solar dos Nunes", None),
+        ("ED AUTUMN BL A", "Edifício Autumn", "A"),
+        ("CD EDIFICIO NEW AGE", "Condomínio Edifício New Age", None),
+        ("C.R.PREMMIO VL.NOVA", "Condomínio Residencial Premmio Vila Nova", None),
+        ("COND EPI III", "Condomínio Epi III", None),  # numeral romano em maiúsculas
+        ("PQ RES DA LAPA", "Parque Residencial da Lapa", None),
+        ("ED STO ANTONIO", "Edifício Santo Antonio", None),
+        ("LISSE RESIDENCE", "Lisse Residence", None),  # sem prefixo, palavra típica
+        ("TORRE 2", None, "2"),
+        ("BLOCO II", None, "II"),
+        ("SAO PAULO", None, None),  # bairros e distritos
+        ("STO AMARO", None, None),
+        ("BUTANTA", None, None),
+        ("LOTE 9 QD 3", None, None),
+        ("GLEBA A", None, None),
+        ("R ALCIDES MOREIRA 12", None, None),
+        ("EDIFICIO", None, None),  # só o prefixo
+        ("CONDOMINIO", None, None),
+    ],
+)
+def test_analisa_referencia(referencia: str, edificio: str | None, bloco: str | None) -> None:
+    assert parse.analisa_referencia(referencia) == (edificio, bloco)
+
+
+@pytest.mark.parametrize(
+    ("bairro", "bloco"),
+    [("BLOCO 14", "14"), ("TORRE B", "B"), ("BL 07", "7"), ("BARRA FUNDA", None), ("T 9", None)],
+)
+def test_bloco_no_bairro(bairro: str, bloco: str | None) -> None:
+    assert parse.bloco_em(bairro) == bloco
+
+
+@pytest.mark.parametrize(
+    ("texto", "chave"),
+    [
+        ("Ap.12 Bl:B", "AP 12 BL B"),
+        ("APTO12 T2 E 2VGS", "APTO 12 T 2 E 2 VGS"),
+        ("AP 9A", "AP 9A"),
+        ("Unidade Nº 3", "UNIDADE N 3"),
+    ],
+)
+def test_texto_chave(texto: str, chave: str) -> None:
+    assert parse.texto_chave(texto) == chave
+
+
+def test_colunas_de_unidade_na_aba() -> None:
+    # Inácio Monteiro, 600: o bloco vem no bairro; a referência dá o nome do condomínio
+    out = one(complemento="AP 21", bairro="BLOCO 14", referencia="RES JARDIM DOS YPES")
+    assert (out["unidade"], out["bloco"], out["vagas"], out["edificio"]) == (
+        "21",
+        "14",
+        None,
+        "Residencial Jardim dos Ypes",
+    )
+    # o complemento tem prioridade; depois o bairro; por fim a referência
+    assert one(complemento="AP 1 BL C", bairro="BLOCO 14")["bloco"] == "C"
+    assert one(complemento="AP 1", referencia="ED AUTUMN BL A")["bloco"] == "A"
+    assert one(complemento="AP 2 E 2VG")["vagas"] == 2
+    assert one(complemento=None, bairro=None, referencia=None)["bloco"] is None
+
+
+@pytest.mark.parametrize(
+    ("numero", "complemento", "unidade", "bloco"),
+    [
+        ("1802", "A 1806", None, None),  # "1802 a 1806": faixa de numeração da porta
+        ("165", "A 167", None, None),
+        ("1483", "A 1499 VAGA", None, None),
+        ("1082", "A 1082", None, None),
+        ("4228", "A 512", "512", "A"),  # torre A, apartamento 512 (longe do nº da porta)
+        ("0", "A 512", "512", "A"),  # sem número da porta: não dá para decidir, fica
+        ("1802", "MARAB A 803", "803", "A"),  # só no início do complemento
+    ],
+)
+def test_a_seguido_de_numero_perto_da_porta_e_faixa(
+    numero: str, complemento: str, unidade: str | None, bloco: str | None
+) -> None:
+    out = one(numero=numero, complemento=complemento, bairro="CENTRO", referencia=None)
+    assert (out["unidade"], out["bloco"]) == (unidade, bloco)
+
+
+def test_faixa_de_porta_nao_esconde_o_bloco_do_bairro() -> None:
+    out = one(numero="1802", complemento="A 1806", bairro="TORRE 2")
+    assert (out["unidade"], out["bloco"]) == (None, "2")
+    assert parse.analisa_complemento("A 1806") == parse.Unidade("1806", "A", None, 1806)
+
+
+@pytest.mark.parametrize(
+    ("cells", "integral", "referencia", "razao", "atipico"),
+    [
+        ({}, 500_000.0, 400_000.0, 1.25, False),
+        # valores reais da R. Inácio Monteiro, 600 (referência ~125–141 mil)
+        ({"valor_transacao": "141000", "valor_venal_ref": "140782",
+          "valor_venal_ref_prop": "140782"}, 141_000.0, 140_782.0, 1.0016, False),
+        ({"valor_transacao": "27213.63", "valor_venal_ref": "129362",
+          "valor_venal_ref_prop": "129362"}, 27_213.63, 129_362.0, 0.2104, True),
+        ({"valor_transacao": "11000", "valor_venal_ref": "78220",
+          "valor_venal_ref_prop": "78220"}, 11_000.0, 78_220.0, 0.1406, True),
+        ({"valor_transacao": "0.01", "valor_venal_ref": "74529",
+          "valor_venal_ref_prop": "74529"}, 0.01, 74_529.0, 0.0, True),
+        # partilha de 50%: o integral dobra; a razão compara com a referência proporcional
+        ({"valor_transacao": "250000", "proporcao_pct": "50", "valor_venal_ref_prop": "200000"},
+         500_000.0, 400_000.0, 1.25, False),
+        ({"valor_transacao": "3000000", "valor_venal_ref_prop": "400000"},
+         3_000_000.0, 400_000.0, 7.5, True),  # acima de 5×
+        ({"valor_transacao": "200000", "valor_venal_ref_prop": "400000"},
+         200_000.0, 400_000.0, 0.5, False),  # exatamente 0,5: típico
+        # sem referência: só a regra dos R$ 5 mil
+        ({"valor_venal_ref": "0", "valor_venal_ref_prop": "0"}, 500_000.0, None, None, False),
+        ({"valor_transacao": "4000", "valor_venal_ref": None, "valor_venal_ref_prop": None},
+         4_000.0, None, None, True),
+        # proporção em branco = 100%
+        ({"proporcao_pct": None}, 500_000.0, 400_000.0, 1.25, False),
+        # fração < 10% (lote-mãe, vaga de garagem coletiva): o declarado é o preço da unidade e
+        # a referência é a do lote inteiro (não comparável)
+        ({"proporcao_pct": "0.64", "valor_venal_ref_prop": "2560"}, 500_000.0, None, None, False),
+        # proporção impossível: sem valor integral → atípico
+        ({"proporcao_pct": "150"}, None, None, None, True),
+        # na planta: a referência é a do terreno
+        ({"uso_cod": "0", "complemento": "APTO 3"}, 500_000.0, None, None, False),
+        # vaga de garagem: a referência é alta para o mercado, o piso é 0,2×
+        ({"uso_cod": "24", "complemento": "VG 3", "valor_transacao": "30000",
+          "valor_venal_ref_prop": "90000"}, 30_000.0, 400_000.0, 0.3333, False),
+        ({"uso_cod": "24", "complemento": "VG 3", "valor_transacao": "15000",
+          "valor_venal_ref_prop": "90000"}, 15_000.0, 400_000.0, 0.1667, True),
+        ({"uso_cod": "20", "complemento": "AP 3", "valor_transacao": "30000",
+          "valor_venal_ref_prop": "90000"}, 30_000.0, 400_000.0, 0.3333, True),
+    ],
+)  # fmt: skip
+def test_valor_integral_referencia_e_atipico(
+    cells: dict[str, str | None],
+    integral: float | None,
+    referencia: float | None,
+    razao: float | None,
+    atipico: bool,
+) -> None:
+    out = one(**cells)
+
+    assert out["valor_integral"] == (pytest.approx(integral) if integral is not None else None)
+    assert out["valor_referencia"] == referencia
+    assert out["razao_referencia"] == (
+        pytest.approx(razao, abs=1e-4) if razao is not None else None
+    )
+    assert out["valor_atipico"] is atipico
+
+
+def test_atipico_nao_tem_rs_m2() -> None:
+    assert one(valor_transacao="27213.63", valor_venal_ref_prop="129362")["rs_m2"] is None
+    assert one(valor_transacao="141000", valor_venal_ref_prop="140782")["rs_m2"] == 1410.0

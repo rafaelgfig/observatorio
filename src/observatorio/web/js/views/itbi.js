@@ -3,12 +3,20 @@
  * View "ITBI · São Paulo": transações imobiliárias (guias de ITBI pagas) com busca por região —
  * raio a partir de um endereço, polígono/retângulo desenhado ou distrito/subprefeitura —,
  * filtros, indicadores (mediana de R$/m²), séries mensais, tabela e exportação CSV.
+ *
+ * O mapa muda com o zoom quando não há região: abaixo de z12, o coroplético dos distritos
+ * (R$/m² mediano ou nº de transações, `/distritos` + `/areas.geojson`); de z12 a z14, a grade
+ * dos vector tiles (`itbi_agg`: nº de guias por célula, escala log.); de z14 em diante, um ponto
+ * por endereço (`itbi`), do tamanho do nº de guias e colorido pelo R$/m² mediano. Com região, os
+ * endereços da região (`/pontos`). Clicar num endereço abre a ficha com todas as guias dele
+ * (`components/location-sheet.js`).
  */
 
-import { api, isAbort, latest, toQuery } from "../api.js";
+import { api, ApiError, isAbort, latest, toQuery } from "../api.js";
 import { createAutocomplete } from "../components/autocomplete.js";
 import { columnChart, hideTooltip, horizontalBars, lineChart, showTooltip } from "../components/charts.js";
 import { createLegend, cssRamp, cssVar, stepExpression } from "../components/legend.js";
+import { createLocationSheet, formatPct, formatValor, tipoCell, unidadeCell, valorCell, valueHelp } from "../components/location-sheet.js";
 import { createTable } from "../components/table.js";
 import { debounce, el, errorNotice, field, fmt, icon, kpiTile, MONTHS, preserveFocus, showError, statusRegion } from "../dom.js";
 import { SAO_PAULO_BOUNDS } from "../map.js";
@@ -18,9 +26,12 @@ import { SAO_PAULO_BOUNDS } from "../map.js";
 /** Tipos de imóvel aceitos pela API (`queries.Tipo`); os nomes vêm de `/itbi/meta` (`tipos`). */
 const TIPO_IDS = ["apartamento", "casa", "terreno", "comercial", "garagem", "outros"];
 const DEFAULT_TIPOS = TIPO_IDS.filter((t) => t !== "garagem");
+/** Tratamento das guias de valor atípico (`queries.Atipicos`), na ordem do controle. */
+const ATIPICOS = ["excluir", "incluir", "somente"];
+/** @type {Record<string, string>} */
+const ATIPICOS_ROTULO = { excluir: "Ocultar", incluir: "Mostrar", somente: "Só atípicos" };
 /** @type {Record<string, string>} id → nome exibido (de `/itbi/meta`) */
 let tipoNome = {};
-const PRECISAO_NOME = { lote: "lote", condominio: "condomínio", quadra: "quadra", setor: "setor" };
 const POINT_LIMIT = 20000;
 const PAGE_SIZE = 50;
 const DEFAULT_RADIUS = 500;
@@ -29,24 +40,33 @@ const RADIUS_MAX = 3000;
 const RADIUS_STEP = 50;
 const YM = /^\d{4}-(0[1-9]|1[0-2])$/;
 const AREA_ID = /^[0-9A-Za-z]{1,8}$/;
-// os tiles (e o heatmap) existem a partir deste zoom (`queries.ZOOM_MIN` no servidor)
+/** Chave `local` na URL (< 2^42: até 13 dígitos). */
+const LOCAL_ID = /^\d{1,13}$/;
+// zooms dos tiles: `queries.ZOOM_MIN` e `queries.ZOOM_PONTOS` no servidor (`tests/test_frontend.py`)
 const TILE_MIN_ZOOM = 9;
+const POINTS_MIN_ZOOM = 14;
+/** Distritos → grade neste zoom, com transição cruzada de ±GRID_FADE (sem faixa vazia). */
+const GRID_ZOOM = 12;
+const GRID_FADE = 0.35;
+const DISTRICT_OPACITY = 0.82;
+const GRID_OPACITY = 0.88;
+/** Rótulo com o nº de guias nos pontos a partir deste zoom (antes colidiriam quase todos). */
+const LABEL_MIN_ZOOM = 15;
+const SP_LAT = -23.55;
 
 /**
- * Mosaico de densidade (camada `itbi_agg`, uma célula de 1/32 do tile): cada célula vira um
- * círculo sem sobreposição, colorido por ln(1 + n) relativo ao p90 de `n` naquele zoom — medido
- * na cidade inteira com os filtros padrão (2 anos, compra e venda, sem garagem, precisão até a
- * quadra → HEAT_REF_TOTAL guias) e escalado pelo total do filtro atual. Um heatmap somaria as
- * células vizinhas e saturaria a cidade inteira numa mancha só.
+ * Grade (camada `itbi_agg`: 32 × 32 células por tile): cada célula colorida por ln(1 + n)
+ * relativo ao p90 de `n` naquele zoom — medido na cidade inteira com os filtros padrão (2 anos,
+ * compra e venda, sem garagem, precisão até a quadra, sem atípicos → HEAT_REF_TOTAL guias) e
+ * escalado pelo total do filtro atual.
  */
-const HEAT_REF_TOTAL = 374_366;
-const CELL_RADIUS = 7; // px no zoom inteiro: vão de 16 px entre células, 2 px de respiro
+const HEAT_REF_TOTAL = 380_091;
+/** Endereços: limites das 7 classes de R$/m² como múltiplos da mediana da cidade (2^±⅙, ±½, ±1). */
+const POINT_FACTORS = [0.5, 0.71, 0.89, 1.12, 1.41, 2];
 const HEAT_P90 = /** @type {[number, number][]} */ ([
-  [9, 4200],
-  [10, 1200],
-  [11, 360],
-  [12, 90],
-  [13, 26],
+  [11, 377],
+  [12, 92],
+  [13, 27],
 ]);
 
 /**
@@ -70,6 +90,8 @@ const HEAT_P90 = /** @type {[number, number][]} */ ([
  * @property {number | null} areaMin    m²
  * @property {number | null} areaMax
  * @property {"lote" | "quadra" | "qualquer"} precisao
+ * @property {"excluir" | "incluir" | "somente"} atipicos
+ * @property {"rs_m2" | "n"} cor      cor do coroplético dos distritos
  * @property {Via | null} via         logradouro ou CEP escolhido na busca (centro do raio)
  * @property {boolean} soVia          filtrar só esse logradouro/CEP dentro da região
  * @property {"none" | "raio" | "polygon" | "rectangle"} ferramenta
@@ -99,22 +121,44 @@ let priceChart = null;
 let countChart = null;
 /** @type {ReturnType<typeof createTable> | null} */
 let table = null;
-/** @type {any} */
+/** @type {ReturnType<typeof createLocationSheet> | null} */
+let sheet = null;
+/** @type {any} pontos da região (`/pontos`) */
 let points = null;
-/** @type {number[]} */
-let priceBreaks = [];
+/** Limites de R$/m² dos pontos da região (quantis) — vazio: usa os da cidade. */
+let regionBreaks = /** @type {number[]} */ ([]);
+/** @type {any} resposta de `/distritos` */
+let distritos = null;
+/** @type {Map<string, any>} */
+let distritosById = new Map();
+/** @type {string | null} */
+let hoveredDistrict = null;
 let page = 1;
 let sort = { key: "data", dir: /** @type {"asc" | "desc"} */ ("desc") };
 /** @type {any} */
 let draw = null;
-/** @type {any} */
-let popup = null;
 /** Caixa [w, s, e, n] do logradouro/CEP escolhido (para o raio cobrir a rua inteira). */
 let viaBbox = /** @type {[number, number, number, number] | null} */ (null);
 /** URL atual dos vector tiles (evita recarregar os tiles quando os filtros deles não mudam). */
 let tilesUrl = "";
-/** Fator do p90 do heatmap (total do filtro / HEAT_REF_TOTAL). */
+/** Fator do p90 da grade (total do filtro / HEAT_REF_TOTAL). */
 let heatScale = 1;
+/** Guias atípicas que os filtros esconderam (`resumo.atipicos_ocultos`). */
+let atipicosOcultos = /** @type {number | null} */ (null);
+/** R$/m² mediano da cidade com os filtros atuais (`resumo.comparacao`): base da cor dos endereços. */
+let cityMedian = /** @type {number | null} */ (null);
+/** Texto digitado na busca (a escolha troca o campo pelo rótulo): de onde sai o número. */
+let typed = "";
+/** Escolha atual da busca: uma escolha nova descarta a procura do número da anterior. */
+let lookupToken = 0;
+/** Aviso da região ("Localizando o nº…", número aproximado). */
+let regiaoNote = "";
+/** Endereço da ficha aberta (anel no mapa). */
+let selected = /** @type {{ local: number, lon: number, lat: number, n: number } | null} */ (null);
+/** A ficha veio da URL: centralizar o mapa nela quando carregar. */
+let flyToSheet = false;
+/** Última legenda desenhada (nível do mapa + zoom), para redesenhar só quando muda. */
+let legendKey = "";
 /** Cancela tudo o que a montagem atual pôs no ar (desmontar = abortar). */
 let controller = /** @type {AbortController | null} */ (null);
 /** Nº da montagem atual: respostas de uma montagem anterior são descartadas. */
@@ -143,6 +187,8 @@ function defaultState() {
     areaMin: null,
     areaMax: null,
     precisao: "quadra",
+    atipicos: "excluir",
+    cor: "rs_m2",
     via: null,
     soVia: false,
     ferramenta: "none",
@@ -159,8 +205,26 @@ export function mount(context) {
   state = defaultState();
   buildPanel(context.panel);
   buildDrawer(context.mapWrap);
+  buildMapColor(context.mapWrap);
   legend = createLegend(context.mapWrap);
+  // a legenda (componente compartilhado) acaba de entrar por último: classe para a largura máxima
+  const legendCards = context.mapWrap.querySelectorAll(".map-legend");
+  legendCards[legendCards.length - 1]?.classList.add("itbi-legend");
   cleanups.push(() => legend?.remove());
+  sheet = createLocationSheet(context.mapWrap, {
+    load: (body, signal) => api("/itbi/local", { body, signal: scoped(signal) }),
+    detail: (id, signal) => api(`/itbi/transacao/${encodeURIComponent(String(id))}`, { signal: scoped(signal) }),
+    consulta,
+    tipoNome: (t) => (t ? (tipoNome[t] ?? t) : "—"),
+    regra: () => meta?.atipicos,
+    onLoad: onSheetLoad,
+    onClose: () => {
+      selected = null;
+      drawSelected();
+      ctx?.setParams({ loc: null });
+    },
+  });
+  cleanups.push(() => sheet?.destroy());
   cleanups.push(context.onStyle(addLayers));
   cleanups.push(
     context.onTheme(() => {
@@ -171,31 +235,77 @@ export function mount(context) {
     }),
   );
   bindMapEvents(context);
-  // nunca abaixo do zoom dos tiles: num mapa baixo (celular, notebook) a cidade inteira não
-  // cabe acima dele e o heatmap ficaria vazio
-  context.fit([SAO_PAULO_BOUNDS[0][0], SAO_PAULO_BOUNDS[0][1], SAO_PAULO_BOUNDS[1][0], SAO_PAULO_BOUNDS[1][1]], 12, TILE_MIN_ZOOM);
+  fitView(context);
   void start(context.params());
+}
+
+/** Caixa da cidade como [w, s, e, n]. */
+const CITY_BBOX = /** @type {[number, number, number, number]} */ ([SAO_PAULO_BOUNDS[0][0], SAO_PAULO_BOUNDS[0][1], SAO_PAULO_BOUNDS[1][0], SAO_PAULO_BOUNDS[1][1]]);
+
+/**
+ * Enquadra a cidade inteira (os distritos funcionam em qualquer zoom). Aberta direto nesta
+ * tela, o mapa pode ainda não ter tamanho (aba oculta, layout carregando) e o enquadramento
+ * falha — o `load` do mapa enquadraria o Brasil: tenta de novo no `load`/`resize` se a câmera
+ * não chegou a São Paulo.
+ * @param {ViewContext} context
+ */
+function fitView(context) {
+  const { map } = context;
+  const fitCity = () => {
+    // folga maior embaixo: a legenda e a gaveta de transações cobrem o rodapé do mapa
+    const { clientWidth: w, clientHeight: h } = map.getContainer();
+    const bottom = Math.round(w < 600 ? h * 0.3 : Math.min(130, h * 0.22));
+    if (w < 160 || h < 200) context.fit(CITY_BBOX, 11);
+    else map.fitBounds(SAO_PAULO_BOUNDS, { padding: { top: 56, bottom, left: 24, right: 24 }, maxZoom: 11, duration: 700 });
+  };
+  fitCity();
+  const retry = () => {
+    if (ctx !== context) return;
+    const { lng, lat } = map.getCenter();
+    const [w, s, e, n] = CITY_BBOX;
+    if (lng >= w - 0.3 && lng <= e + 0.3 && lat >= s - 0.3 && lat <= n + 0.3) return;
+    const geometry = state.regiao?.geometry;
+    if (geometry) context.fit(bboxOf(geometry), 17);
+    else fitCity();
+  };
+  map.once("load", retry);
+  map.once("resize", retry);
+  cleanups.push(() => {
+    map.off("load", retry);
+    map.off("resize", retry);
+  });
 }
 
 export function unmount() {
   generation += 1;
+  lookupToken += 1;
   controller?.abort();
   controller = null;
   stopDrawing();
   cleanups.forEach((fn) => fn());
   cleanups = [];
   hideTooltip();
-  popup?.remove();
-  popup = null;
   if (ctx) removeLayers(ctx);
   priceChart?.destroy();
   countChart?.destroy();
   priceChart = countChart = null;
   table = null;
+  sheet = null;
   points = null;
+  regionBreaks = [];
+  distritos = null;
+  distritosById = new Map();
+  hoveredDistrict = null;
   viaBbox = null;
   tilesUrl = "";
   heatScale = 1;
+  atipicosOcultos = null;
+  cityMedian = null;
+  typed = "";
+  regiaoNote = "";
+  selected = null;
+  flyToSheet = false;
+  legendKey = "";
   ctx = null;
 }
 
@@ -210,6 +320,7 @@ async function start(params) {
   }
   if (gen !== generation) return; // a view foi desmontada (ou remontada) enquanto o /meta carregava
   tipoNome = Object.fromEntries((meta.tipos ?? []).map((/** @type {any} */ t) => [t.id, t.nome]));
+  ui.help.replaceChildren(valueHelp(meta.atipicos));
   const min = String(meta.periodo?.min ?? "").slice(0, 7);
   state.dataFim = defaultEnd();
   state.dataIni = shiftMonth(state.dataFim, -23);
@@ -222,7 +333,13 @@ async function start(params) {
   renderTools();
   renderRegiao();
   renderFilters();
+  renderMapColor();
   refresh();
+  const loc = params.get("loc");
+  if (loc && LOCAL_ID.test(loc)) {
+    flyToSheet = true;
+    sheet?.open(Number(loc), { focus: false });
+  }
 }
 
 /**
@@ -251,6 +368,9 @@ async function applyParams(p) {
   normalizeRanges();
   const prec = p.get("prec");
   if (prec === "lote" || prec === "qualquer") state.precisao = prec;
+  const at = p.get("at");
+  if (at === "incluir" || at === "somente") state.atipicos = at;
+  if (p.get("cor") === "n") state.cor = "n";
   const lg = p.get("lg");
   const cep = p.get("cep");
   if (lg) state.via = { tipo: "logradouro", id: lg };
@@ -263,11 +383,11 @@ async function applyParams(p) {
     const [lon, lat, r] = c.split(",").map(Number);
     if ([lon, lat, r].every(Number.isFinite) && Math.abs(lon) <= 180 && Math.abs(lat) <= 85) {
       state.raio = clampRadius(r);
-      setCircle(lon, lat, p.get("cl") ?? "Ponto no mapa", true);
+      setCircle(lon, lat, p.get("cl") ?? "Ponto no mapa", !p.get("loc"));
     }
   } else if ((d && AREA_ID.test(d)) || (s && AREA_ID.test(s))) {
     const tipo = d && AREA_ID.test(d) ? "distrito" : "subprefeitura";
-    await setDistrict(tipo, String(tipo === "distrito" ? d : s), true);
+    await setDistrict(tipo, String(tipo === "distrito" ? d : s), !p.get("loc"));
   }
   // logradouro/CEP só fazem sentido como centro de um raio
   if (state.regiao?.tipo !== "circulo") {
@@ -339,6 +459,8 @@ function syncParams() {
     amin: state.areaMin,
     amax: state.areaMax,
     prec: state.precisao === "quadra" ? null : state.precisao,
+    at: state.atipicos === "excluir" ? null : state.atipicos,
+    cor: state.cor === "n" ? "n" : null,
     lg: state.via?.tipo === "logradouro" ? state.via.id : null,
     cep: state.via?.tipo === "cep" ? state.via.id : null,
     so: state.soVia ? "1" : null,
@@ -370,6 +492,13 @@ function monthEnd(/** @type {string} */ ym) {
   return `${ym}-${String(d.getUTCDate()).padStart(2, "0")}`;
 }
 
+/** "2026-07-31" → "jul/2026". */
+function monthYear(/** @type {string | null | undefined} */ iso) {
+  if (!iso) return "";
+  const [y, m] = iso.split("-").map(Number);
+  return `${MONTHS[m - 1]}/${y}`;
+}
+
 /** Corpo `ConsultaItbi` da API. */
 function consulta() {
   return {
@@ -385,7 +514,24 @@ function consulta() {
     logradouro: state.soVia && state.via?.tipo === "logradouro" ? state.via.id : null,
     cep: state.soVia && state.via?.tipo === "cep" ? state.via.id : null,
     precisao: state.precisao,
+    atipicos: state.atipicos,
   };
+}
+
+/**
+ * Separa o número do fim de um endereço digitado ("Rua Inacio Monteiro, 600" → rua + 600). Sem
+ * vírgula, só quando sobram ao menos duas palavras ("Rua 7" continua sendo o nome da rua); CEPs
+ * (só dígitos) ficam como estão.
+ * @param {string} text
+ * @returns {{ rua: string, numero: number | null }}
+ */
+function splitAddress(text) {
+  const t = text.trim();
+  const m = /^(.*\p{L}.*?)(\s*,\s*|\s+)(?:n[º°o]?\.?\s*)?(\d{1,5})$/iu.exec(t);
+  if (!m) return { rua: t, numero: null };
+  const rua = m[1].replace(/[\s,]+n[º°o]?\.?$/iu, "").trim();
+  if (!m[2].includes(",") && rua.split(/\s+/).length < 2) return { rua: t, numero: null };
+  return { rua, numero: Number(m[3]) };
 }
 
 // ------------------------------------------------------------------ painel
@@ -395,13 +541,18 @@ function buildPanel(panel) {
   const input = el("input", {
     className: "input",
     type: "search",
-    placeholder: "Rua, CEP, distrito ou subprefeitura",
-    "aria-label": "Buscar rua, CEP, distrito ou subprefeitura",
+    placeholder: "Rua e número, CEP, distrito ou subprefeitura",
+    "aria-label": "Buscar endereço (rua e número), CEP, distrito ou subprefeitura",
+  });
+  // a escolha troca o texto do campo pelo rótulo (sem disparar "input"): `typed` guarda o número
+  input.addEventListener("input", () => {
+    typed = input.value;
   });
   const combobox = el("div", { className: "combobox" }, [el("span", { className: "combobox-icon" }, [icon("search")]), input]);
   const auto = createAutocomplete({
     input,
-    search: (q, signal) => api("/busca", { params: { q, escopo: "itbi", limite: 8 }, signal }),
+    // o número não está nos nomes da busca: vai só a rua ("Rua X, 600" → "Rua X")
+    search: (q, signal) => api("/busca", { params: { q: splitAddress(q).rua || q, escopo: "itbi", limite: 8 }, signal }),
     view: (/** @type {any} */ item) => ({
       label: item.rotulo,
       detail: item.detalhe ?? "",
@@ -409,22 +560,33 @@ function buildPanel(panel) {
     }),
     onSelect: (/** @type {any} */ item) => void selectPlace(item),
   });
+  ui.search = auto;
+  ui.searchInput = input;
   cleanups.push(() => auto.destroy());
 
   ui.regiao = el("div", { className: "section" });
   ui.tools = el("div", { className: "section" });
   ui.filters = el("div", { className: "section" });
   ui.status = statusRegion();
-  // erros de pontos/tabela à parte: o resumo, ao chegar, só limpa os avisos dele
+  // erros de pontos/tabela/distritos à parte: o resumo, ao chegar, só limpa os avisos dele
   ui.errors = el("div");
   ui.notice = el("div");
   // aviso de pontos cortados: separado de `notice` (que o resumo limpa ao chegar)
   ui.pointsNote = el("div");
+  ui.compare = el("div", { className: "itbi-compare" });
   ui.kpis = el("div", { className: "tiles" });
+  ui.help = el("div");
   ui.price = el("div");
   ui.count = el("div");
   ui.partialNote = el("p", { className: "section-subtitle" });
   ui.tipos = el("div");
+  ui.ranking = el("div");
+  ui.rankingNote = el("p", { className: "section-subtitle" });
+  ui.rankingSection = el("section", { className: "section", "aria-labelledby": "itbi-ranking-title" }, [
+    el("h2", { className: "section-title", id: "itbi-ranking-title", textContent: "Distritos por R$/m² mediano" }),
+    ui.rankingNote,
+    ui.ranking,
+  ]);
 
   panel.append(
     el("div", {}, [
@@ -442,7 +604,8 @@ function buildPanel(panel) {
     ui.errors,
     ui.notice,
     ui.pointsNote,
-    el("section", { className: "section", "aria-label": "Indicadores" }, [ui.kpis]),
+    el("section", { className: "section", "aria-label": "Indicadores" }, [ui.compare, ui.kpis, ui.help]),
+    ui.rankingSection,
     el("section", { className: "section" }, [
       el("h2", { className: "section-title", textContent: "R$/m² mediano por mês" }),
       ui.price,
@@ -454,7 +617,7 @@ function buildPanel(panel) {
     ]),
     el("section", { className: "section" }, [
       el("h2", { className: "section-title", textContent: "Por tipo de imóvel" }),
-      el("p", { className: "section-subtitle", textContent: "Número de transações, com o valor e o R$/m² medianos" }),
+      el("p", { className: "section-subtitle", textContent: "Número de transações, com o valor (a 100%) e o R$/m² medianos" }),
       ui.tipos,
     ]),
     el("p", { className: "section-subtitle" }, [
@@ -467,7 +630,7 @@ function buildPanel(panel) {
       }),
       " (valores declarados pelo contribuinte) e ",
       el("a", { href: "https://geosampa.prefeitura.sp.gov.br", target: "_blank", rel: "noopener", textContent: "GeoSampa" }),
-      " (localização pelo lote). R$/m² usa a área construída (terrenos: área do terreno); unidades na planta ficam fora.",
+      " (localização pelo lote). R$/m² usa a área construída (terrenos: área do terreno); unidades na planta e guias atípicas ficam fora.",
     ]),
   );
 
@@ -509,7 +672,7 @@ function buildTools() {
         ? "Clique para adicionar vértices; clique no primeiro ponto para fechar."
         : state.ferramenta === "rectangle"
           ? "Clique em dois cantos opostos."
-          : "Escolha uma ferramenta ou busque um endereço acima.";
+          : "Escolha uma ferramenta, clique num distrito ou busque um endereço acima.";
 
   ui.tools.replaceChildren(
     el("h2", { className: "section-title", textContent: "Região" }),
@@ -529,12 +692,16 @@ function renderRegiao() {
 
 function buildRegiao() {
   const r = state.regiao;
+  const note = regiaoNote ? el("p", { className: "section-subtitle itbi-regiao-note", textContent: regiaoNote }) : null;
   if (!r) {
     ui.regiao.replaceChildren(
-      el("p", {
-        className: "muted",
-        textContent: "Sem região: os números consideram a cidade inteira e o mapa mostra a densidade de transações.",
-      }),
+      ...[
+        el("p", {
+          className: "muted",
+          textContent: "Sem região: os números são da cidade inteira. Afastado, o mapa mostra os distritos; aproxime para a grade e, depois, para cada endereço.",
+        }),
+        note,
+      ].filter((c) => c !== null),
     );
     return;
   }
@@ -544,6 +711,7 @@ function buildRegiao() {
       el("span", { className: "listbox-kind", textContent: { circulo: "Raio", poligono: "Desenho", distrito: "Distrito", subprefeitura: "Subpref." }[r.tipo] }),
       el("strong", { textContent: r.label }),
     ]),
+    note,
   ];
   if (r.tipo === "circulo") {
     const value = el("span", { className: "muted", textContent: formatRadius(state.raio) });
@@ -697,6 +865,21 @@ function buildFilters() {
     refresh();
   });
 
+  const atipicos = el(
+    "div",
+    { className: "segmented", role: "radiogroup", "aria-label": "Valores atípicos" },
+    ATIPICOS.map((value) => {
+      const input = el("input", { type: "radio", name: "itbi-atipicos", value, checked: state.atipicos === value, dataset: { focusKey: `atipicos-${value}` } });
+      input.addEventListener("change", () => {
+        state.atipicos = /** @type {State["atipicos"]} */ (value);
+        renderFilters();
+        refresh();
+      });
+      return el("label", {}, [input, el("span", { textContent: ATIPICOS_ROTULO[value] })]);
+    }),
+  );
+  ui.atipicosNote = el("p", { className: "section-subtitle", textContent: atipicosText() });
+
   const numberInput = (/** @type {number | null} */ value, /** @type {string} */ label, /** @type {string} */ name, /** @type {(v: number | null) => void} */ set) => {
     const node = el("input", { className: "input", type: "number", min: "0", inputMode: "numeric", value: value == null ? "" : String(value), placeholder: label, "aria-label": name, dataset: { focusKey: name } });
     node.addEventListener("change", () => {
@@ -714,15 +897,62 @@ function buildFilters() {
     presetRow,
     field("Tipo de imóvel", tipoChips),
     el("div", { className: "grid-2" }, [field("Natureza", natureza), field("Localização", precisao)]),
+    field("Valores atípicos (muito abaixo ou acima da referência)", atipicos),
+    ui.atipicosNote,
     el("div", { className: "grid-2" }, [
-      field("Valor mín. (R$ mil)", numberInput(state.valorMin, "mín.", "Valor mínimo em R$ mil", (v) => (state.valorMin = v))),
-      field("Valor máx. (R$ mil)", numberInput(state.valorMax, "máx.", "Valor máximo em R$ mil", (v) => (state.valorMax = v))),
+      field("Valor mín. (R$ mil, a 100%)", numberInput(state.valorMin, "mín.", "Valor mínimo em R$ mil", (v) => (state.valorMin = v))),
+      field("Valor máx. (R$ mil, a 100%)", numberInput(state.valorMax, "máx.", "Valor máximo em R$ mil", (v) => (state.valorMax = v))),
     ]),
     el("div", { className: "grid-2" }, [
       field("Área mín. (m²)", numberInput(state.areaMin, "mín.", "Área mínima em m²", (v) => (state.areaMin = v))),
       field("Área máx. (m²)", numberInput(state.areaMax, "máx.", "Área máxima em m²", (v) => (state.areaMax = v))),
     ]),
   );
+}
+
+/** Nota sob o controle de atípicos (com quantas o filtro escondeu). */
+function atipicosText() {
+  if (state.atipicos === "incluir") return "As atípicas entram nas contagens, no mapa e na tabela (marcadas); o R$/m² delas não é calculado.";
+  if (state.atipicos === "somente") return "Só as guias atípicas — cessões de saldo, valores simbólicos… Elas não têm R$/m².";
+  if (atipicosOcultos == null) return "Guias com valor declarado muito abaixo ou acima da referência ficam de fora.";
+  if (!atipicosOcultos) return "Nenhuma guia atípica nesta seleção.";
+  return `${fmt.int(atipicosOcultos)} ${atipicosOcultos === 1 ? "guia atípica ficou" : "guias atípicas ficaram"} de fora (valor muito abaixo ou acima da referência).`;
+}
+
+/** Controle "Cor do mapa" (só com os distritos à vista). */
+function buildMapColor(/** @type {HTMLElement} */ host) {
+  /** @type {HTMLInputElement[]} */
+  const inputs = [];
+  const seg = el(
+    "div",
+    { className: "segmented", role: "radiogroup", "aria-label": "Cor do mapa" },
+    /** @type {[State["cor"], string][]} */ ([
+      ["rs_m2", "R$/m²"],
+      ["n", "Transações"],
+    ]).map(([value, label]) => {
+      const input = el("input", { type: "radio", name: "itbi-cor", value, checked: state.cor === value });
+      input.addEventListener("change", () => {
+        state.cor = value;
+        syncParams();
+        applyDistrictStates();
+        paintDistricts();
+        renderLegend(true);
+      });
+      inputs.push(input);
+      return el("label", {}, [input, el("span", { textContent: label })]);
+    }),
+  );
+  ui.mapColorInputs = inputs;
+  ui.mapColor = el("div", { className: "map-card itbi-mapcolor" }, [el("span", { className: "itbi-mapcolor-label", textContent: "Cor do mapa", "aria-hidden": "true" }), seg]);
+  ui.mapColor.hidden = true;
+  host.append(ui.mapColor);
+  cleanups.push(() => ui.mapColor?.remove());
+}
+
+function renderMapColor() {
+  if (!ui.mapColor) return;
+  ui.mapColor.hidden = mapLevel() !== "distritos";
+  for (const input of /** @type {HTMLInputElement[]} */ (ui.mapColorInputs ?? [])) input.checked = input.value === state.cor;
 }
 
 // ------------------------------------------------------------------ região
@@ -732,24 +962,87 @@ async function selectPlace(place) {
   stopDrawing();
   state.ferramenta = "none";
   if (ctx) ctx.map.getCanvas().style.cursor = "";
+  const token = ++lookupToken;
   if (place.tipo === "distrito" || place.tipo === "subprefeitura") {
-    state.via = null;
-    state.soVia = false;
-    viaBbox = null;
-    const gen = generation;
-    const pedido = String(place.id);
-    await setDistrict(place.tipo, pedido, true);
-    // montagem nova, ou outra escolha chegou depois desta
-    if (gen !== generation || state.regiao?.payload?.id !== pedido) return;
-  } else if (place.lon != null && place.lat != null) {
-    const tipo = place.tipo === "logradouro" || place.tipo === "cep" ? place.tipo : null;
-    state.via = tipo ? { tipo, id: String(place.id) } : null;
-    state.soVia = false;
-    viaBbox = tipo && Array.isArray(place.bbox) ? place.bbox : null;
-    setCircle(place.lon, place.lat, place.rotulo, true);
-  } else {
+    await chooseArea(place.tipo, String(place.id));
     return;
   }
+  if (place.lon == null || place.lat == null) return;
+  const tipo = place.tipo === "logradouro" || place.tipo === "cep" ? place.tipo : null;
+  state.via = tipo ? { tipo, id: String(place.id) } : null;
+  state.soVia = false;
+  viaBbox = tipo && Array.isArray(place.bbox) ? place.bbox : null;
+  regiaoNote = "";
+  const numero = tipo === "logradouro" ? splitAddress(typed).numero : null;
+  if (numero == null) {
+    setCircle(place.lon, place.lat, place.rotulo, true);
+    renderTools();
+    renderRegiao();
+    refresh();
+    return;
+  }
+  // "Rua X, 600": centraliza o raio no número e abre a ficha do endereço
+  ui.search?.setText(`${place.rotulo}, ${numero}`);
+  regiaoNote = `Localizando o nº ${numero}…`;
+  renderTools();
+  renderRegiao();
+  const found = await locateNumber(String(place.id), numero, token);
+  if (token !== lookupToken || !ctx) return; // outra escolha (ou outra montagem) veio depois
+  if (found) {
+    // número exato: a ficha abre e o mapa vai até o endereço, ao lado dela (sem enquadrar o raio)
+    setCircle(found.lon, found.lat, found.exato ? `${place.rotulo}, ${numero}` : `${place.rotulo}, ${numero} (aprox.)`, !found.exato);
+    regiaoNote = found.exato ? "" : `Nenhuma guia no nº ${numero}: o raio está no nº ${found.n}, o mais próximo com guias.`;
+  } else {
+    setCircle(place.lon, place.lat, place.rotulo, true);
+    regiaoNote = `Nenhuma guia localizada perto do nº ${numero} desta rua: o raio está no centro dela.`;
+  }
+  ui.status.announce(regiaoNote || `${place.rotulo}, ${numero}`);
+  renderRegiao();
+  refresh();
+  if (found?.exato) {
+    flyToSheet = true;
+    sheet?.open(found.local);
+  }
+}
+
+/**
+ * Procura o número entre todas as guias da rua (`GET /itbi/endereco`, sem os filtros do painel):
+ * o local com mais guias nesse número ou, sem guias nele, o do número mais próximo (até 300).
+ * @param {string} logradouro  id da busca (`R INACIO MONTEIRO`)
+ * @param {number} numero
+ * @param {number} token
+ * @returns {Promise<{ lon: number, lat: number, local: number, n: number, exato: boolean } | null>}
+ */
+async function locateNumber(logradouro, numero, token) {
+  try {
+    const data = await api("/itbi/endereco", { params: { logradouro, numero }, signal: scoped() });
+    if (token !== lookupToken) return null;
+    return { lon: Number(data.lon), lat: Number(data.lat), local: Number(data.local), n: Number(data.numero), exato: Boolean(data.exato) };
+  } catch (error) {
+    // 404: nenhuma guia geocodificada perto do número
+    if (!isAbort(error) && !(error instanceof ApiError && error.status === 404)) console.warn("busca do número:", error);
+    return null;
+  }
+}
+
+/**
+ * Seleciona um distrito/subprefeitura como região (busca, coroplético ou ranking).
+ * @param {"distrito" | "subprefeitura"} tipo
+ * @param {string} id
+ */
+async function chooseArea(tipo, id) {
+  lookupToken += 1;
+  stopDrawing();
+  state.ferramenta = "none";
+  if (ctx) ctx.map.getCanvas().style.cursor = "";
+  state.via = null;
+  state.soVia = false;
+  viaBbox = null;
+  regiaoNote = "";
+  const gen = generation;
+  await setDistrict(tipo, id, true);
+  // montagem nova, ou outra escolha chegou depois desta
+  if (gen !== generation || state.regiao?.payload?.id !== id) return;
   renderTools();
   renderRegiao();
   refresh();
@@ -802,6 +1095,8 @@ function setPolygon(geometry) {
   state.via = null;
   state.soVia = false;
   viaBbox = null;
+  regiaoNote = "";
+  lookupToken += 1;
   drawRegiao();
   renderTools();
   renderRegiao();
@@ -810,15 +1105,20 @@ function setPolygon(geometry) {
 
 function clearRegiao() {
   stopDrawing();
+  lookupToken += 1;
   state.regiao = null;
   state.via = null;
   state.soVia = false;
   viaBbox = null;
+  regiaoNote = "";
   state.ferramenta = "none";
   if (ctx) ctx.map.getCanvas().style.cursor = "";
   drawRegiao();
+  // "Limpar" fica desabilitado sem região: o foco do teclado vai para a busca, não para o <body>
+  const clearHadFocus = document.activeElement instanceof HTMLElement && document.activeElement.dataset.focusKey === "tool-limpar";
   renderTools();
   renderRegiao();
+  if (clearHadFocus) ui.searchInput?.focus({ preventScroll: true });
   refresh();
 }
 
@@ -864,6 +1164,7 @@ function setTool(tool) {
   stopDrawing();
   state.ferramenta = tool;
   if (ctx) ctx.map.getCanvas().style.cursor = tool === "raio" ? "crosshair" : "";
+  hideTooltip();
   if (tool === "polygon" || tool === "rectangle") void startDrawing(tool);
   renderTools();
 }
@@ -922,14 +1223,20 @@ function refresh(options = {}) {
   void loadSummary();
   void loadPoints();
   void loadTable();
+  void loadDistritos();
   updateTiles();
+  updateVisibility();
+  renderRanking();
+  renderMapColor();
+  renderLegend(true);
+  sheet?.refresh();
 }
 
 const fetchSummary = latest((signal) => api("/itbi/resumo", { body: consulta(), signal: scoped(signal) }));
 
 async function loadSummary() {
   const gen = generation;
-  const busy = [ui.kpis, ui.price, ui.count, ui.tipos];
+  const busy = [ui.kpis, ui.compare, ui.price, ui.count, ui.tipos];
   busy.forEach((n) => n.classList.add("is-loading"));
   try {
     const data = await fetchSummary();
@@ -968,6 +1275,29 @@ async function loadPoints() {
   }
 }
 
+// o coroplético usa os filtros sem a região (e sem logradouro/CEP, que só valem dentro do raio)
+const fetchDistritos = latest((signal) =>
+  api("/itbi/distritos", { body: { consulta: { ...consulta(), area: null, logradouro: null, cep: null }, nivel: "distrito" }, signal: scoped(signal) }),
+);
+
+async function loadDistritos() {
+  const gen = generation;
+  try {
+    const data = await fetchDistritos();
+    if (gen !== generation) return;
+    distritos = data;
+    distritosById = new Map((data.areas ?? []).map((/** @type {any} */ a) => [String(a.id), a]));
+    ui.errors.querySelector("[data-erro='distritos']")?.remove();
+    applyDistrictStates();
+    paintDistricts();
+    paintPoints();
+    renderRanking();
+  } catch (error) {
+    if (isAbort(error) || gen !== generation) return;
+    showBlockError("distritos", error, "Não foi possível carregar os distritos: ");
+  }
+}
+
 const fetchRows = latest((signal) =>
   api("/itbi/transacoes", {
     body: { consulta: consulta(), pagina: page, por_pagina: PAGE_SIZE, ordem: sort.key, direcao: sort.dir },
@@ -997,7 +1327,7 @@ async function loadTable() {
 }
 
 /**
- * Erro de um bloco (pontos ou tabela), no contêiner de erros e com `role="alert"`.
+ * Erro de um bloco (pontos, tabela, distritos), no contêiner de erros e com `role="alert"`.
  * @param {string} key
  * @param {unknown} error
  * @param {string} prefix
@@ -1015,18 +1345,27 @@ function renderSummary(data) {
   const p = data.precisao ?? {};
   const located = (p.lote ?? 0) + (p.quadra ?? 0) + (p.aproximado ?? 0);
   const exact = total ? ((p.lote ?? 0) / total) * 100 : null;
+  const c = data.comparacao ?? {};
   ui.kpis.replaceChildren(
     kpiTile("Transações", fmt.int(total), state.regiao ? state.regiao.label : "cidade inteira", true),
-    kpiTile("Valor mediano", fmt.brlCompact(data.valor_mediano)),
-    kpiTile("R$/m² mediano", fmt.brl(data.rs_m2_mediano)),
+    kpiTile("Valor mediano", fmt.brlCompact(data.valor_mediano), "declarado, levado a 100%"),
+    kpiTile("R$/m² mediano", fmt.brl(data.rs_m2_mediano), state.regiao && c.cidade_rs_m2_mediano != null ? `cidade: ${fmt.brl(c.cidade_rs_m2_mediano)}` : null),
     kpiTile("Área mediana", data.area_mediana == null ? "—" : `${fmt.int(data.area_mediana)} m²`),
-    kpiTile("Volume total", total ? fmt.brlCompact(data.valor_total) : "—"),
+    kpiTile("Volume declarado", total ? fmt.brlCompact(data.valor_total) : "—", total ? "soma dos valores declarados" : null),
     kpiTile(
       "Localização exata",
       exact == null ? "—" : `${fmt.int(exact)}%`,
       !total ? null : located < total ? `${fmt.int(total - located)} sem coordenada` : "no lote ou condomínio",
     ),
   );
+  renderCompare(data);
+  atipicosOcultos = state.atipicos === "excluir" ? Number(data.atipicos_ocultos ?? 0) : null;
+  if (ui.atipicosNote) ui.atipicosNote.textContent = atipicosText();
+  const median = c.cidade_rs_m2_mediano ?? (state.regiao ? null : data.rs_m2_mediano);
+  if (median !== cityMedian) {
+    cityMedian = median ?? null;
+    paintPoints();
+  }
   if (!total) {
     ui.notice.replaceChildren(el("div", { className: "notice", textContent: "Nenhuma transação com esses filtros nesta região e período." }));
   }
@@ -1064,12 +1403,84 @@ function renderSummary(data) {
     (v) => fmt.int(v),
   );
 
-  // o heatmap (sem região) usa os mesmos filtros do resumo (`tileUrl`): a escala segue o total
+  // a grade (sem região) usa os mesmos filtros do resumo (`tileUrl`): a escala segue o total
   if (!state.regiao) {
     heatScale = total / HEAT_REF_TOTAL;
-    paintHeat();
-    renderLegend();
+    paintGrid();
+    renderLegend(true);
   }
+}
+
+/**
+ * Comparação da seleção: R$/m² contra a cidade (mesmos filtros) e variação em 12 meses.
+ * @param {any} data  resposta de `/resumo`
+ */
+function renderCompare(data) {
+  const c = data.comparacao ?? {};
+  /** @type {string[]} */
+  const chips = [];
+  if (state.regiao && data.rs_m2_mediano != null && c.cidade_rs_m2_mediano) {
+    const d = data.rs_m2_mediano / c.cidade_rs_m2_mediano - 1;
+    chips.push(Math.abs(d) < 0.005 ? "R$/m² igual ao da cidade" : `R$/m² ${fmt.int(Math.abs(d) * 100)}% ${d < 0 ? "abaixo" : "acima"} da cidade`);
+  }
+  if (c.variacao_12m != null) chips.push(`${formatPct(c.variacao_12m)} em 12 meses${state.regiao ? "" : " na cidade"}`);
+  /** @type {string | null} */
+  let detail = null;
+  if (c.variacao_12m != null) {
+    detail = `R$/m² mediano nos 12 meses até ${monthYear(c.variacao_fim)}: ${fmt.brl(c.rs_m2_12m)}, contra ${fmt.brl(c.rs_m2_12m_anterior)} nos 12 anteriores.`;
+  } else if (state.regiao && Number(data.total ?? 0) > 0) {
+    detail = "Variação em 12 meses: guias com R$/m² insuficientes (mínimo de 20 em cada janela).";
+  }
+  ui.compare.replaceChildren(
+    ...[
+      chips.length ? el("div", { className: "chips" }, chips.map((t) => el("span", { className: "itbi-chip", textContent: t }))) : null,
+      detail ? el("p", { className: "section-subtitle", textContent: detail }) : null,
+    ].filter((n) => n !== null),
+  );
+}
+
+/** Ranking dos distritos por R$/m² (sem região): os 5 mais caros, os 5 mais baratos e todos. */
+function renderRanking() {
+  if (!ui.rankingSection) return;
+  ui.rankingSection.hidden = Boolean(state.regiao);
+  if (state.regiao) return;
+  if (!distritos) {
+    ui.rankingNote.textContent = "";
+    ui.ranking.replaceChildren(el("p", { className: "muted", textContent: "Carregando…" }));
+    return;
+  }
+  const nMin = Number(distritos.n_min ?? 20);
+  ui.rankingNote.textContent = `Com os filtros do painel; só distritos com ao menos ${fmt.int(nMin)} guias. Clique para selecionar.`;
+  const validas = /** @type {any[]} */ (distritos.areas ?? [])
+    .filter((a) => a.n >= nMin && a.rs_m2_mediano != null)
+    .sort((a, b) => b.rs_m2_mediano - a.rs_m2_mediano);
+  if (!validas.length) {
+    ui.ranking.replaceChildren(el("p", { className: "muted", textContent: "Sem R$/m² com estes filtros." }));
+    return;
+  }
+  const item = (/** @type {any} */ a, /** @type {string} */ group) => {
+    const detail = [`${fmt.int(a.n)} ${a.n === 1 ? "guia" : "guias"}`, a.variacao_12m != null ? `${formatPct(a.variacao_12m)} em 12 meses` : null].filter(Boolean).join(" · ");
+    const button = el("button", { className: "rank-button", type: "button", dataset: { focusKey: `dist-${group}-${a.id}` } }, [
+      el("span", { className: "rank-name" }, [a.nome, el("small", { textContent: detail })]),
+      el("span", { className: "rank-value", textContent: `${fmt.brl(a.rs_m2_mediano)}/m²` }),
+    ]);
+    button.addEventListener("click", () => void chooseArea("distrito", String(a.id)));
+    return el("li", { className: "rank-item" }, [button]);
+  };
+  const all = el("ol", { className: "rank-list itbi-rank" });
+  const more = el("details", { className: "itbi-rank-all" }, [el("summary", { textContent: `Todos os ${fmt.int(validas.length)} distritos` }), all]);
+  more.addEventListener("toggle", () => {
+    if (more.open && !all.firstChild) all.append(...validas.map((a) => item(a, "todos")));
+  });
+  preserveFocus(ui.ranking, () =>
+    ui.ranking.replaceChildren(
+      el("h3", { className: "itbi-rank-title", textContent: "Maior R$/m²" }),
+      el("ol", { className: "rank-list itbi-rank" }, validas.slice(0, 5).map((a) => item(a, "topo"))),
+      el("h3", { className: "itbi-rank-title", textContent: "Menor R$/m²" }),
+      el("ol", { className: "rank-list itbi-rank" }, validas.slice(-5).reverse().map((a) => item(a, "base"))),
+      more,
+    ),
+  );
 }
 
 /**
@@ -1176,12 +1587,17 @@ function buildDrawer(host) {
     caption: "Transações filtradas",
     columns: [
       { key: "data", label: "Data", sortKey: "data", render: (r) => fmt.date(r.data) },
-      { key: "endereco", label: "Endereço" },
-      { key: "complemento", label: "Compl.", render: (r) => r.complemento ?? "" },
-      { key: "tipo", label: "Tipo", render: (r) => `${tipoNome[r.tipo] ?? r.tipo ?? ""}${r.na_planta ? " (na planta)" : ""}` },
+      {
+        key: "endereco",
+        label: "Endereço",
+        render: (r) => (r.edificio ? el("span", { className: "itbi-addr" }, [el("span", { textContent: r.endereco ?? "—" }), el("small", { textContent: r.edificio })]) : (r.endereco ?? "—")),
+      },
+      { key: "bloco", label: "Bloco", render: (r) => r.bloco ?? "—" },
+      { key: "unidade", label: "Unidade", render: (r) => unidadeCell(r) },
+      { key: "tipo", label: "Tipo", render: (r) => tipoCell(r, tipoNome[r.tipo] ?? r.tipo ?? "") },
       // mesma área da ordenação `area` da API: construída, ou a do terreno para terrenos
       { key: "area", label: "Área (m²)", num: true, sortKey: "area", render: (r) => formatArea(r.tipo === "terreno" ? r.area_terreno : r.area_construida) },
-      { key: "valor", label: "Valor", num: true, sortKey: "valor", render: (r) => fmt.brl(r.valor) },
+      { key: "valor", label: "Valor declarado", num: true, sortKey: "valor", render: (r) => valorCell(r) },
       { key: "rs_m2", label: "R$/m²", num: true, sortKey: "rs_m2", render: (r) => fmt.brl(r.rs_m2) },
     ],
     onSort: (key, dir) => {
@@ -1193,12 +1609,12 @@ function buildDrawer(host) {
       page = next;
       void loadTable();
     },
-    rowLabel: "Ver no mapa",
+    rowLabel: "Abrir a ficha do endereço",
     onRowClick: (row) => {
-      if (row.lon != null && row.lat != null && ctx) {
-        ctx.map.flyTo({ center: [row.lon, row.lat], zoom: Math.max(ctx.map.getZoom(), 17) });
-        void openPopup(row.id, [row.lon, row.lat]);
-      }
+      if (row.local == null || !ctx) return;
+      if (row.lon != null && row.lat != null) flyTo([row.lon, row.lat]);
+      table?.select(row.id);
+      sheet?.open(Number(row.local), { highlight: row.id });
     },
   });
   table.setSort(sort.key, sort.dir);
@@ -1209,12 +1625,74 @@ function formatArea(/** @type {number | null | undefined} */ v) {
   return v ? fmt.int(v) : "—";
 }
 
+// ------------------------------------------------------------------ ficha do endereço
+
+/** @param {any} res  resposta de `/local` */
+function onSheetLoad(res) {
+  const novo = res.local !== selected?.local;
+  // o anel acompanha o tamanho do ponto, que conta as guias com os filtros (não todas do local)
+  const n = Math.max(1, Number(res.resumo?.n ?? 1));
+  selected = res.lon != null && res.lat != null ? { local: res.local, lon: res.lon, lat: res.lat, n } : null;
+  drawSelected();
+  ctx?.setParams({ loc: String(res.local) });
+  if (selected && (flyToSheet || novo)) {
+    if (flyToSheet) flyTo([selected.lon, selected.lat]);
+    else keepVisible([selected.lon, selected.lat]);
+  }
+  flyToSheet = false;
+}
+
+/** Largura da ficha quando ela cobre a direita do mapa (no celular ela sobe do rodapé: 0). */
+function sheetSide() {
+  const sheetEl = /** @type {HTMLElement | null} */ (ctx?.mapWrap.querySelector(".sheet"));
+  return sheetEl && !sheetEl.hidden && getComputedStyle(sheetEl).position === "absolute" ? sheetEl.offsetWidth + 12 : 0;
+}
+
+/**
+ * Centraliza o mapa num endereço (z ≥ 17) — à esquerda da ficha, quando ela cobre a direita.
+ * @param {[number, number]} center
+ */
+function flyTo(center) {
+  if (!ctx) return;
+  ctx.map.flyTo({ center, zoom: Math.max(ctx.map.getZoom(), 17), offset: [-sheetSide() / 2, 0], duration: 900 });
+}
+
+/**
+ * Endereço clicado que ficou embaixo da ficha: desliza o mapa até ele aparecer ao lado dela.
+ * @param {[number, number]} lngLat
+ */
+function keepVisible(lngLat) {
+  if (!ctx) return;
+  const side = sheetSide();
+  if (!side) return;
+  const { x } = ctx.map.project(lngLat);
+  if (x < ctx.map.getContainer().clientWidth - side - 24) return;
+  ctx.map.easeTo({ center: lngLat, offset: [-side / 2, 0], duration: 600 });
+}
+
 // ------------------------------------------------------------------ mapa
 
 const SRC_TILES = "itbi-tiles";
 const SRC_POINTS = "itbi-points";
 const SRC_AREA = "itbi-area";
-const LAYERS = ["itbi-heat", "itbi-tile-points", "itbi-points", "itbi-area-fill", "itbi-area-line"];
+const SRC_DIST = "itbi-distritos";
+const SRC_SEL = "itbi-selected";
+const L = {
+  distFill: "itbi-dist-fill",
+  distLine: "itbi-dist-line",
+  distHover: "itbi-dist-hover",
+  grid: "itbi-grid",
+  areaFill: "itbi-area-fill",
+  areaLine: "itbi-area-line",
+  tilePoints: "itbi-tile-points",
+  tileLabels: "itbi-tile-labels",
+  points: "itbi-points",
+  pointLabels: "itbi-point-labels",
+  selected: "itbi-selected",
+};
+/** Camadas da cidade inteira (somem com uma região). */
+const CITY_LAYERS = [L.distFill, L.distLine, L.distHover, L.grid, L.tilePoints, L.tileLabels];
+const REGION_LAYERS = [L.points, L.pointLabels];
 
 /** URL dos tiles com os filtros da consulta, exceto a área (`FiltroTile`). */
 function tileUrl() {
@@ -1231,8 +1709,44 @@ function tileUrl() {
     logradouro: c.logradouro,
     cep: c.cep,
     precisao: c.precisao === "quadra" ? undefined : c.precisao,
+    atipicos: c.atipicos === "excluir" ? undefined : c.atipicos,
   });
   return `${location.origin}/api/itbi/tiles/{z}/{x}/{y}.mvt${query}`;
+}
+
+/** Nível do mapa: região, ou (cidade) distritos → grade → endereços conforme o zoom. */
+function mapLevel() {
+  if (state.regiao) return "regiao";
+  const z = ctx ? ctx.map.getZoom() : 0;
+  return z < GRID_ZOOM ? "distritos" : z < POINTS_MIN_ZOOM ? "grade" : "enderecos";
+}
+
+/**
+ * Raio do ponto pelo nº de guias no endereço (√n, com teto: um condomínio grande não cobre a
+ * quadra). `extra` alarga (anel da ficha aberta).
+ * @param {number} [extra]
+ */
+function pointRadius(extra = 0) {
+  const n = ["coalesce", ["get", "n"], 1];
+  const r = (/** @type {number} */ base, /** @type {number} */ k, /** @type {number} */ cap) => ["min", cap + extra, ["+", base + extra, ["*", k, ["sqrt", ["-", n, 1]]]]];
+  return ["interpolate", ["linear"], ["zoom"], 11, r(2.5, 0.45, 7), 14, r(3.5, 0.9, 12), 17, r(5, 1.6, 22)];
+}
+
+/** Rótulo com o nº de guias (n > 1) — fontes do estilo do OpenFreeMap. */
+function countLabelLayout() {
+  return {
+    "text-field": ["to-string", ["get", "n"]],
+    "text-font": ["Noto Sans Bold"],
+    "text-size": ["interpolate", ["linear"], ["zoom"], LABEL_MIN_ZOOM, 9.5, 18, 12],
+    "text-allow-overlap": false,
+    "text-padding": 1,
+    "symbol-sort-key": ["-", ["coalesce", ["get", "n"], 1]],
+  };
+}
+
+/** Opacidade que entra (`rising`) ou sai em torno de GRID_ZOOM. */
+function fade(/** @type {number} */ max, /** @type {boolean} */ rising) {
+  return ["interpolate", ["linear"], ["zoom"], GRID_ZOOM - GRID_FADE, rising ? 0 : max, GRID_ZOOM + GRID_FADE, rising ? max : 0];
 }
 
 function addLayers() {
@@ -1241,60 +1755,39 @@ function addLayers() {
   const before = ctx.labelLayerId();
   if (!map.getSource(SRC_TILES)) {
     tilesUrl = tileUrl();
-    map.addSource(SRC_TILES, { type: "vector", tiles: [tilesUrl], minzoom: 9, maxzoom: 16 });
+    map.addSource(SRC_TILES, { type: "vector", tiles: [tilesUrl], minzoom: TILE_MIN_ZOOM, maxzoom: 16 });
   }
-  if (!map.getSource(SRC_POINTS)) map.addSource(SRC_POINTS, { type: "geojson", data: emptyFc() });
-  if (!map.getSource(SRC_AREA)) map.addSource(SRC_AREA, { type: "geojson", data: emptyFc() });
+  if (!map.getSource(SRC_DIST)) map.addSource(SRC_DIST, { type: "geojson", data: "/api/itbi/areas.geojson?tipo=distrito", promoteId: "id" });
+  for (const id of [SRC_POINTS, SRC_AREA, SRC_SEL]) if (!map.getSource(id)) map.addSource(id, { type: "geojson", data: emptyFc() });
 
-  if (!map.getLayer("itbi-heat")) {
-    map.addLayer(
-      {
-        id: "itbi-heat",
-        type: "circle",
-        source: SRC_TILES,
-        "source-layer": "itbi_agg",
-        maxzoom: 14,
-        paint: {
-          "circle-radius": /** @type {any} */ (cellRadius()),
-          "circle-opacity": 0.9,
-          "circle-blur": 0.15,
-        },
-      },
-      before,
-    );
-  }
-  if (!map.getLayer("itbi-tile-points")) {
-    // no topo, como `itbi-points` (círculos pequenos não escondem rótulos)
-    map.addLayer({
-      id: "itbi-tile-points",
-      type: "circle",
-      source: SRC_TILES,
-      "source-layer": "itbi",
-      minzoom: 14,
-      paint: { "circle-radius": ["interpolate", ["linear"], ["zoom"], 14, 2.5, 17, 5], "circle-opacity": 0.85, "circle-stroke-width": 1 },
-    });
-  }
-  if (!map.getLayer("itbi-area-fill")) {
-    map.addLayer({ id: "itbi-area-fill", type: "fill", source: SRC_AREA, paint: { "fill-opacity": 0.07 } }, before);
-  }
-  if (!map.getLayer("itbi-area-line")) {
-    map.addLayer({ id: "itbi-area-line", type: "line", source: SRC_AREA, paint: { "line-width": 2 } }, before);
-  }
-  if (!map.getLayer("itbi-points")) {
-    map.addLayer({
-      id: "itbi-points",
-      type: "circle",
-      source: SRC_POINTS,
-      paint: {
-        "circle-radius": ["interpolate", ["linear"], ["zoom"], 11, 2.5, 15, 4.5, 18, 8],
-        "circle-stroke-width": 1,
-        "circle-opacity": 0.9,
-      },
-    });
-  }
+  const add = (/** @type {any} */ layer, /** @type {string | undefined} */ beforeId) => {
+    if (!map.getLayer(layer.id)) map.addLayer(layer, beforeId);
+  };
+  const distMax = GRID_ZOOM + GRID_FADE;
+  add({ id: L.distFill, type: "fill", source: SRC_DIST, maxzoom: distMax, paint: { "fill-opacity": fade(DISTRICT_OPACITY, false) } }, before);
+  add({ id: L.distLine, type: "line", source: SRC_DIST, maxzoom: distMax, paint: { "line-width": ["interpolate", ["linear"], ["zoom"], 9, 0.6, 12, 1.2], "line-opacity": fade(1, false) } }, before);
+  add({ id: L.distHover, type: "line", source: SRC_DIST, maxzoom: distMax, paint: { "line-width": ["case", ["boolean", ["feature-state", "hover"], false], 2, 0] } }, before);
+  // grade: quadrados que cobrem a célula inteira; o contorno na cor da superfície faz o vão
+  add({ id: L.grid, type: "fill", source: SRC_TILES, "source-layer": "itbi_agg", minzoom: GRID_ZOOM - GRID_FADE, maxzoom: POINTS_MIN_ZOOM, paint: { "fill-opacity": fade(GRID_OPACITY, true) } }, before);
+  add({ id: L.areaFill, type: "fill", source: SRC_AREA, paint: { "fill-opacity": 0.07 } }, before);
+  add({ id: L.areaLine, type: "line", source: SRC_AREA, paint: { "line-width": 2 } }, before);
+  // endereços acima dos rótulos do basemap; os menores por cima dos maiores
+  const circle = () => ({
+    layout: { "circle-sort-key": ["-", ["coalesce", ["get", "n"], 1]] },
+    paint: { "circle-radius": pointRadius(), "circle-opacity": 0.92, "circle-stroke-width": 1 },
+  });
+  add({ id: L.tilePoints, type: "circle", source: SRC_TILES, "source-layer": "itbi", minzoom: POINTS_MIN_ZOOM, ...circle() });
+  add({ id: L.tileLabels, type: "symbol", source: SRC_TILES, "source-layer": "itbi", minzoom: LABEL_MIN_ZOOM, filter: [">", ["coalesce", ["get", "n"], 1], 1], layout: countLabelLayout() });
+  add({ id: L.points, type: "circle", source: SRC_POINTS, ...circle() });
+  add({ id: L.pointLabels, type: "symbol", source: SRC_POINTS, minzoom: LABEL_MIN_ZOOM, filter: [">", ["coalesce", ["get", "n"], 1], 1], layout: countLabelLayout() });
+  add({ id: L.selected, type: "circle", source: SRC_SEL, paint: { "circle-radius": pointRadius(4), "circle-opacity": 0, "circle-stroke-width": 2.5 } });
   repaint();
+  applyDistrictStates();
   drawRegiao();
   setPoints();
+  drawSelected();
+  legendKey = "";
+  renderLegend();
   // estilo novo (troca de tema) no meio de um desenho: recria o terra-draw na mesma ferramenta
   if ((state.ferramenta === "polygon" || state.ferramenta === "rectangle") && !draw) void startDrawing(state.ferramenta);
 }
@@ -1302,103 +1795,146 @@ function addLayers() {
 /** @param {ViewContext} context */
 function removeLayers(context) {
   const { map } = context;
-  for (const id of LAYERS) if (map.getLayer(id)) map.removeLayer(id);
-  for (const id of [SRC_TILES, SRC_POINTS, SRC_AREA]) if (map.getSource(id)) map.removeSource(id);
+  for (const id of Object.values(L)) if (map.getLayer(id)) map.removeLayer(id);
+  for (const id of [SRC_TILES, SRC_POINTS, SRC_AREA, SRC_DIST, SRC_SEL]) if (map.getSource(id)) map.removeSource(id);
 }
 
 function emptyFc() {
   return { type: "FeatureCollection", features: [] };
 }
 
+/** Cores que dependem do tema (o estilo novo da troca de tema chega sem elas). */
 function repaint() {
   if (!ctx) return;
   const { map } = ctx;
-  if (!map.getLayer("itbi-points")) return;
-  const ramp = cssRamp("--seq-price");
+  if (!map.getLayer(L.points)) return;
   const surface = cssVar("--surface-1");
   const accent = cssVar("--accent");
-  map.setPaintProperty("itbi-tile-points", "circle-color", ramp[4]);
-  map.setPaintProperty("itbi-tile-points", "circle-stroke-color", surface);
-  map.setPaintProperty("itbi-area-fill", "fill-color", accent);
-  map.setPaintProperty("itbi-area-line", "line-color", accent);
-  map.setPaintProperty("itbi-points", "circle-stroke-color", surface);
-  paintHeat();
+  const text = cssVar("--text-primary");
+  map.setPaintProperty(L.distLine, "line-color", cssVar("--bg"));
+  map.setPaintProperty(L.distHover, "line-color", text);
+  map.setPaintProperty(L.grid, "fill-outline-color", surface);
+  map.setPaintProperty(L.areaFill, "fill-color", accent);
+  map.setPaintProperty(L.areaLine, "line-color", accent);
+  map.setPaintProperty(L.selected, "circle-stroke-color", text);
+  for (const id of [L.pointLabels, L.tileLabels]) {
+    map.setPaintProperty(id, "text-color", text);
+    map.setPaintProperty(id, "text-halo-color", surface);
+    map.setPaintProperty(id, "text-halo-width", 1.4);
+  }
+  paintDistricts();
+  paintGrid();
   paintPoints();
 }
 
 /**
- * Cor de cada célula de `itbi_agg`: ln(1 + n) / ln(1 + p90 do zoom × escala do filtro), na rampa
- * sequencial. `step` no zoom acompanha a troca de tiles (o vector tile de zoom z vale até z + 1).
+ * `classes` cores espalhadas pela rampa (sempre as pontas): com menos classes que cores, o
+ * contraste não fica só na metade baixa.
+ * @param {number} classes
  */
-function cellColor() {
+function rampFor(classes) {
   const ramp = cssRamp("--seq-price");
+  if (classes >= ramp.length) return ramp;
+  if (classes <= 1) return [ramp[Math.floor(ramp.length / 2)]];
+  return Array.from({ length: classes }, (_, i) => ramp[Math.round((i * (ramp.length - 1)) / (classes - 1))]);
+}
+
+/** Limites de cor dos distritos: `quebras` da API (R$/m²) ou quantis do nº de transações. */
+function districtBreaks() {
+  if (!distritos) return [];
+  if (state.cor === "n") return quantileBreaks(distritos.areas.map((/** @type {any} */ a) => a.n).filter((/** @type {number} */ n) => n > 0), 7);
+  return /** @type {number[]} */ (distritos.quebras ?? []);
+}
+
+/** Valor de cada distrito no feature-state (`v`): nulo = sem dados (cinza). */
+function applyDistrictStates() {
+  if (!ctx || !distritos || !ctx.map.getSource(SRC_DIST)) return;
+  const nMin = Number(distritos.n_min ?? 0);
+  for (const a of distritos.areas ?? []) {
+    const v = state.cor === "n" ? (a.n > 0 ? a.n : null) : a.n >= nMin ? a.rs_m2_mediano : null;
+    ctx.map.setFeatureState({ source: SRC_DIST, id: String(a.id) }, { v });
+  }
+}
+
+function paintDistricts() {
+  if (!ctx?.map.getLayer(L.distFill)) return;
+  const breaks = districtBreaks();
+  const colors = rampFor(breaks.length + 1);
+  const nodata = cssVar("--nodata");
+  // `step` exige ao menos um limite: sem quebras (ainda carregando), uma cor só
+  const scale = breaks.length ? stepExpression(["feature-state", "v"], colors, breaks) : colors[0];
+  ctx.map.setPaintProperty(L.distFill, "fill-color", /** @type {any} */ (["case", ["==", ["feature-state", "v"], null], nodata, scale]));
+}
+
+/** p90 de `n` por célula no zoom do tile (`step`: o tile de zoom z vale até z + 1). */
+function gridP90(/** @type {number} */ zoom) {
   const k = Math.max(heatScale, 0.02);
-  const color = (/** @type {number} */ p90) => [
-    "interpolate",
-    ["linear"],
-    ["/", ["ln", ["+", 1, ["get", "n"]]], Math.log(1 + p90 * k)],
-    0,
-    ramp[0],
-    0.25,
-    ramp[1],
-    0.45,
-    ramp[2],
-    0.6,
-    ramp[3],
-    0.75,
-    ramp[4],
-    0.9,
-    ramp[5],
-    1,
-    ramp[6],
-  ];
+  let p90 = HEAT_P90[0][1];
+  for (const [z, v] of HEAT_P90) if (zoom >= z) p90 = v;
+  return Math.max(2, p90 * k);
+}
+
+/** Cor de cada célula de `itbi_agg`: ln(1 + n) / ln(1 + p90), na rampa sequencial. */
+function paintGrid() {
+  if (!ctx?.map.getLayer(L.grid)) return;
+  const ramp = cssRamp("--seq-price");
+  const color = (/** @type {number} */ z) => {
+    const stops = [0, 0.25, 0.45, 0.6, 0.75, 0.9, 1];
+    return ["interpolate", ["linear"], ["/", ["ln", ["+", 1, ["coalesce", ["get", "n"], 0]]], Math.log(1 + gridP90(z))], ...stops.flatMap((s, i) => [s, ramp[i]])];
+  };
   /** @type {unknown[]} */
-  const expr = ["step", ["zoom"], color(HEAT_P90[0][1])];
-  for (const [z, p90] of HEAT_P90.slice(1)) expr.push(z, color(p90));
-  return expr;
+  const expr = ["step", ["zoom"], color(HEAT_P90[0][0])];
+  for (const [z] of HEAT_P90.slice(1)) expr.push(z, color(z));
+  ctx.map.setPaintProperty(L.grid, "fill-color", /** @type {any} */ (expr));
 }
 
 /**
- * Raio proporcional ao vão da grade: 32 células por tile de 512 px = 16 px no zoom inteiro,
- * dobrando até o próximo (quando o tile troca) — as células nunca se sobrepõem.
+ * Limites de R$/m² dos endereços sem região: de ½× a 2× a mediana da cidade com os filtros
+ * atuais, em passos iguais na escala log. As `quebras` dos distritos (medianas de áreas grandes)
+ * são estreitas demais para endereços: nos Jardins todos cairiam na classe de cima.
  */
-function cellRadius() {
-  /** @type {unknown[]} */
-  const expr = ["interpolate", ["exponential", 2], ["zoom"]];
-  for (let z = HEAT_P90[0][0]; z <= HEAT_P90[HEAT_P90.length - 1][0]; z++) {
-    expr.push(z, CELL_RADIUS, z + 0.999, CELL_RADIUS * 2);
-  }
-  return expr;
-}
-
-function paintHeat() {
-  if (!ctx?.map.getLayer("itbi-heat")) return;
-  ctx.map.setPaintProperty("itbi-heat", "circle-color", /** @type {any} */ (cellColor()));
+function cityBreaks() {
+  if (!cityMedian) return /** @type {number[]} */ (distritos?.quebras ?? []);
+  return POINT_FACTORS.map((f) => Math.round((f * cityMedian) / 100) * 100);
 }
 
 function paintPoints() {
   if (!ctx) return;
   const { map } = ctx;
-  if (!map.getLayer("itbi-points")) return;
-  const ramp = cssRamp("--seq-price");
-  const color = priceBreaks.length
-    ? ["case", ["==", ["get", "m2"], null], cssVar("--nodata"), stepExpression(["get", "m2"], ramp, priceBreaks)]
-    : ramp[4];
-  map.setPaintProperty("itbi-points", "circle-color", /** @type {any} */ (color));
-  renderLegend();
+  if (!map.getLayer(L.points)) return;
+  const nodata = cssVar("--nodata");
+  const color = (/** @type {number[]} */ breaks) => [
+    "case",
+    ["==", ["get", "m2"], null],
+    nodata,
+    breaks.length ? stepExpression(["get", "m2"], rampFor(breaks.length + 1), breaks) : rampFor(1)[0],
+  ];
+  map.setPaintProperty(L.tilePoints, "circle-color", /** @type {any} */ (color(cityBreaks())));
+  map.setPaintProperty(L.points, "circle-color", /** @type {any} */ (color(regionBreaks.length ? regionBreaks : cityBreaks())));
+  // contorno neutro: a classe mais barata (que recua para o fundo) e o cinza "sem R$/m²" seguem
+  // visíveis nos dois temas, e círculos sobrepostos se separam
+  for (const id of [L.tilePoints, L.points]) map.setPaintProperty(id, "circle-stroke-color", cssVar("--text-muted"));
+  renderLegend(true);
+}
+
+/** Camadas da cidade × da região. */
+function updateVisibility() {
+  if (!ctx) return;
+  const { map } = ctx;
+  const hasRegion = Boolean(state.regiao);
+  for (const id of CITY_LAYERS) if (map.getLayer(id)) map.setLayoutProperty(id, "visibility", hasRegion ? "none" : "visible");
+  for (const id of REGION_LAYERS) if (map.getLayer(id)) map.setLayoutProperty(id, "visibility", hasRegion ? "visible" : "none");
+  if (hasRegion) setHoveredDistrict(null);
 }
 
 function setPoints() {
   if (!ctx) return;
   const { map } = ctx;
   const src = /** @type {any} */ (map.getSource(SRC_POINTS));
-  const hasRegion = Boolean(state.regiao);
-  for (const id of ["itbi-heat", "itbi-tile-points"]) {
-    if (map.getLayer(id)) map.setLayoutProperty(id, "visibility", hasRegion ? "none" : "visible");
-  }
+  updateVisibility();
   if (!src) return;
   src.setData(points ?? emptyFc());
-  priceBreaks = quantileBreaks(
+  regionBreaks = quantileBreaks(
     (points?.features ?? []).map((/** @type {any} */ f) => f.properties.m2).filter((/** @type {any} */ v) => v != null),
     7,
   );
@@ -1408,7 +1944,7 @@ function setPoints() {
       ? [
           el("div", {
             className: "notice",
-            textContent: `Mostrando ${fmt.int(points.features.length)} de ${fmt.int(points.total)} transações no mapa (as mais recentes). Os indicadores consideram todas.`,
+            textContent: `O mapa mostra ${fmt.int(points.features.length)} de ${fmt.int(points.locais)} endereços (os de guia mais recente). Os indicadores consideram todas as ${fmt.int(points.total)} guias.`,
           }),
         ]
       : []),
@@ -1421,6 +1957,14 @@ function drawRegiao() {
   if (!src) return;
   const geometry = state.regiao?.geometry;
   src.setData(geometry ? { type: "Feature", properties: {}, geometry } : emptyFc());
+}
+
+/** Anel em volta do endereço da ficha aberta. */
+function drawSelected() {
+  if (!ctx) return;
+  const src = /** @type {any} */ (ctx.map.getSource(SRC_SEL));
+  if (!src) return;
+  src.setData(selected ? { type: "Feature", properties: { n: selected.n }, geometry: { type: "Point", coordinates: [selected.lon, selected.lat] } } : emptyFc());
 }
 
 function updateTiles() {
@@ -1449,27 +1993,75 @@ function quantileBreaks(values, classes) {
   return out;
 }
 
-function renderLegend() {
-  if (!legend) return;
-  const ramp = cssRamp("--seq-price");
-  if (state.regiao && priceBreaks.length) {
+/** Lado aproximado (m) de uma célula da grade no zoom do tile, na latitude de São Paulo. */
+function cellSize(/** @type {number} */ zoom) {
+  const tz = Math.max(TILE_MIN_ZOOM, Math.floor(zoom));
+  const m = (40_075_016.686 * Math.cos((SP_LAT * Math.PI) / 180)) / 2 ** tz / 32;
+  return m >= 1000 ? `${fmt.dec1(m / 1000)} km` : `${fmt.int(Math.round(m / 10) * 10)} m`;
+}
+
+/**
+ * Legenda do nível do mapa (distritos, grade, endereços ou região). Só redesenha quando o
+ * nível (ou o zoom do tile, na grade) muda — ou sempre, com `force`.
+ * @param {boolean} [force]
+ */
+function renderLegend(force = false) {
+  if (!legend || !ctx) return;
+  const level = mapLevel();
+  const z = ctx.map.getZoom();
+  const key = `${level}:${level === "grade" ? Math.floor(z) : ""}`;
+  if (!force && key === legendKey) return;
+  legendKey = key;
+  const size = { className: "itbi-legend-size", label: "Tamanho: nº de guias no endereço" };
+  const price = (/** @type {number} */ v) => fmt.compact(v);
+  if (level === "distritos") {
+    const breaks = districtBreaks();
+    const porN = state.cor === "n";
     legend.render({
-      title: "R$/m² (faixas por quantil)",
-      colors: ramp.slice(0, priceBreaks.length + 1),
-      breaks: priceBreaks,
-      format: (v) => fmt.compact(v),
-      nodataLabel: "Sem R$/m² (garagem, na planta…)",
+      title: porN ? "Transações por distrito" : "R$/m² mediano por distrito",
+      colors: rampFor(breaks.length + 1),
+      breaks,
+      format: price,
+      nodataLabel: porN
+        ? "Sem transações"
+        : state.atipicos === "somente"
+          ? "Atípicas não têm R$/m²: veja “Transações”"
+          : `Menos de ${fmt.int(distritos?.n_min ?? 20)} guias`,
+      note: "Clique num distrito para selecioná-lo; aproxime para a grade",
     });
-  } else if (!state.regiao) {
-    const longe = Boolean(ctx && ctx.map.getZoom() < TILE_MIN_ZOOM);
+  } else if (level === "grade") {
+    const p90 = gridP90(z);
     legend.render({
-      title: "Transações por célula (escala log.)",
-      colors: ramp,
+      title: `Guias por célula de ~${cellSize(z)} (escala log.)`,
+      colors: cssRamp("--seq-price"),
       breaks: [],
       format: () => "",
-      labels: ["menos", "mais"],
-      nodataLabel: "Desenhe uma região para ver cada venda",
-      note: longe ? "Aproxime o mapa para ver a densidade" : undefined,
+      labels: ["1", `${fmt.int(p90)} ou mais`],
+      nodataLabel: "Sem guias: sem cor",
+      note: "Aproxime para ver cada endereço",
+    });
+  } else if (level === "enderecos") {
+    const breaks = cityBreaks();
+    legend.render({
+      title: "R$/m² mediano do endereço",
+      colors: rampFor(breaks.length + 1),
+      breaks,
+      format: price,
+      nodataLabel: "Sem R$/m² (garagem, na planta…)",
+      marks: [size],
+      note: cityMedian ? `Faixas de ½× a 2× a mediana da cidade (${fmt.brl(cityMedian)}/m²)` : "Clique num endereço para ver todas as guias",
+    });
+  } else if (points?.features?.length) {
+    const local = regionBreaks.length > 0;
+    const breaks = local ? regionBreaks : cityBreaks();
+    legend.render({
+      title: local ? "R$/m² mediano do endereço (faixas desta região)" : "R$/m² mediano do endereço",
+      colors: rampFor(breaks.length + 1),
+      breaks,
+      format: price,
+      nodataLabel: "Sem R$/m² (garagem, na planta…)",
+      marks: [size],
+      note: "Clique num endereço para ver todas as guias",
     });
   } else {
     legend.hide();
@@ -1477,51 +2069,87 @@ function renderLegend() {
 }
 
 /**
- * @param {number | string} id
- * @param {[number, number]} lngLat
- * @param {number} [count]  guias no mesmo ponto (tiles: o id é o da mais recente)
+ * O que está sob o cursor: endereço (ponto), célula da grade ou distrito — nessa prioridade.
+ * @param {{ x: number, y: number }} point
+ * @returns {{ kind: "ponto" | "celula" | "distrito", feature: any, layer: string } | null}
  */
-async function openPopup(id, lngLat, count = 1) {
-  if (!ctx) return;
-  popup?.remove();
-  const current = new ctx.maplibregl.Popup({ maxWidth: "320px", closeButton: true })
-    .setLngLat(lngLat)
-    .setDOMContent(el("div", { className: "muted", textContent: "Carregando…" }))
-    .addTo(ctx.map);
-  popup = current;
-  try {
-    const t = await api(`/itbi/transacao/${encodeURIComponent(String(id))}`, { signal: scoped() });
-    if (popup !== current) return; // outro clique abriu outro popup
-    // `endereco` já traz o número ("Rua Pamplona, 834"; "s/n" quando não há)
-    const titulo = t.endereco ?? ([t.logradouro, t.numero_raw ?? t.numero].filter(Boolean).join(", ") || "Endereço não informado");
-    const cep = t.cep ? `CEP ${String(t.cep).replace(/^(\d{5})(\d{3})$/, "$1-$2")}` : "";
-    // na planta / fração < 10%: a área construída do IPTU é a do lote inteiro, não a da unidade
-    const areaDoLote = t.na_planta || (t.proporcao_pct != null && t.proporcao_pct < 10);
-    const rows = [
-      ["Data", fmt.date(t.data_transacao)],
-      ["Valor", fmt.brl(t.valor_transacao)],
-      ["Área construída", areaDoLote ? "— (IPTU do lote)" : t.area_construida_m2 ? `${fmt.int(t.area_construida_m2)} m²` : "—"],
-      ["Área do terreno", t.area_terreno_m2 ? `${fmt.int(t.area_terreno_m2)} m²` : "—"],
-      ["R$/m²", fmt.brl(t.rs_m2)],
-      ["Tipo", `${tipoNome[t.tipo] ?? t.tipo ?? "—"}${t.na_planta ? " (na planta)" : ""}`],
-      ["Uso / padrão", [t.uso, t.padrao].filter(Boolean).join(" · ") || "—"],
-      ["Construção", t.acc_ano ? String(t.acc_ano) : "—"],
-      ["Natureza", t.natureza ?? "—"],
-      ["Financiamento", t.financiamento ?? "—"],
-      ["Localização", PRECISAO_NOME[/** @type {keyof typeof PRECISAO_NOME} */ (t.precisao)] ?? t.precisao ?? "—"],
-    ];
-    current.setDOMContent(
-      el("div", {}, [
-        el("div", { className: "popup-title", textContent: titulo }),
-        el("div", { className: "muted", textContent: [t.complemento, t.bairro, cep].filter(Boolean).join(" · ") }),
-        count > 1 ? el("div", { className: "muted", textContent: `A mais recente de ${fmt.int(count)} transações neste ponto` }) : null,
-        el("div", { className: "popup-grid" }, rows.flatMap(([k, v]) => [el("span", { textContent: k }), el("b", { textContent: v })])),
-        t.possivel_duplicata ? el("div", { className: "muted", textContent: "Possível duplicata de outra guia da mesma planilha" }) : null,
-      ]),
-    );
-  } catch (error) {
-    if (popup === current) current.setDOMContent(el("div", { className: "notice notice--error", textContent: (error instanceof Error ? error.message : String(error)) }));
+function pick(point) {
+  if (!ctx) return null;
+  const { map } = ctx;
+  const box = /** @type {[[number, number], [number, number]]} */ ([
+    [point.x - 3, point.y - 3],
+    [point.x + 3, point.y + 3],
+  ]);
+  const pointLayers = [L.points, L.tilePoints].filter((id) => map.getLayer(id));
+  const hits = pointLayers.length ? map.queryRenderedFeatures(box, { layers: pointLayers }) : [];
+  // círculos se sobrepõem: vale o de centro mais perto do cursor (o rótulo "64" abre o condomínio)
+  let f = hits[0];
+  let best = Infinity;
+  for (const h of hits) {
+    if (h.geometry?.type !== "Point") continue;
+    const c = map.project(/** @type {[number, number]} */ (h.geometry.coordinates));
+    const d = Math.hypot(c.x - point.x, c.y - point.y);
+    if (d < best) [best, f] = [d, h];
   }
+  if (f) return { kind: "ponto", feature: f, layer: f.layer?.id ?? "" };
+  if (state.regiao) return null;
+  const grade = map.getZoom() >= GRID_ZOOM;
+  const layer = grade ? L.grid : L.distFill;
+  if (!map.getLayer(layer)) return null;
+  const g = map.queryRenderedFeatures([point.x, point.y], { layers: [layer] })[0];
+  return g ? { kind: grade ? "celula" : "distrito", feature: g, layer } : null;
+}
+
+/**
+ * Texto da tooltip de cada coisa do mapa (deixa claro qual valor é: mediana, última guia…).
+ * @param {{ kind: "ponto" | "celula" | "distrito", feature: any, layer: string }} hit
+ * @returns {{ value: string, label: string, extra?: string }}
+ */
+function tooltipFor(hit) {
+  const p = hit.feature.properties ?? {};
+  if (hit.kind === "distrito") {
+    const a = distritosById.get(String(hit.feature.id ?? p.id));
+    const nome = a?.nome ?? p.nome ?? "Distrito";
+    if (!a) return { value: nome, label: "carregando…" };
+    const transacoes = `${fmt.int(a.n)} ${a.n === 1 ? "transação" : "transações"}`;
+    const rs = a.n >= Number(distritos?.n_min ?? 0) ? a.rs_m2_mediano : null;
+    const value = state.cor === "n" ? transacoes : rs != null ? `${fmt.brl(rs)}/m² (mediana)` : "Poucas guias para a mediana";
+    const extra = [
+      state.cor === "n" ? (rs != null ? `${fmt.brl(rs)}/m² mediano` : null) : transacoes,
+      a.variacao_12m != null ? `${formatPct(a.variacao_12m)} em 12 meses` : null,
+      "clique para selecionar",
+    ]
+      .filter(Boolean)
+      .join(" · ");
+    return { value, label: nome, extra };
+  }
+  if (hit.kind === "celula") {
+    const n = Number(p.n ?? 0);
+    return {
+      value: `${fmt.int(n)} ${n === 1 ? "guia" : "guias"} na célula`,
+      label: p.m2 != null ? `R$/m² mediano: ${fmt.brl(p.m2)}` : "sem R$/m²",
+      extra: "Clique para aproximar e ver os endereços",
+    };
+  }
+  const n = Number(p.n ?? 1);
+  const daRegiao = hit.layer === L.points;
+  const guias = `${fmt.int(n)} ${n === 1 ? "guia" : "guias"}`;
+  const value = p.m2 != null ? `${fmt.brl(p.m2)}/m² (mediana)` : n > 1 ? guias : formatValor(p.v);
+  const aproximado = daRegiao && (p.p === "quadra" || p.p === "setor") ? `centro da ${p.p}` : null;
+  const label = [daRegiao ? p.e : null, tipoNome[p.t] ?? p.t, value === guias ? "sem R$/m²" : guias, aproximado].filter(Boolean).join(" · ");
+  const ultima = p.d ? ` em ${fmt.date(p.d)}` : "";
+  const extra = daRegiao ? `Valor mediano: ${formatValor(p.v)} (a 100%) · última guia${ultima}` : `Última guia: ${formatValor(p.v)}${ultima} (a 100%)`;
+  return { value, label, extra: `${extra} · clique para a ficha` };
+}
+
+/** @param {string | null} id */
+function setHoveredDistrict(id) {
+  if (!ctx || hoveredDistrict === id) return;
+  const { map } = ctx;
+  const has = Boolean(map.getSource(SRC_DIST));
+  if (hoveredDistrict != null && has) map.setFeatureState({ source: SRC_DIST, id: hoveredDistrict }, { hover: false });
+  hoveredDistrict = id;
+  if (id != null && has) map.setFeatureState({ source: SRC_DIST, id }, { hover: true });
 }
 
 /** @param {ViewContext} context */
@@ -1530,9 +2158,11 @@ function bindMapEvents(context) {
   /** @param {any} ev */
   const onClick = (ev) => {
     if (state.ferramenta === "raio") {
+      lookupToken += 1;
       state.via = null;
       state.soVia = false;
       viaBbox = null;
+      regiaoNote = "";
       setCircle(ev.lngLat.lng, ev.lngLat.lat, "Ponto no mapa", false);
       state.ferramenta = "none";
       map.getCanvas().style.cursor = "";
@@ -1542,57 +2172,52 @@ function bindMapEvents(context) {
       return;
     }
     if (state.ferramenta !== "none") return;
-    // folga de 4 px: os círculos têm 2,5–5 px de raio
-    const { x, y } = ev.point;
-    const layers = ["itbi-points", "itbi-tile-points"].filter((id) => map.getLayer(id));
-    const feature = layers.length
-      ? map.queryRenderedFeatures(
-          [
-            [x - 4, y - 4],
-            [x + 4, y + 4],
-          ],
-          { layers },
-        )[0]
-      : undefined;
-    if (!feature) return;
-    // GeoJSON (`pontos`): id da feição; MVT (`itbi`): sem id de feição, vai em properties.id
-    const id = feature.id ?? feature.properties?.id;
-    const coords = feature.geometry?.type === "Point" ? /** @type {[number, number]} */ (feature.geometry.coordinates) : [ev.lngLat.lng, ev.lngLat.lat];
-    if (id != null) void openPopup(/** @type {number} */ (id), /** @type {[number, number]} */ (coords), Number(feature.properties?.n ?? 1));
+    const hit = pick(ev.point);
+    if (!hit) return;
+    hideTooltip();
+    if (hit.kind === "ponto") {
+      // GeoJSON (`pontos`): o id da feição é o local; MVT (`itbi`): vai em properties.local
+      const local = hit.feature.id ?? hit.feature.properties?.local;
+      if (local != null) sheet?.open(Number(local));
+    } else if (hit.kind === "celula") {
+      map.easeTo({ center: ev.lngLat, zoom: POINTS_MIN_ZOOM + 0.6, duration: 700 });
+    } else {
+      void chooseArea("distrito", String(hit.feature.id ?? hit.feature.properties?.id));
+    }
   };
   /** @param {any} ev */
   const onMove = (ev) => {
-    const f = ev.features?.[0];
-    if (!f || state.ferramenta !== "none") return;
-    map.getCanvas().style.cursor = "pointer";
-    const p = f.properties;
-    // tiles (z ≥ 14): uma feição por ponto — valor/tipo/data da guia mais recente, `m2` mediano
-    const n = Number(p.n ?? 1);
-    const m2 = p.m2 != null ? `${fmt.brl(p.m2)}/m²` : null;
-    const extra = n > 1 ? `Mais recente de ${fmt.int(n)} no ponto${m2 ? ` · mediana ${m2}` : ""}` : m2;
-    showTooltip(ev.originalEvent.clientX, ev.originalEvent.clientY, fmt.brl(p.v), `${tipoNome[p.t] ?? p.t ?? ""}${p.d ? ` · ${fmt.date(p.d)}` : ""}`, extra ?? undefined);
+    if (state.ferramenta !== "none") return;
+    const hit = pick(ev.point);
+    setHoveredDistrict(hit?.kind === "distrito" ? String(hit.feature.id) : null);
+    map.getCanvas().style.cursor = hit ? "pointer" : "";
+    if (!hit) {
+      hideTooltip();
+      return;
+    }
+    const t = tooltipFor(hit);
+    showTooltip(ev.originalEvent.clientX, ev.originalEvent.clientY, t.value, t.label, t.extra);
   };
-  const onLeave = () => {
-    if (state.ferramenta === "none") map.getCanvas().style.cursor = "";
+  const onOut = () => {
+    setHoveredDistrict(null);
     hideTooltip();
+    if (state.ferramenta === "none") map.getCanvas().style.cursor = "";
   };
-  // abaixo do zoom dos tiles o heatmap some: a legenda avisa
+  // a legenda e o controle "Cor do mapa" seguem o nível do zoom
   const onZoom = () => {
-    if (!state.regiao) renderLegend();
+    renderLegend();
+    renderMapColor();
   };
   map.on("click", onClick);
-  map.on("zoomend", onZoom);
-  for (const layer of ["itbi-points", "itbi-tile-points"]) {
-    map.on("mousemove", layer, onMove);
-    map.on("mouseleave", layer, onLeave);
-  }
+  map.on("mousemove", onMove);
+  map.on("mouseout", onOut);
+  map.on("zoom", onZoom);
   cleanups.push(() => {
     map.off("click", onClick);
-    map.off("zoomend", onZoom);
-    for (const layer of ["itbi-points", "itbi-tile-points"]) {
-      map.off("mousemove", layer, onMove);
-      map.off("mouseleave", layer, onLeave);
-    }
+    map.off("mousemove", onMove);
+    map.off("mouseout", onOut);
+    map.off("zoom", onZoom);
+    setHoveredDistrict(null);
     map.getCanvas().style.cursor = "";
   });
 }

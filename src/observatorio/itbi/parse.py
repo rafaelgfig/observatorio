@@ -27,6 +27,15 @@ Regras verificadas nas 155 abas mensais de 2015 a 2026:
   do XML da aba (:func:`formula_texts`);
 * não há deduplicação: linhas idênticas são declarações distintas (coadquirentes); elas
   apenas recebem ``possivel_duplicata``.
+
+Colunas derivadas dos textos livres (:func:`analisa_complemento`, :func:`bloco_em`,
+:func:`analisa_referencia`): ``unidade`` e ``vagas`` vêm do complemento; ``bloco`` do
+complemento, depois do bairro e da referência (onde o cadastro também o digita, ex. bairro
+``BLOCO 14``); ``edificio`` da referência quando ela tem cara de nome de prédio/condomínio.
+
+Valores (:func:`_classify`): ``valor_integral`` leva o valor declarado a 100% do imóvel;
+``valor_atipico`` marca declarações muito longe da referência da Prefeitura (cessões de saldo
+de COHAB, valores simbólicos, partilhas…), que ficam fora das medianas por padrão na API.
 """
 
 from __future__ import annotations
@@ -35,15 +44,16 @@ import html
 import logging
 import re
 import zipfile
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Final
 
 import fastexcel
 import polars as pl
 
-from observatorio.text import search_key
+from observatorio.text import TITLES, search_key, strip_accents, title_pt
 
 log = logging.getLogger(__name__)
 
@@ -133,6 +143,14 @@ SCHEMA: Final = pl.Schema(
         "acc_ano": pl.Int16,
         "tipo": pl.String,
         "na_planta": pl.Boolean,
+        "unidade": pl.String,
+        "bloco": pl.String,
+        "vagas": pl.Int16,
+        "edificio": pl.String,
+        "valor_integral": pl.Float64,
+        "valor_referencia": pl.Float64,
+        "razao_referencia": pl.Float64,
+        "valor_atipico": pl.Boolean,
         "rs_m2": pl.Float64,
         "possivel_duplicata": pl.Boolean,
         "aba": pl.String,
@@ -223,7 +241,9 @@ _NUMERIC_COLUMNS: Final = (
 )  # fmt: skip
 # Versão das regras de normalização: incremente ao mudar qualquer regra que altere a saída —
 # a ingestão reprocessa sozinha os anos gravados com outra versão.
-PARSER_VERSION: Final = 3
+# 4: unidade, bloco, vagas, edifício, valor integral/referência e valor atípico.
+# 5: "E 1341"/"A 1806" (números de porta) não viram torre E/A nem unidade.
+PARSER_VERSION: Final = 5
 
 # Identificadores pessoais em textos livres (ex.: CPF no complemento) — ver :func:`scrub_ids`.
 # O pré-filtro (regex do polars, sem lookaround) só escolhe as linhas a conferir.
@@ -243,9 +263,18 @@ _ACC_MIN_YEAR: Final = 1800
 # entre 10% e 100%). rs_m2 só existe entre 10% e 100%, dividindo pela fração transmitida.
 _MIN_SHARE_PCT: Final = 10.0
 # Valores simbólicos (R$ 1, R$ 100…) e R$/m² fora desta faixa não são preço de mercado: o
-# rs_m2 fica nulo (a transação continua contando nos totais e medianas de valor).
+# rs_m2 fica nulo (a transação continua contando nos totais).
 _VALOR_MIN_RS_M2: Final = 5_000.0
 _RS_M2_RANGE: Final = (100.0, 100_000.0)
+# Valor atípico: declarado abaixo de 50% ou acima de 5× a referência proporcional da Prefeitura
+# (quando ela é comparável), ou valor integral abaixo de R$ 5 mil. Nas compras e vendas de
+# 2015-2026 com proporção de 10% a 100%, 9,1% das guias ficam abaixo de 0,5× (cessões de saldo
+# devedor de COHAB/CDHU, partilhas, valores simbólicos) e 0,4% acima de 5×; nos apartamentos o
+# percentil 5 da razão é 0,5 e a mediana 1,25. A referência das vagas de garagem é alta para o
+# mercado (mediana 0,8, percentil 25 0,43: 31% abaixo de 0,5×): para elas o piso é 0,2× (~8%).
+RAZAO_ATIPICA: Final = (0.5, 5.0)
+RAZAO_MIN_GARAGEM: Final = 0.2
+VALOR_MIN_TIPICO: Final = _VALOR_MIN_RS_M2
 # Mais linhas corrompidas que isto numa aba indica mudança de layout, não defeito pontual.
 _MAX_QUARANTINE: Final = 20
 _MAX_QUARANTINE_SHARE: Final = 0.01
@@ -317,6 +346,272 @@ def parse_sheet_name(name: str) -> tuple[int, int] | None:
     if match is None:
         return None
     return int(match[2]), MONTHS.index(match[1].upper()) + 1
+
+
+# ---------------------------------------------------------------- textos livres (unidade…)
+#
+# Os textos são digitados à mão e cortados em ~19 caracteres (complemento) ou 20 (referência):
+# ``AP 44 E 2VG``, ``AP: 306 BL: 02``, ``TORRE 9 APTO 9``, ``APT 112 TORR``. As regras abaixo
+# trabalham sobre :func:`texto_chave` e foram calibradas nos padrões mais frequentes de 2015-2026.
+
+# Palavras que antecedem o número da unidade (apartamento, sala, loja, casa…).
+_PALAVRAS_UNIDADE: Final = (
+    "APARTAMENTO", "APART", "APTOS", "APTO", "APTM", "APT", "AP", "UNIDADE", "UNID", "UND", "UN",
+    "CONJUNTO", "CONJ", "CJ", "SALAS", "SALA", "SL", "LOJAS", "LOJA", "LJ", "CASA", "CS",
+    "SOBRADO", "STUDIO", "ESTUDIO", "FLAT", "LOFT", "DUPLEX", "TRIPLEX", "COBERTURA", "COB",
+    "ESCRITORIO", "STD",
+)  # fmt: skip
+# Entre a palavra e o número: "Nº", "NR", "RESID" ("STUDIO NR 9", "UNID RESID 12").
+_UNIDADE: Final = re.compile(
+    rf"\b(?:{'|'.join(_PALAVRAS_UNIDADE)})(?: (?:N|NO|NR|R|RES|RESID)){{0,2}} (\d{{1,6}}[A-Z]?)\b"
+)
+# Complemento que é só o número ("12", "9A").
+_SO_NUMERO: Final = re.compile(r"^(\d{1,5}[A-Z]?)$")
+# Número logo depois do bloco: "BL 9-12" (bloco 9, unidade 12).
+_NUMERO_APOS_BLOCO: Final = re.compile(r" (\d{1,5}[A-Z]?)(?: |$)")
+# Sem palavra de unidade: "511 TORRE 1" (nº + torre), "1603 A" (nº + torre de uma letra; não
+# "177 E 179", dois números de porta) e "MARAB A 803" (torre + nº). "E" antes de um número é a
+# conjunção dos números de porta ("E 1341" no nº 1337, "472 FD E 476", "E 1560 FD": 12 mil
+# guias), nunca torre; "A 1806" no nº 1802 é a faixa de numeração ("1802 a 1806"): ver
+# ``Unidade.faixa`` e :data:`_FAIXA_MAX`.
+_UNIDADE_ANTES_DO_BLOCO: Final = re.compile(
+    r"^(\d{1,5}[A-Z]?) (?=(?:TORRE|TORR|TOR|TR|T|BLOCO|BLOC|BLC|BLO|BL)\b)"
+)
+_NUMERO_E_LETRA: Final = re.compile(r"\b(\d{3,4}) ([A-H])(?:$| (?=[A-Z]))")
+_LETRA_E_NUMERO: Final = re.compile(r"(?:^|[A-Z] )([A-DF-H]) (\d{3,4})(?: |$)")
+# "A <n>" no início com n até esta distância do número do imóvel é faixa de porta, não torre A
+# (nos dados: "A 1806" no nº 1802, "A 167" no 165; torres A legítimas: "A 512" no nº 4228).
+_FAIXA_MAX: Final = 300
+# "TRBAP2307": a sigla da unidade colada a outra (torre B, AP 2307).
+_UNIDADE_COLADA: Final = re.compile(r"[A-Z](?:APTO|APT|AP) (\d{1,6}[A-Z]?)\b")
+# Bloco/torre: "BL 9", "BLOCO B", "TORRE 2", "BLOCO II", "TR 3", "BL. T2" (no complemento
+# também "T 9", "T9" e "TA"/"TB"). Sem identificador ("AP 9 TORR", cortado) não há bloco.
+_BLOCO: Final = re.compile(
+    r"\b(?:BLOCO|BLOC|BLC|BLO|BL|TORRE|TORR|TOR|TR)(?: NO?)? "
+    r"(T \d{1,2}|\d{1,3}[A-Z]?|[IVX]{2,5}|[A-Z])\b"
+)
+_TORRE_CURTA: Final = re.compile(r"\bT (\d{1,2}|[A-H])\b|\bT([A-H])\b")
+# Vagas: "E 2VG", "4 VGS", "E 2 V" (cortado) → número; "E VG", "VG 45" (a vaga nº 45), "E BOX" → 1.
+_PALAVRAS_VAGA: Final = "VAGAS|VAGA|VGS|VG|BOXES|BOX|BX|GARAGENS|GARAGEM|GAR"
+_VAGAS_CONTADAS: Final = re.compile(rf"\b(\d{{1,2}}) (?:{_PALAVRAS_VAGA}|V)\b")
+_UMA_VAGA: Final = re.compile(r"\b(?:VAGA|VG|BOX|BX|GARAGEM|GAR)\b")
+_SEGUE_VAGA: Final = re.compile(rf" (?:\d|(?:{_PALAVRAS_VAGA}|V)\b)")
+_MAX_VAGAS: Final = 20
+
+# Referência: prefixos de nome de prédio/condomínio → forma por extenso (aplicados em cadeia:
+# "CD RES AIRY" → "Condomínio Residencial Airy").
+_PREFIXOS_2: Final[Mapping[tuple[str, str], str]] = {
+    **{
+        (a, b): "Conjunto Habitacional"
+        for a in ("CJ", "CONJ", "CONJUNTO")
+        for b in ("HAB", "HABIT", "HABITACIONAL")
+    },
+    **{
+        (a, b): "Conjunto Residencial"
+        for a in ("CJ", "CONJ", "CONJUNTO")
+        for b in ("RES", "RESID", "RESIDENCIAL")
+    },
+    **{
+        (a, b): "Parque Residencial"
+        for a in ("PQ", "PRQ", "PARQUE")
+        for b in ("RES", "RESID", "RESIDENCIAL")
+    },
+    ("C", "R"): "Condomínio Residencial",
+}
+_PREFIXOS_1: Final[Mapping[str, str]] = {
+    **dict.fromkeys(("ED", "EDF", "EDIF", "EDIFICIO"), "Edifício"),
+    **dict.fromkeys(("COND", "CONDOM", "CONDOMINIO", "CD"), "Condomínio"),
+    **dict.fromkeys(("RES", "RESID", "RESIDENCIAL"), "Residencial"),
+    "SUBCOND": "Subcondomínio",
+}
+# Sem prefixo, palavras que só aparecem em nomes de empreendimentos ("LISSE RESIDENCE").
+_PALAVRAS_EMPREENDIMENTO: Final = frozenset(
+    (
+        "RESIDENCE", "RESIDENCES", "RESIDENCIAL", "RESORT", "TOWER", "TOWERS", "CONDOMINIUM",
+        "SUITES", "HOME", "HOMES", "CLUB", "VILLAGE", "GARDEN", "GARDENS", "PLAZA", "SQUARE",
+        "CONDOMINIO", "EDIFICIO", "LOFTS", "STUDIOS", "OFFICE", "OFFICES", "CORPORATE",
+        "SPAZIO", "PARK", "SHOPPING", "SHOP", "CENTER", "MALL", "LIVING", "TRADE",
+    )
+)  # fmt: skip
+# Referências que descrevem o terreno ou o registro, não um prédio.
+_NAO_NOME: Final = frozenset(
+    ("LOTE", "LOTES", "LT", "LTS", "QD", "QUADRA", "GLEBA", "MATR", "MATRIC", "MATRICULA", "AREA")
+)
+_ABREVIACOES_NOME: Final[Mapping[str, str]] = {
+    **TITLES,
+    "JD": "Jardim",
+    "VL": "Vila",
+    "PQ": "Parque",
+    "PRQ": "Parque",
+}
+_ROMANO: Final = re.compile(r"^(?=[IVX]{2,})X{0,3}(?:IX|IV|V?I{0,3})$")
+
+
+@dataclass(frozen=True, slots=True)
+class Unidade:
+    """O que o complemento diz da unidade (``None`` = não informado ou ilegível).
+
+    ``faixa``: o número de ``"A <n>"`` no início, lido como torre A + unidade n — mas que é a
+    faixa de numeração da porta ("1802 a 1806") quando n fica perto do número do imóvel; quem
+    conhece o número decide (:func:`_textos_livres`).
+    """
+
+    unidade: str | None
+    bloco: str | None
+    vagas: int | None
+    faixa: int | None = None
+
+
+def texto_chave(texto: str) -> str:
+    """Maiúsculas, sem acentos nem pontuação, siglas separadas dos números.
+
+    ``"Ap.12 Bl:B"`` → ``"AP 12 BL B"``; ``"APTO12 T2 E 2VGS"`` → ``"APTO 12 T 2 E 2 VGS"``.
+    A letra colada **depois** do número fica (``"AP 9A"``: unidade 9A).
+    """
+    chave = re.sub(r"[^A-Z0-9]+", " ", strip_accents(texto).upper())
+    chave = re.sub(r"([A-Z]{2,})(\d)", r"\1 \2", chave)
+    chave = re.sub(r"\b([A-Z])(\d)", r"\1 \2", chave)
+    chave = re.sub(r"(\d)([A-Z]{2,})", r"\1 \2", chave)
+    return " ".join(chave.split())
+
+
+def _sem_zeros(ident: str) -> str:
+    """``"02"`` → ``"2"``, ``"007A"`` → ``"7A"``, ``"0"`` → ``"0"``; letras como estão."""
+    if not ident[0].isdigit():
+        return ident
+    stripped = ident.lstrip("0")
+    return stripped if stripped[:1].isdigit() else "0" + stripped
+
+
+def _blocos(chave: str, *, curtos: bool) -> Iterator[re.Match[str]]:
+    """Ocorrências de bloco/torre; ``E`` seguido de vaga ou número é conjunção ("TORRE E VG")."""
+    padroes = (_BLOCO, _TORRE_CURTA) if curtos else (_BLOCO,)
+    for padrao in padroes:
+        for match in padrao.finditer(chave):
+            ident = match[1] or match[2]
+            if ident == "E" and _SEGUE_VAGA.match(chave, match.end()):
+                continue
+            yield match
+
+
+def _primeiro_bloco(chave: str, *, curtos: bool) -> re.Match[str] | None:
+    return min(_blocos(chave, curtos=curtos), key=lambda m: m.start(), default=None)
+
+
+def _ident_bloco(match: re.Match[str]) -> str:
+    return _sem_zeros((match[1] or match[2]).replace(" ", ""))
+
+
+@lru_cache(maxsize=1 << 18)
+def analisa_complemento(texto: str) -> Unidade:
+    """Unidade, bloco/torre e nº de vagas declarados no complemento.
+
+    ``"BL 1 AP 44"`` → (44, 1, None); ``"AP 72 BL 3 E"`` → (72, 3, None);
+    ``"APT 112 TORR"`` → (112, None, None); ``"AP 201 E 3VGS"`` → (201, None, 3);
+    ``"VG 45"`` → (None, None, 1).
+    """
+    chave = texto_chave(texto)
+    unidade: str | None = None
+    bloco: str | None = None
+    faixa: int | None = None
+    usados: list[tuple[int, int]] = []
+    if match := _UNIDADE.search(chave):
+        unidade = _sem_zeros(match[1])
+        usados.append(match.span())
+    # "TA"/"T 9" só valem como torre quando há unidade (sem ela, "T" pode ser outra coisa)
+    if bloco_match := _primeiro_bloco(chave, curtos=unidade is not None):
+        bloco = _ident_bloco(bloco_match)
+        usados.append(bloco_match.span())
+    if unidade is None:
+        apos_bloco = _NUMERO_APOS_BLOCO.match(chave, bloco_match.end()) if bloco_match else None
+        if match := (
+            _UNIDADE_ANTES_DO_BLOCO.search(chave)
+            or apos_bloco
+            or _UNIDADE_COLADA.search(chave)
+            or _SO_NUMERO.search(chave)
+        ):
+            unidade = _sem_zeros(match[1])
+            usados.append(match.span())
+        elif bloco is None and (match := _NUMERO_E_LETRA.search(chave)):
+            unidade, bloco = _sem_zeros(match[1]), match[2]
+            usados.append(match.span())
+        elif bloco is None and (match := _LETRA_E_NUMERO.search(chave)):
+            bloco, unidade = match[1], _sem_zeros(match[2])
+            usados.append(match.span())
+            if match.start() == 0 and bloco == "A":
+                faixa = int(match[2])
+    return Unidade(unidade, bloco, _vagas(_sem_trechos(chave, usados)), faixa)
+
+
+def _sem_trechos(chave: str, trechos: Sequence[tuple[int, int]]) -> str:
+    """O texto sem os trechos já interpretados (o nº do apartamento não é nº de vagas)."""
+    for inicio, fim in sorted(trechos, reverse=True):
+        chave = f"{chave[:inicio]} {chave[fim:]}"
+    return " ".join(chave.split())
+
+
+def _vagas(resto: str) -> int | None:
+    if match := _VAGAS_CONTADAS.search(resto):
+        n = int(match[1])
+        return n if 1 <= n <= _MAX_VAGAS else None
+    return 1 if _UMA_VAGA.search(resto) else None
+
+
+@lru_cache(maxsize=1 << 16)
+def bloco_em(texto: str) -> str | None:
+    """Bloco/torre num texto que não é o complemento (bairro: ``"BLOCO 14"`` → ``"14"``)."""
+    match = _primeiro_bloco(texto_chave(texto), curtos=False)
+    return _ident_bloco(match) if match else None
+
+
+@lru_cache(maxsize=1 << 16)
+def analisa_referencia(texto: str) -> tuple[str | None, str | None]:
+    """``(edifício, bloco)`` da referência.
+
+    ``"RES JARDIM DOS YPES"`` → ("Residencial Jardim dos Ypes", None);
+    ``"ED AUTUMN BL A"`` → ("Edifício Autumn", "A"); ``"TORRE 2"`` → (None, "2");
+    ``"SAO PAULO"``, ``"LOTE 9 QD 3"`` → (None, None).
+    """
+    chave = texto_chave(texto)
+    bloco_match = _primeiro_bloco(chave, curtos=False)
+    bloco = _ident_bloco(bloco_match) if bloco_match else None
+    nome = _sem_trechos(chave, [bloco_match.span()]) if bloco_match else chave
+    return _nome_edificio(nome.split()), bloco
+
+
+def _nome_edificio(palavras: list[str]) -> str | None:
+    """Nome por extenso se as palavras começam por um prefixo de prédio/condomínio ou trazem
+    uma palavra típica de empreendimento; ``None`` para bairros, lotes e afins."""
+    prefixos: list[str] = []
+    resto = palavras
+    while resto:
+        dupla = (resto[0], resto[1]) if len(resto) > 2 else None
+        if dupla is not None and dupla in _PREFIXOS_2:
+            prefixos.append(_PREFIXOS_2[dupla])
+            resto = resto[2:]
+        elif resto[0] in _PREFIXOS_1 and len(resto) > 1:
+            prefixos.append(_PREFIXOS_1[resto[0]])
+            resto = resto[1:]
+        else:
+            break
+    if not any(len(p) >= 2 and not p.isdigit() for p in resto):
+        return None
+    if not prefixos and (
+        not _PALAVRAS_EMPREENDIMENTO.intersection(resto)
+        or _NAO_NOME.intersection(resto)
+        or all(p in _PALAVRAS_EMPREENDIMENTO or len(p) < 2 for p in resto)  # só "EDIFICIO"
+    ):
+        return None
+    corpo = title_pt(
+        " ".join(_ABREVIACOES_NOME.get(p, p) for p in resto), continuation=bool(prefixos)
+    )
+    corpo = " ".join(p.upper() if _ROMANO.match(p.upper()) else p for p in corpo.split())
+    return " ".join([*prefixos, corpo])
+
+
+def _mapeia[T](serie: pl.Series, funcao: Callable[[str], T]) -> dict[str, T]:
+    """``funcao`` aplicada a cada valor distinto (não nulo) da coluna."""
+    return {valor: funcao(valor) for valor in serie.drop_nulls().unique().to_list()}
 
 
 # ---------------------------------------------------------------- leitura (camada fina)
@@ -629,8 +924,40 @@ def _derive(data: pl.DataFrame, ref_year: int, ref_month: int, sheet: str) -> pl
         acc_ano=pl.when(acc.is_between(_ACC_MIN_YEAR, ref_year + 1)).then(acc),
         aba=pl.lit(sheet),
     )
-    typed = _scrub_personal_ids(typed, sheet)
+    typed = _textos_livres(_scrub_personal_ids(typed, sheet))
     return _classify(typed).select(pl.col(name).cast(dtype) for name, dtype in SCHEMA.items())
+
+
+def _textos_livres(typed: pl.DataFrame) -> pl.DataFrame:
+    """``unidade``, ``bloco``, ``vagas`` e ``edificio`` (analisando cada texto distinto uma vez).
+
+    O bloco vem do complemento; sem ele, do bairro e depois da referência. ``"A <n>"`` com n a
+    até :data:`_FAIXA_MAX` do número do imóvel é faixa de porta: não dá unidade nem bloco.
+    """
+    complementos = _mapeia(typed.get_column("complemento"), analisa_complemento)
+    bairros = _mapeia(typed.get_column("bairro"), bloco_em)
+    referencias = _mapeia(typed.get_column("referencia"), analisa_referencia)
+
+    def por(coluna: str, mapa: Mapping[str, object], dtype: type[pl.DataType]) -> pl.Expr:
+        return pl.col(coluna).replace_strict(mapa, default=None, return_dtype=dtype)
+
+    faixa = por("complemento", {k: v.faixa for k, v in complementos.items()}, pl.Int32)
+    porta = ((faixa - pl.col("numero").cast(pl.Int32)).abs() <= _FAIXA_MAX).fill_null(False)
+
+    def da_unidade(campo: str) -> pl.Expr:
+        mapa = {k: getattr(v, campo) for k, v in complementos.items()}
+        return pl.when(~porta).then(por("complemento", mapa, pl.String))
+
+    return typed.with_columns(
+        unidade=da_unidade("unidade"),
+        vagas=por("complemento", {k: v.vagas for k, v in complementos.items()}, pl.Int16),
+        bloco=pl.coalesce(
+            da_unidade("bloco"),
+            por("bairro", bairros, pl.String),
+            por("referencia", {k: v[1] for k, v in referencias.items()}, pl.String),
+        ),
+        edificio=por("referencia", {k: v[0] for k, v in referencias.items()}, pl.String),
+    )
 
 
 def _scrub_personal_ids(typed: pl.DataFrame, sheet: str) -> pl.DataFrame:
@@ -679,9 +1006,18 @@ def _classify(typed: pl.DataFrame) -> pl.DataFrame:
       (prédio antigo no lugar do lançamento). Uso, áreas e padrão do IPTU são do lote, então
       ``tipo`` sai do complemento (apartamento, se só houver torre/bloco/unidade) e
       ``rs_m2`` fica nulo;
-    * ``rs_m2`` também fica nulo para valores simbólicos (< R$ 5 mil) e fora de
-      R$ 100–100 mil/m².
     * vaga vendida com uso de apartamento/sala (complemento começa por ``VG``/``BOX``…) → garagem.
+
+    Valores:
+
+    * ``valor_integral`` = declarado ÷ proporção (10–100%; em branco = 100%); abaixo de 10% o
+      declarado já é o preço da unidade; proporção > 100% ou ≤ 0 → nulo;
+    * ``valor_referencia`` / ``razao_referencia``: valor venal de referência (100%) e
+      declarado ÷ referência proporcional — só quando a referência é do próprio imóvel (nem na
+      planta, nem proporção < 10%);
+    * ``valor_atipico``: razão fora de 0,5–5, valor integral < R$ 5 mil ou nulo;
+    * ``rs_m2`` = valor integral ÷ área; nulo para atípicos, proporção fora de 10–100%, área
+      ausente e fora de R$ 100–100 mil/m².
     """
     key = _unit_key(pl.col("complemento"))
     unit_word = key.str.extract(_UNIT_TOKEN, 1).str.extract(r"^([A-Z]+)", 1)
@@ -706,6 +1042,29 @@ def _classify(typed: pl.DataFrame) -> pl.DataFrame:
         .otherwise("_base"),
     )
     share_pct = pl.col("proporcao_pct").fill_null(100.0)  # em branco = 100% (dicionário)
+    whole_share = share_pct.is_between(_MIN_SHARE_PCT, 100.0)
+    valor = pl.col("valor_transacao")
+    # Abaixo de 10% o valor declarado já é o preço da unidade inteira (lote-mãe, vaga de um
+    # SQL de garagem): fica como está. Acima de 100% (ou ≤ 0) a proporção é erro de digitação.
+    valor_integral = (
+        pl.when(whole_share)
+        .then(valor * 100 / share_pct)
+        .when((share_pct > 0) & (share_pct < _MIN_SHARE_PCT))
+        .then(valor)
+    )
+    # A referência só descreve o mesmo imóvel quando não é a do lote-mãe.
+    comparable = ~pl.col("na_planta") & whole_share
+    ratio = pl.when(comparable & (pl.col("valor_venal_ref_prop") > 0)).then(
+        valor / pl.col("valor_venal_ref_prop")
+    )
+    ratio_min = (
+        pl.when(pl.col("tipo") == "garagem").then(RAZAO_MIN_GARAGEM).otherwise(RAZAO_ATIPICA[0])
+    )
+    atypical = (
+        valor_integral.is_null()
+        | (valor_integral < VALOR_MIN_TIPICO)
+        | (~ratio.is_between(ratio_min, RAZAO_ATIPICA[1])).fill_null(False)
+    ).fill_null(True)
     area = (
         pl.when(pl.col("na_planta"))
         .then(None)
@@ -714,12 +1073,16 @@ def _classify(typed: pl.DataFrame) -> pl.DataFrame:
         .when(pl.col("tipo").is_in(_BUILT_TIPOS))
         .then("area_construida_m2")
     )
-    valid = (
-        (pl.col("valor_transacao") >= _VALOR_MIN_RS_M2)
-        & share_pct.is_between(_MIN_SHARE_PCT, 100.0)
-        & (area > 0)
+    staged = staged.with_columns(
+        valor_integral=valor_integral,
+        valor_referencia=pl.when(comparable & (pl.col("valor_venal_ref") > 0)).then(
+            pl.col("valor_venal_ref")
+        ),
+        razao_referencia=ratio,
+        valor_atipico=atypical,
     )
-    rs_m2 = pl.col("valor_transacao") / (area * share_pct / 100)
+    rs_m2 = pl.col("valor_integral") / area
+    valid = ~pl.col("valor_atipico") & whole_share & (area > 0)
     return staged.with_columns(
         rs_m2=pl.when(valid & rs_m2.is_between(*_RS_M2_RANGE)).then(rs_m2),
     )

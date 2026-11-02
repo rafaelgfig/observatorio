@@ -31,7 +31,8 @@ Saídas em ``processed/itbi/``:
 * ``geocode.parquet`` — ``sql, logradouro, numero, cep, lon, lat, precisao, tier``; uma linha
   por chave (as não resolvidas ficam com coordenadas nulas);
 * ``areas.parquet`` — ``tipo, id, nome, geom, bbox_*`` (polígonos simplificados sem frestas);
-* ``places.parquet`` — logradouros, CEPs, distritos e subprefeituras (escopo ``itbi``).
+* ``places.parquet`` — logradouros, CEPs, distritos e subprefeituras (escopo ``itbi``);
+* ``tabela.parquet`` — a tabela que a API carrega (:mod:`observatorio.itbi.tabela`).
 """
 
 from __future__ import annotations
@@ -48,17 +49,18 @@ import polars as pl
 
 from observatorio.config import Settings
 from observatorio.db import connect, sql_path
-from observatorio.itbi import geosampa
+from observatorio.itbi import geosampa, tabela
 from observatorio.itbi.geosampa import Lookups
 from observatorio.storage import copy_query, touch_version
 from observatorio.text import TITLES, search_key, street_label
 
 log = logging.getLogger(__name__)
 
-OUTPUTS = ("geocode.parquet", "areas.parquet", "places.parquet")
-# Versão das regras (cascata, áreas, lugares): incremente ao mudar qualquer regra que altere as
-# saídas. Fica num arquivo ao lado delas; versão diferente refaz a geocodificação.
-GEOCODE_VERSION = 1
+OUTPUTS = ("geocode.parquet", "areas.parquet", "places.parquet", "tabela.parquet")
+# Versão das regras (cascata, áreas, lugares, tabela da API): incremente ao mudar qualquer regra
+# que altere as saídas. Fica num arquivo ao lado delas; versão diferente refaz a geocodificação.
+# 2: tabela.parquet (local, distrito/subprefeitura por ponto) para a API.
+GEOCODE_VERSION = 2
 VERSION_SIDECAR = ".geocode-version"
 PRECISOES = ("lote", "condominio", "quadra", "setor")
 
@@ -244,7 +246,7 @@ def _is_current(outputs: Sequence[Path], inputs: Sequence[Path]) -> bool:
 
 
 def build(transacoes: Path, lookups: Lookups, out_dir: Path) -> None:
-    """Gera ``geocode``, ``areas`` e ``places`` a partir das transações e do GeoSampa."""
+    """Gera ``geocode``, ``areas``, ``places`` e ``tabela`` (transações + GeoSampa)."""
     started = time.perf_counter()
     con = connect(spatial=True)
     try:
@@ -262,6 +264,8 @@ def build(transacoes: Path, lookups: Lookups, out_dir: Path) -> None:
         with _step("places.parquet"):
             build_places(con)
             copy_query(con, "SELECT * FROM places ORDER BY tipo, id", out_dir / "places.parquet")
+        with _step("tabela.parquet"):
+            tabela.build(con, transacoes, out_dir / "tabela.parquet")
         _log_coverage(con)
     finally:
         con.close()

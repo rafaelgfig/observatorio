@@ -11,7 +11,7 @@ from collections.abc import Callable
 from datetime import date
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Body, HTTPException, Path, Query, Response, status
+from fastapi import APIRouter, Body, HTTPException, Path, Query, Request, Response, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
@@ -22,21 +22,17 @@ from observatorio.itbi.queries import (
     AreaNomeada,
     ConsultaItbi,
     FiltroTile,
+    PedidoDistritos,
+    PedidoLocal,
     PedidoTransacoes,
     TipoArea,
 )
 
+# ``itbi``: a tabela montada na ingestão (já na ordem de Hilbert; sem junção nem ordenação aqui).
 DATASETS: list[Dataset] = [
     Dataset("itbi_transacoes", queries.PASTA_TRANSACOES),
-    Dataset("itbi_geocode", "itbi/geocode.parquet"),
     Dataset("itbi_areas", "itbi/areas.parquet", materialize=True),
-    Dataset(
-        "itbi",
-        materialize=True,
-        query=queries.ITBI_SQL,
-        requires=("itbi_transacoes", "itbi_geocode"),
-        order_by=queries.ITBI_ORDER,
-    ),
+    Dataset("itbi", queries.ARQUIVO_TABELA, materialize=True),
 ]
 
 router = APIRouter(prefix="/api/itbi", tags=["itbi"])
@@ -48,6 +44,7 @@ MVT_MEDIA_TYPE = "application/vnd.mapbox-vector-tile"
 # curto: após uma recarga de dados o navegador não deve mostrar tiles antigos por muito tempo
 CACHE_CONTROL_TILE = "public, max-age=300"
 CACHE_CONTROL_AREA = "public, max-age=86400"
+GEOJSON_MEDIA_TYPE = "application/geo+json"
 
 
 # ------------------------------------------------------------------ modelos de resposta
@@ -74,12 +71,21 @@ class PeriodoMeta(Periodo):
     completo_ate: date | None
 
 
+class RegraAtipico(BaseModel):
+    n: int
+    razao_min: float
+    razao_min_garagem: float
+    razao_max: float
+    valor_min: float
+
+
 class MetaItbi(BaseModel):
     periodo: PeriodoMeta
     atualizado_em: str | None
     tipos: list[TipoInfo]
     naturezas: list[NaturezaInfo]
     total: int
+    atipicos: RegraAtipico
 
 
 class ContagemPrecisao(BaseModel):
@@ -103,22 +109,36 @@ class ResumoTipo(BaseModel):
     rs_m2_mediano: float | None
 
 
+class Comparacao(BaseModel):
+    cidade_rs_m2_mediano: float | None
+    variacao_12m: float | None
+    rs_m2_12m: float | None
+    rs_m2_12m_anterior: float | None
+    variacao_fim: date | None
+
+
 class ResumoItbi(BaseModel):
     total: int
     valor_total: float
     valor_mediano: float | None
     rs_m2_mediano: float | None
     area_mediana: float | None
+    atipicos_ocultos: int
     precisao: ContagemPrecisao
     mensal: list[ResumoMes]
     por_tipo: list[ResumoTipo]
     periodo: Periodo
+    comparacao: Comparacao
 
 
 class LinhaTransacao(BaseModel):
     id: int
     data: date | None
     endereco: str | None
+    edificio: str | None
+    bloco: str | None
+    unidade: str | None
+    vagas: int | None
     complemento: str | None
     bairro: str | None
     cep: str | None
@@ -129,11 +149,16 @@ class LinhaTransacao(BaseModel):
     area_construida: float | None
     area_terreno: float | None
     valor: float | None
+    proporcao: float | None
+    valor_integral: float | None
+    valor_referencia: float | None
+    valor_atipico: bool
     rs_m2: float | None
     natureza: str | None
     financiamento: str | None
     acc_ano: int | None
     precisao: str | None
+    local: int | None
     lon: float | None
     lat: float | None
 
@@ -141,6 +166,84 @@ class LinhaTransacao(BaseModel):
 class PaginaTransacoes(BaseModel):
     total: int
     linhas: list[LinhaTransacao]
+
+
+class LinhaLocal(BaseModel):
+    id: int
+    data: date | None
+    endereco: str | None
+    complemento: str | None
+    unidade: str | None
+    bloco: str | None
+    vagas: int | None
+    tipo: str | None
+    area: float | None
+    valor: float | None
+    valor_integral: float | None
+    proporcao: float | None
+    valor_referencia: float | None
+    base_calculo: float | None
+    rs_m2: float | None
+    natureza: str | None
+    financiamento: str | None
+    valor_atipico: bool
+    na_planta: bool | None
+
+
+class AreaRef(BaseModel):
+    id: str
+    nome: str
+
+
+class ResumoLocal(BaseModel):
+    n: int
+    valor_mediano: float | None
+    rs_m2_mediano: float | None
+    periodo: Periodo
+    unidades: int
+    blocos: int
+    atipicos_ocultos: int
+
+
+class PaginaLocal(BaseModel):
+    local: int
+    lon: float | None
+    lat: float | None
+    precisao: str | None
+    endereco: str | None
+    edificio: str | None
+    distrito: AreaRef | None
+    subprefeitura: AreaRef | None
+    guias: int
+    resumo: ResumoLocal
+    total: int
+    linhas: list[LinhaLocal]
+
+
+class LocalNumero(BaseModel):
+    local: int
+    lon: float
+    lat: float
+    numero: int
+    exato: bool
+    guias: int
+    endereco: str | None
+
+
+class AreaValores(BaseModel):
+    id: str
+    nome: str
+    n: int
+    rs_m2_mediano: float | None
+    valor_mediano: float | None
+    variacao_12m: float | None
+
+
+class ValoresAreas(BaseModel):
+    nivel: str
+    areas: list[AreaValores]
+    quebras: list[float]
+    n_min: int
 
 
 class AreaItbi(BaseModel):
@@ -170,6 +273,10 @@ def _dados(consulta: ConsultaItbi) -> tuple[str, ...]:
     return ("itbi", "itbi_areas") if isinstance(consulta.area, AreaNomeada) else ("itbi",)
 
 
+def _gzip_aceito(request: Request) -> bool:
+    return "gzip" in request.headers.get("accept-encoding", "").lower()
+
+
 @router.get("/meta", response_model=MetaItbi)
 def meta(db: DB, settings: AppSettings) -> dict[str, Any]:
     """Período (transações e último mês completo), atualização, tipos, naturezas e total."""
@@ -181,7 +288,7 @@ def meta(db: DB, settings: AppSettings) -> dict[str, Any]:
 
 @router.post("/resumo", response_model=ResumoItbi)
 def resumo(db: DB, consulta: Consulta = None) -> dict[str, Any]:
-    """Totais, medianas, precisão da localização, série mensal e quebra por tipo."""
+    """Totais, medianas, precisão, série mensal, quebra por tipo e comparação com a cidade."""
     c = consulta or ConsultaItbi()
     return _run(db, _dados(c), lambda: queries.resumo(db, c))
 
@@ -192,10 +299,54 @@ def pontos(
     consulta: Consulta = None,
     limite: Annotated[int, Query(ge=1, le=queries.MAX_PONTOS)] = queries.LIMITE_PONTOS,
 ) -> Response:
-    """GeoJSON das transações (as mais recentes, se passar do limite), ``total``, ``truncado``."""
+    """GeoJSON com uma feição por local (os mais recentes, se passar do limite)."""
     c = consulta or ConsultaItbi()
     corpo = _run(db, _dados(c), lambda: queries.pontos(db, c, limite))
-    return Response(corpo, media_type="application/geo+json")
+    return Response(corpo, media_type=GEOJSON_MEDIA_TYPE)
+
+
+@router.post("/local", response_model=PaginaLocal)
+def local(db: DB, pedido: Annotated[PedidoLocal, Body()]) -> dict[str, Any]:
+    """Guias de um local (lote/condomínio) com os filtros, menos a área; paginadas."""
+    row = _run(db, ("itbi",), lambda: queries.local(db, pedido))
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"local {pedido.local} não encontrado")
+    return row
+
+
+@router.get("/endereco", response_model=LocalNumero)
+def endereco(
+    db: DB,
+    logradouro: Annotated[str, Query(min_length=1, max_length=120)],
+    numero: Annotated[int, Query(ge=1, le=99_999)],
+) -> dict[str, Any]:
+    """Local de um número da rua (``logradouro`` como na fonte): o exato ou o mais próximo."""
+    nome = " ".join(logradouro.split()).upper()
+    row = _run(db, ("itbi",), lambda: queries.endereco_numero(db, nome, numero))
+    if row is None:
+        detalhe = f"nenhuma guia geocodificada perto do nº {numero} de {nome}"
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detalhe)
+    return row
+
+
+@router.post("/distritos", response_model=ValoresAreas)
+def distritos(db: DB, pedido: Annotated[PedidoDistritos | None, Body()] = None) -> dict[str, Any]:
+    """Guias, medianas e variação de 12 meses por distrito ou subprefeitura (coroplético)."""
+    p = pedido or PedidoDistritos()
+    return _run(db, ("itbi", "itbi_areas"), lambda: queries.distritos(db, p))
+
+
+@router.get("/areas.geojson", response_class=Response)
+def areas_geojson(
+    db: DB, request: Request, tipo: Annotated[TipoArea, Query()] = "distrito"
+) -> Response:
+    """FeatureCollection dos distritos ou subprefeituras (``id``, ``nome``), já comprimida."""
+    corpo, comprimido = _run(db, ("itbi_areas",), lambda: queries.areas_geojson(db, tipo))
+    headers = {"Cache-Control": CACHE_CONTROL_AREA, "Vary": "Accept-Encoding"}
+    if _gzip_aceito(request):
+        headers["Content-Encoding"] = "gzip"
+        return Response(comprimido, media_type=GEOJSON_MEDIA_TYPE, headers=headers)
+    return Response(corpo, media_type=GEOJSON_MEDIA_TYPE, headers=headers)
 
 
 @router.post("/transacoes", response_model=PaginaTransacoes)
@@ -228,7 +379,7 @@ def exportar(db: DB, consulta: Consulta = None) -> StreamingResponse:
 
 @router.get("/transacao/{id}")
 def transacao(db: DB, id: Annotated[int, Path(ge=0, le=2**63 - 1)]) -> dict[str, Any]:
-    """Todas as colunas de uma guia, com coordenadas, precisão, regra (tier) e endereço."""
+    """Todas as colunas de uma guia, com coordenadas, precisão, regra (tier), local e endereço."""
     row = _run(db, ("itbi_transacoes", "itbi"), lambda: queries.transacao(db, id))
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f"transação {id} não encontrada")
@@ -259,7 +410,7 @@ def tiles(
     x: int,
     y: int,
 ) -> Response:
-    """Vector tile: ``itbi_agg`` (grade com ``n``, ``m2``) abaixo de z14; ``itbi`` a partir dele.
+    """Vector tile: ``itbi_agg`` (células: ``n``, ``m2``) abaixo de z14; ``itbi`` (locais) depois.
 
     Zoom fora de 9…18 ou tile inexistente → 404; tile fora da cidade → corpo vazio.
     """

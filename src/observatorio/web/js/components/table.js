@@ -12,7 +12,8 @@ import { el, fmt } from "../dom.js";
  * @property {string} label
  * @property {boolean} [num]
  * @property {string} [sortKey]                  nome usado pela API para ordenar (se ordenável)
- * @property {(row: any) => string} [render]     texto da célula (padrão: valor bruto)
+ * @property {(row: any) => string | Node} [render]  texto (ou nó montado com `el`) da célula;
+ *                                                padrão: valor bruto
  */
 
 /**
@@ -100,10 +101,15 @@ export function createTable(container, options) {
             "tr",
             {},
             columns.map((col, i) => {
-              const text = col.render ? col.render(row) : String(row[col.key] ?? "—");
-              if (i > 0 || !onRowClick) return el("td", { className: col.num ? "num" : "", textContent: text });
+              const content = col.render ? col.render(row) : String(row[col.key] ?? "—");
+              const fill = (/** @type {HTMLElement} */ node) => {
+                if (typeof content === "string") node.textContent = content;
+                else node.append(content);
+                return node;
+              };
+              if (i > 0 || !onRowClick) return fill(el("td", { className: col.num ? "num" : "" }));
               // ponto de teclado da linha: botão na 1ª célula (Enter/Espaço nativos)
-              const button = el("button", { className: "row-action", type: "button", textContent: text, title: rowLabel });
+              const button = fill(el("button", { className: "row-action", type: "button", title: rowLabel }));
               button.addEventListener("click", (event) => {
                 event.stopPropagation();
                 onRowClick(row);

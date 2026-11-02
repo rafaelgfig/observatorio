@@ -11,9 +11,10 @@ import pytest
 from conftest import PLACES_SCHEMA
 from observatorio.config import Settings
 from observatorio.db import connect
-from observatorio.itbi import geocode, geosampa
+from observatorio.itbi import geocode, geosampa, tabela
 from observatorio.itbi.geocode import TIERS, search_text, tier_query
 from observatorio.itbi.geosampa import Lookups
+from observatorio.itbi.parse import SCHEMA
 from observatorio.storage import copy_query
 from observatorio.text import street_label
 
@@ -114,6 +115,7 @@ def write_transacoes(root: Path, casos: list[Caso] = CASOS) -> Path:
             sql = caso.sql
             rows.append(
                 {
+                    **dict.fromkeys(SCHEMA),
                     "id": len(rows),
                     "ref_year": 2025 + i,
                     "ref_month": 1,
@@ -126,9 +128,13 @@ def write_transacoes(root: Path, casos: list[Caso] = CASOS) -> Path:
                     "cep": caso.cep,
                     "data_transacao": date(2025 + i, 1, 10),
                     "tipo": "apartamento",
+                    "na_planta": False,
+                    "valor_transacao": 100_000.0,
+                    "valor_integral": 100_000.0,
+                    "valor_atipico": False,
                 }
             )
-    frame = pl.DataFrame(rows, schema_overrides={"ref_year": pl.Int16, "ref_month": pl.Int8})
+    frame = pl.DataFrame(rows, schema=SCHEMA)
     for (year,), part in frame.group_by("ref_year"):
         dest = root / f"ref_year={year}" / "ref_month=01" / "part.parquet"
         dest.parent.mkdir(parents=True)
@@ -308,6 +314,101 @@ def test_rotulo_do_logradouro(logradouro: str, rotulo: str) -> None:
 )
 def test_texto_de_busca(logradouro: str, busca: str) -> None:
     assert search_text(logradouro, street_label(logradouro)) == busca
+
+
+# ---------------------------------------------------------------- tabela da API
+
+
+def test_tabela_da_api(outputs: Path) -> None:
+    linhas = read(outputs / "tabela.parquet")
+
+    assert tuple(linhas.columns) == tabela.COLUNAS
+    assert linhas.height == sum(c.linhas for c in CASOS)  # uma linha por guia
+    por_id = {row["id"]: row for row in linhas.iter_rows(named=True)}
+    # guias no mesmo ponto (lote exato com 2 guias; condomínio por 3 chaves) dividem o local
+    locais = {
+        (row["lon"], row["lat"]): row["local"] for row in por_id.values() if row["lon"] is not None
+    }
+    assert len(set(locais.values())) == len(locais)
+    for (lon, lat), local in locais.items():
+        assert tabela.local_de(lon, lat) == local
+        assert tabela.ponto_do_local(local) == (lon, lat)
+    no_condominio = linhas.filter(pl.col("lon") == round(P_COND_A[0], 6))
+    assert no_condominio.height == 3  # tiers 2, 5 e 7
+    assert no_condominio["local"].n_unique() == 1
+    # distrito/subprefeitura do ponto; sem coordenada → sem local nem área
+    com_ponto = linhas.filter(pl.col("lon").is_not_null())
+    assert set(com_ponto["distrito"]) == {"01"}
+    assert set(com_ponto["subprefeitura"]) == {"09"}
+    sem_ponto = linhas.filter(pl.col("lon").is_null())
+    assert sem_ponto.height == 3
+    assert sem_ponto.select(pl.col("local", "distrito", "subprefeitura").is_null().all()).row(
+        0
+    ) == (
+        True,
+        True,
+        True,
+    )
+    # ordem de Hilbert: sem coordenada no fim
+    assert linhas["lon"].tail(3).is_null().all()
+    assert linhas.schema["local"] == pl.Int64
+    assert linhas.schema["valor_atipico"] == pl.Boolean
+
+
+def test_tabela_refeita_so_a_partir_das_saidas(tmp_path: Path, outputs: Path) -> None:
+    original = read(outputs / "tabela.parquet")
+    (outputs / "tabela.parquet").unlink()
+
+    tabela.build_from_outputs(tmp_path / "transacoes", outputs)
+
+    assert read(outputs / "tabela.parquet").equals(original)
+
+
+def test_divisa_entre_areas_fica_com_o_menor_codigo(tmp_path: Path) -> None:
+    con = connect(spatial=True)
+    con.execute("CREATE TABLE resolvidas AS SELECT -46.6 AS lon, -23.5 AS lat")
+    con.execute(
+        """
+        CREATE TABLE areas AS
+        SELECT * FROM (VALUES
+            ('distrito', '02', ST_GeomFromText('POLYGON((-46.6 -23.6, -46.5 -23.6, -46.5 -23.4,
+                                                         -46.6 -23.4, -46.6 -23.6))')),
+            ('distrito', '01', ST_GeomFromText('POLYGON((-46.7 -23.6, -46.6 -23.6, -46.6 -23.4,
+                                                         -46.7 -23.4, -46.7 -23.6))'))
+        ) a(tipo, id, geom)
+        """
+    )
+    tabela._locais(con)
+    assert con.execute("SELECT distrito, subprefeitura FROM locais").fetchall() == [("01", None)]
+    con.close()
+
+
+@pytest.mark.parametrize(
+    ("lon", "lat"),
+    [(-46.6333, -23.5505), (-48.0, -25.0), (-45.903, -22.903), (-46.4102571, -23.5647712)],
+)
+def test_chave_do_local_e_inteiro_exato_em_javascript(lon: float, lat: float) -> None:
+    local = tabela.local_de(lon, lat)
+    assert local is not None
+    assert 0 <= local <= tabela.LOCAL_MAX < 2**53
+    assert tabela.ponto_do_local(local) == (round(lon, 6), round(lat, 6))
+
+
+@pytest.mark.parametrize(("lon", "lat"), [(-48.1, -23.5), (-46.6, -22.0), (0.0, 0.0)])
+def test_chave_do_local_fora_da_faixa(lon: float, lat: float) -> None:
+    assert tabela.local_de(lon, lat) is None
+
+
+def test_chave_do_local_igual_no_sql_e_no_python() -> None:
+    con = connect()
+    pontos = [(-46.6333, -23.5505), (-46.410257, -23.564771), (-48.0, -25.0), (-49.0, -23.5)]
+    for lon, lat in pontos:
+        sql = con.execute(
+            f"SELECT {tabela.LOCAL_SQL} FROM (SELECT round(?, 6) AS lon, round(?, 6) AS lat)",
+            [lon, lat],
+        ).fetchall()[0][0]
+        assert sql == tabela.local_de(lon, lat), (lon, lat)
+    con.close()
 
 
 # ---------------------------------------------------------------- run

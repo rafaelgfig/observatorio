@@ -1,8 +1,11 @@
 """API ITBI (``/api/itbi``) sobre transações, geocodificação e áreas sintéticas.
 
-Cenário: nove guias em sete pontos em torno do centro de um tile z14 de São Paulo (``A``…``G``,
+Cenário: dez guias em sete pontos em torno do centro de um tile z14 de São Paulo (``A``…``G``,
 a leste do centro ou ao norte), com todas as precisões, uma guia sem coordenada, naturezas com
-o código 5 nos dois rótulos e chaves com número nulo (junção *null-safe*).
+o código 5 nos dois rótulos, chaves com número nulo (junção *null-safe*) e uma guia com valor
+atípico (``T10``, R$ 11 mil num condomínio de referência R$ 130 mil). ``A`` e ``G`` ficam no
+mesmo ponto: um local só. A tabela da API sai de :func:`tabela.build_from_outputs`, como na
+ingestão.
 """
 
 from __future__ import annotations
@@ -26,7 +29,7 @@ from observatorio.config import Settings
 from observatorio.db import connect
 from observatorio.downloads import Manifest, RemoteVersion
 from observatorio.itbi import api as itbi_api
-from observatorio.itbi import queries
+from observatorio.itbi import queries, tabela
 from observatorio.itbi.geocode import PRECISOES
 from observatorio.itbi.parse import SCHEMA, TIPOS
 from observatorio.storage import copy_query
@@ -55,6 +58,12 @@ def xy(ponto: str) -> tuple[float, float]:
     assert lon is not None
     assert lat is not None
     return lon, lat
+
+
+def local(ponto: str) -> int:
+    chave = tabela.local_de(*xy(ponto))
+    assert chave is not None
+    return chave
 
 
 # ponto → (lon, lat, precisao, tier); "F" não foi geocodificado
@@ -99,22 +108,47 @@ GUIAS: list[tuple[Any, ...]] = [
      "R TESTE", 22, "22", "01001000", "B", "-BL 2; AP 3"),
     ((2026, 8, 1), "2026-08-20", "comercial", CV, 1_000_000.0, 200.0, 1000.0, 5000.0,
      "R TESTE", None, "1577A", "01001000", "G", "LOJA"),
+    ((2025, 7, 1), "2025-07-10", "apartamento", CV, 11_000.0, 60.0, 1000.0, None,
+     "R TESTE", 22, "22", "01001000", "B", "AP 44 BL 2"),
 ]  # fmt: skip
 
-T1, T2, T3, T4, T5, T6, T7, T8, T9 = (_id(*g[0]) for g in GUIAS)
-TODAS = {T1, T2, T3, T4, T5, T6, T7, T8, T9}
-ATE_QUADRA = TODAS - {T6, T7}  # padrão: sem setor e sem coordenada
+T1, T2, T3, T4, T5, T6, T7, T8, T9, T10 = (_id(*g[0]) for g in GUIAS)
+TODAS = {T1, T2, T3, T4, T5, T6, T7, T8, T9, T10}
+TIPICAS = TODAS - {T10}  # padrão: sem as de valor atípico
+ATE_QUADRA = TIPICAS - {T6, T7}  # padrão: também sem setor e sem coordenada
 SQL_DO_PONTO = {p: f"0010010000{i}" for i, p in enumerate("ABCDEFG")}
 SQL_DO_PONTO["G"] = SQL_DO_PONTO["A"]  # mesmo lote, chave sem número
+
+# Colunas derivadas pelo parse (aqui, escritas à mão).
+EXTRAS: dict[int, dict[str, Any]] = {
+    T1: {"unidade": "11"},
+    T5: {"vagas": 1},
+    T8: {
+        "unidade": "3",
+        "bloco": "2",
+        "edificio": "Edifício Teste",
+        "valor_referencia": 550_000.0,
+        "base_calculo": 600_000.0,
+    },
+    T10: {
+        "unidade": "44",
+        "bloco": "2",
+        "edificio": "Edifício Teste",
+        "valor_referencia": 130_000.0,
+        "base_calculo": 130_000.0,
+        "valor_atipico": True,
+    },
+}
 
 
 def _guia(g: tuple[Any, ...]) -> dict[str, Any]:
     (ano, mes, linha), data, tipo, (nat_cod, nat), valor, ac, at, rs_m2 = g[:8]
     logradouro, numero, numero_raw, cep, ponto, complemento = g[8:]
     sql = SQL_DO_PONTO[ponto]
+    id_ = _id(ano, mes, linha)
     return {
         **dict.fromkeys(SCHEMA),
-        "id": _id(ano, mes, linha),
+        "id": id_,
         "ref_year": ano,
         "ref_month": mes,
         "row_in_sheet": linha,
@@ -132,6 +166,7 @@ def _guia(g: tuple[Any, ...]) -> dict[str, Any]:
         "natureza": nat,
         "valor_transacao": valor,
         "data_transacao": date.fromisoformat(data),
+        "proporcao_pct": 100.0,
         "area_terreno_m2": at,
         "area_construida_m2": ac,
         "uso": "RESIDÊNCIA" if tipo == "casa" else "OUTROS",
@@ -139,19 +174,18 @@ def _guia(g: tuple[Any, ...]) -> dict[str, Any]:
         "acc_ano": 1990,
         "tipo": tipo,
         "na_planta": False,
+        "valor_integral": valor,
+        "valor_atipico": False,
         "rs_m2": rs_m2,
         "possivel_duplicata": False,
         "aba": f"M{mes:02d}-{ano}",
+        **EXTRAS.get(id_, {}),
     }
 
 
 def escreve_cenario(processed: Path) -> None:
     pasta = processed / "itbi"
-    linhas = [_guia(g) for g in GUIAS]
-    for (ano, mes), grupo in pl.DataFrame(linhas, schema=SCHEMA).group_by("ref_year", "ref_month"):
-        destino = pasta / "transacoes" / f"ref_year={ano}" / f"ref_month={mes:02d}"
-        destino.mkdir(parents=True)
-        grupo.sort("row_in_sheet").write_parquet(destino / "part.parquet")
+    escreve_transacoes(pasta / "transacoes", [_guia(g) for g in GUIAS])
     chaves = {(SQL_DO_PONTO[g[12]], g[8], g[9], g[11], g[12]) for g in GUIAS}
     geocode = [
         {
@@ -178,6 +212,14 @@ def escreve_cenario(processed: Path) -> None:
     }
     pl.DataFrame(geocode, schema=schema).write_parquet(pasta / "geocode.parquet")
     _escreve_areas(pasta / "areas.parquet")
+    tabela.build_from_outputs(pasta / "transacoes", pasta)
+
+
+def escreve_transacoes(raiz: Path, linhas: list[dict[str, Any]]) -> None:
+    for (ano, mes), grupo in pl.DataFrame(linhas, schema=SCHEMA).group_by("ref_year", "ref_month"):
+        destino = raiz / f"ref_year={ano}" / f"ref_month={mes:02d}"
+        destino.mkdir(parents=True, exist_ok=True)
+        grupo.sort("row_in_sheet").write_parquet(destino / "part.parquet")
 
 
 def _quadrado(w: float, s: float, e: float, n: float) -> str:
@@ -252,15 +294,26 @@ CIRCULO = {"tipo": "circulo", "lon": LON0, "lat": LAT0, "raio_m": 500}
 ROTAS_POST = ["resumo", "pontos", "transacoes", "exportar"]
 
 
-@pytest.mark.parametrize("rota", ROTAS_POST)
-def test_sem_dados_post_503(client: TestClient, rota: str) -> None:
-    resp = client.post(f"/api/itbi/{rota}", json={})
+@pytest.mark.parametrize(
+    ("rota", "corpo"),
+    [*((rota, {}) for rota in ROTAS_POST), ("local", {"local": 1}), ("distritos", {})],
+)
+def test_sem_dados_post_503(client: TestClient, rota: str, corpo: dict[str, Any]) -> None:
+    resp = client.post(f"/api/itbi/{rota}", json=corpo)
     assert resp.status_code == 503
     assert "ingest" in resp.json()["detail"]
 
 
 @pytest.mark.parametrize(
-    "url", ["meta", "transacao/201501000000", "area/distrito/01", f"tiles/{_Z}/{_TX}/{_TY}.mvt"]
+    "url",
+    [
+        "meta",
+        "transacao/201501000000",
+        "area/distrito/01",
+        "areas.geojson",
+        f"tiles/{_Z}/{_TX}/{_TY}.mvt",
+        "endereco?logradouro=R%20TESTE&numero=10",
+    ],
 )
 def test_sem_dados_get_503(client: TestClient, url: str) -> None:
     resp = client.get(f"/api/itbi/{url}")
@@ -268,13 +321,22 @@ def test_sem_dados_get_503(client: TestClient, url: str) -> None:
     assert "ingest" in resp.json()["detail"]
 
 
-def test_sem_geocode_nao_materializa(settings: Settings, processado: Path) -> None:
+def test_sem_tabela_nao_carrega(settings: Settings, processado: Path) -> None:
     shutil.copytree(processado, settings.processed_dir)
-    (settings.processed_dir / "itbi" / "geocode.parquet").unlink()
+    (settings.processed_dir / "itbi" / "tabela.parquet").unlink()
     with TestClient(create_app(settings, watch=False)) as client:
         assert client.post("/api/itbi/resumo", json={}).status_code == 503
         # as áreas continuam disponíveis
         assert client.get("/api/itbi/area/distrito/01").status_code == 200
+
+
+def test_a_api_nao_junta_nem_ordena_na_carga(api: TestClient) -> None:
+    """A tabela vem pronta da ingestão (local, distrito, ordem de Hilbert)."""
+    db = api.app.state.db  # type: ignore[attr-defined]
+    assert db.datasets["itbi"].query is None
+    assert db.datasets["itbi"].order_by is None
+    colunas = [r["column_name"] for r in db.fetch_dicts("DESCRIBE itbi")]
+    assert tuple(colunas) == tabela.COLUNAS
 
 
 # ------------------------------------------------------------------ meta
@@ -292,14 +354,21 @@ def test_meta(api: TestClient) -> None:
         "pago_ate": "2026-08-31",
         "completo_ate": "2026-07-31",
     }
-    assert meta["total"] == 9
+    assert meta["total"] == 10
     assert meta["tipos"] == [{"id": t, "nome": t.capitalize()} for t in TIPOS]
     assert meta["naturezas"] == [
-        {"cod": 1, "nome": "Compra e venda", "n": 6},
+        {"cod": 1, "nome": "Compra e venda", "n": 7},
         {"cod": 2, "nome": CESSAO[1], "n": 1},
         {"cod": 5, "nome": "Adjudicação compulsória", "n": 1},
         {"cod": 5, "nome": "Excesso de meação ou quinhão na partilha", "n": 1},
     ]
+    assert meta["atipicos"] == {
+        "n": 1,
+        "razao_min": 0.5,
+        "razao_min_garagem": 0.2,
+        "razao_max": 5.0,
+        "valor_min": 5000.0,
+    }
     assert meta["atualizado_em"]  # sem manifesto: data dos Parquet
 
 
@@ -317,6 +386,7 @@ def test_atualizado_em_vem_do_manifesto(tmp_path: Path) -> None:
 def test_tipos_e_precisoes_seguem_o_pipeline() -> None:
     assert get_args(queries.Tipo.__value__) == TIPOS
     assert {p for ps in queries._PRECISAO_SQL.values() for p in ps} | {"setor"} == set(PRECISOES)
+    assert set(get_args(queries.Atipicos.__value__)) == set(queries._ATIPICOS_SQL)
 
 
 # ------------------------------------------------------------------ resumo
@@ -324,13 +394,15 @@ def test_tipos_e_precisoes_seguem_o_pipeline() -> None:
 
 def test_resumo_sem_filtros_qualquer_precisao(api: TestClient) -> None:
     resumo = post(api, "resumo", {"precisao": "qualquer"})
-    valores = [g[4] for g in GUIAS]
+    tipicas = GUIAS[:9]
+    valores = [g[4] for g in tipicas]
     assert resumo["total"] == 9
+    assert resumo["atipicos_ocultos"] == 1  # T10
     assert resumo["valor_total"] == pytest.approx(sum(valores))
     assert resumo["valor_mediano"] == statistics.median(valores)
-    assert resumo["rs_m2_mediano"] == statistics.median(g[7] for g in GUIAS if g[7] is not None)
+    assert resumo["rs_m2_mediano"] == statistics.median(g[7] for g in tipicas if g[7] is not None)
     # área: construída, ou do terreno para terreno (400 m² em vez de 0)
-    areas = [g[6] if g[2] == "terreno" else g[5] for g in GUIAS]
+    areas = [g[6] if g[2] == "terreno" else g[5] for g in tipicas]
     assert resumo["area_mediana"] == statistics.median(areas)
     assert resumo["precisao"] == {"lote": 6, "quadra": 1, "aproximado": 1, "sem_coordenada": 1}
     assert resumo["periodo"] == {"min": "2014-12-20", "max": "2026-08-20"}
@@ -344,6 +416,12 @@ def test_resumo_sem_filtros_qualquer_precisao(api: TestClient) -> None:
         "2025-07",
         "2026-08",
     ]
+    assert resumo["mensal"][-2] == {  # jul/2025: só T7 (T10 é atípica)
+        "mes": "2025-07",
+        "n": 1,
+        "valor_mediano": 250_000.0,
+        "rs_m2_mediano": 5000.0,
+    }
     agosto = resumo["mensal"][-1]
     assert agosto == {
         "mes": "2026-08",
@@ -352,7 +430,8 @@ def test_resumo_sem_filtros_qualquer_precisao(api: TestClient) -> None:
         "rs_m2_mediano": 6500.0,
     }
     por_tipo = {t["tipo"]: t for t in resumo["por_tipo"]}
-    assert [t["tipo"] for t in resumo["por_tipo"]][:2] == ["apartamento", "casa"]  # n desc
+    # n desc; empate (3 × 3, T10 fora) pelo nome
+    assert [t["tipo"] for t in resumo["por_tipo"]][:2] == ["apartamento", "casa"]
     assert por_tipo["garagem"] == {
         "tipo": "garagem",
         "n": 1,
@@ -360,6 +439,16 @@ def test_resumo_sem_filtros_qualquer_precisao(api: TestClient) -> None:
         "rs_m2_mediano": None,
     }
     assert por_tipo["casa"]["n"] == 3
+    assert por_tipo["apartamento"]["n"] == 3  # T10 fora
+    # sem área: a "cidade" é a própria seleção; 12 meses até jul/2026 sem guias com R$/m²,
+    # os 12 anteriores com T6 e T7
+    assert resumo["comparacao"] == {
+        "cidade_rs_m2_mediano": resumo["rs_m2_mediano"],
+        "variacao_12m": None,
+        "rs_m2_12m": None,
+        "rs_m2_12m_anterior": 10_000.0,
+        "variacao_fim": "2026-07-31",
+    }
 
 
 def test_resumo_vazio(api: TestClient) -> None:
@@ -370,11 +459,42 @@ def test_resumo_vazio(api: TestClient) -> None:
         "valor_mediano": None,
         "rs_m2_mediano": None,
         "area_mediana": None,
+        "atipicos_ocultos": 0,
         "precisao": {"lote": 0, "quadra": 0, "aproximado": 0, "sem_coordenada": 0},
         "mensal": [],
         "por_tipo": [],
         "periodo": {"min": None, "max": None},
+        "comparacao": {
+            "cidade_rs_m2_mediano": None,
+            "variacao_12m": None,
+            "rs_m2_12m": None,
+            "rs_m2_12m_anterior": None,
+            "variacao_fim": "2026-07-31",
+        },
     }
+
+
+def test_resumo_atipicos(api: TestClient) -> None:
+    somente = post(api, "resumo", {"atipicos": "somente"})
+    assert (somente["total"], somente["valor_mediano"], somente["rs_m2_mediano"]) == (
+        1,
+        11_000.0,
+        None,
+    )
+    assert somente["atipicos_ocultos"] == 0
+    assert [m["mes"] for m in somente["mensal"]] == ["2025-07"]  # meses só com típicas somem
+    incluir = post(api, "resumo", {"atipicos": "incluir", "precisao": "qualquer"})
+    assert (incluir["total"], incluir["atipicos_ocultos"]) == (10, 0)
+    assert incluir["valor_mediano"] == statistics.median(g[4] for g in GUIAS)
+
+
+def test_resumo_compara_com_a_cidade(api: TestClient) -> None:
+    casas = {"tipos": ["casa"]}
+    resumo = post(api, "resumo", {**casas, "area": {"tipo": "distrito", "id": "01"}})
+    assert (resumo["total"], resumo["rs_m2_mediano"]) == (1, 4000.0)  # só T2
+    # cidade: as mesmas casas sem a área (T2 e T3)
+    assert resumo["comparacao"]["cidade_rs_m2_mediano"] == 6000.0
+    assert post(api, "resumo", casas)["rs_m2_mediano"] == 6000.0
 
 
 def test_corpo_ausente_equivale_a_consulta_vazia(api: TestClient) -> None:
@@ -382,6 +502,100 @@ def test_corpo_ausente_equivale_a_consulta_vazia(api: TestClient) -> None:
     assert resp.status_code == 200
     assert resp.json() == post(api, "resumo", {})
     assert resp.json()["total"] == len(ATE_QUADRA)
+
+
+# ------------------------------------------------------------------ variação de 12 meses
+
+
+@pytest.mark.parametrize(
+    ("data_fim", "fim", "ini_atual", "ini_anterior"),
+    [
+        (None, "2026-07-31", "2025-08-01", "2024-08-01"),
+        ("2026-12-31", "2026-07-31", "2025-08-01", "2024-08-01"),  # depois do último completo
+        ("2025-12-31", "2025-12-31", "2025-01-01", "2024-01-01"),  # fim de mês: o mês conta
+        ("2025-12-30", "2025-11-30", "2024-12-01", "2023-12-01"),  # mês parcial fica de fora
+        ("2024-02-29", "2024-02-29", "2023-03-01", "2022-03-01"),
+    ],
+)
+def test_janelas_da_variacao(
+    data_fim: str | None, fim: str, ini_atual: str, ini_anterior: str
+) -> None:
+    consulta = queries.ConsultaItbi(
+        data_ini=date(2010, 1, 1), data_fim=date.fromisoformat(data_fim) if data_fim else None
+    )
+    janelas = queries.janelas(consulta, date(2026, 7, 31))
+    assert janelas == queries.Janelas(
+        date.fromisoformat(ini_anterior), date.fromisoformat(ini_atual), date.fromisoformat(fim)
+    )
+
+
+def _guias_da_variacao() -> list[dict[str, Any]]:
+    """25 guias com R$ 4.000/m² em set–dez/2024 e 25 com R$ 5.000/m² em set–dez/2025, nos
+    pontos A (distrito 01) e B; pagamento até ago/2026 (completo até jul/2026)."""
+    linhas = []
+    for i in range(50):
+        recente = i >= 25
+        ano = 2025 if recente else 2024
+        base = _guia(GUIAS[0 if i % 2 else 7])
+        linhas.append(
+            base
+            | {
+                "id": _id(2026, 8, i),
+                "ref_year": 2026,
+                "ref_month": 8,
+                "row_in_sheet": i,
+                "data_transacao": date(ano, 9 + i % 4, 1 + i % 28),
+                "rs_m2": 5000.0 if recente else 4000.0,
+                "tipo": "apartamento",
+            }
+        )
+    return linhas
+
+
+@pytest.fixture(scope="module")
+def api_variacao(tmp_path_factory: pytest.TempPathFactory) -> Iterator[TestClient]:
+    settings = Settings(data_dir=tmp_path_factory.mktemp("itbi_variacao"))
+    pasta = settings.processed_dir / "itbi"
+    escreve_cenario(settings.processed_dir)
+    shutil.rmtree(pasta / "transacoes")
+    escreve_transacoes(pasta / "transacoes", _guias_da_variacao())
+    tabela.build_from_outputs(pasta / "transacoes", pasta)
+    with TestClient(create_app(settings, watch=False)) as client:
+        yield client
+
+
+def test_variacao_de_12_meses(api_variacao: TestClient) -> None:
+    comparacao = post(api_variacao, "resumo", {})["comparacao"]
+    assert comparacao == {
+        "cidade_rs_m2_mediano": 4500.0,
+        "variacao_12m": 0.25,
+        "rs_m2_12m": 5000.0,
+        "rs_m2_12m_anterior": 4000.0,
+        "variacao_fim": "2026-07-31",
+    }
+    # data_ini não corta a janela anterior; data_fim no fim de 2025 a desloca, com o mesmo
+    # resultado (as guias estão em set–dez)
+    mesmo = post(api_variacao, "resumo", {"data_ini": "2025-06-01", "data_fim": "2025-12-31"})
+    assert mesmo["total"] == 25
+    assert mesmo["comparacao"]["variacao_12m"] == 0.25
+    assert mesmo["comparacao"]["variacao_fim"] == "2025-12-31"
+
+
+def test_variacao_exige_guias_nas_duas_janelas(
+    api_variacao: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(queries, "VARIACAO_MIN_N", 26)
+    comparacao = post(api_variacao, "resumo", {})["comparacao"]
+    assert comparacao["variacao_12m"] is None
+    assert comparacao["rs_m2_12m"] == 5000.0  # as medianas continuam saindo
+
+
+def test_variacao_por_distrito(api_variacao: TestClient) -> None:
+    resposta = post(api_variacao, "distritos", {})
+    por_id = {a["id"]: a for a in resposta["areas"]}
+    assert por_id["01"]["n"] == 50
+    assert por_id["01"]["variacao_12m"] == 0.25
+    assert por_id["02"]["variacao_12m"] is None
 
 
 # ------------------------------------------------------------------ filtros
@@ -393,17 +607,18 @@ def test_corpo_ausente_equivale_a_consulta_vazia(api: TestClient) -> None:
         ({}, ATE_QUADRA),
         ({"precisao": "lote"}, ATE_QUADRA - {T3}),
         ({"precisao": "quadra"}, ATE_QUADRA),
-        ({"precisao": "qualquer"}, TODAS),
+        ({"precisao": "qualquer"}, TIPICAS),
         ({"tipos": ["casa"]}, {T2, T3}),
         ({"tipos": ["casa"], "precisao": "qualquer"}, {T2, T3, T7}),
         ({"tipos": []}, ATE_QUADRA),
-        ({"tipos": list(TIPOS), "precisao": "qualquer"}, TODAS),
+        ({"tipos": list(TIPOS), "precisao": "qualquer"}, TIPICAS),
         ({"naturezas": [5]}, {T2, T3}),
         ({"naturezas": [2], "precisao": "qualquer"}, {T7}),
         ({"naturezas": []}, ATE_QUADRA),
         ({"data_ini": "2022-01-01", "data_fim": "2024-12-31"}, {T3, T4, T5}),
         ({"data_ini": "2026-08-20"}, {T9}),
         ({"data_fim": "2014-12-20"}, {T1}),
+        # valor integral (aqui todas com proporção de 100%)
         ({"valor_min": 500_000, "valor_max": 1_000_000}, {T2, T3, T8, T9}),
         ({"area_min": 100}, {T2, T3, T4, T9}),
         # terreno usa a área do terreno (400 m²), não a construída (0)
@@ -414,6 +629,12 @@ def test_corpo_ausente_equivale_a_consulta_vazia(api: TestClient) -> None:
         ({"cep": "01001"}, {T1, T2, T3, T5, T8, T9}),
         ({"cep": "08255290", "precisao": "qualquer"}, {T7}),
         ({"cep": "  "}, ATE_QUADRA),
+        # valores atípicos
+        ({"atipicos": "excluir"}, ATE_QUADRA),
+        ({"atipicos": "incluir"}, ATE_QUADRA | {T10}),
+        ({"atipicos": "somente"}, {T10}),
+        ({"atipicos": "incluir", "valor_max": 20_000}, {T10}),
+        ({"atipicos": "somente", "tipos": ["casa"]}, set()),
     ],
 )
 def test_filtros(api: TestClient, consulta: dict[str, Any], esperado: set[int]) -> None:
@@ -437,7 +658,7 @@ class TestCirculo:
 
     def test_qualquer_com_area_exclui_sem_coordenada(self, api: TestClient) -> None:
         circulo = {**CIRCULO, "raio_m": 5000}
-        assert ids(api, {"area": circulo, "precisao": "qualquer"}) == TODAS - {T7}
+        assert ids(api, {"area": circulo, "precisao": "qualquer"}) == TIPICAS - {T7}
 
     def test_combinado_com_outros_filtros(self, api: TestClient) -> None:
         # C (quadra) cai pela precisão; D, E e F pela distância
@@ -445,6 +666,7 @@ class TestCirculo:
         assert ids(api, consulta) == {T1, T2, T8}
         resumo = post(api, "resumo", consulta)
         assert resumo["precisao"] == {"lote": 3, "quadra": 0, "aproximado": 0, "sem_coordenada": 0}
+        assert resumo["atipicos_ocultos"] == 1
 
 
 class TestPoligono:
@@ -485,7 +707,7 @@ class TestAreaNomeada:
 
     def test_subprefeitura(self, api: TestClient) -> None:
         consulta = {"area": {"tipo": "subprefeitura", "id": "09"}, "precisao": "qualquer"}
-        assert ids(api, consulta) == TODAS - {T7}
+        assert ids(api, consulta) == TIPICAS - {T7}
 
     @pytest.mark.parametrize("rota", ROTAS_POST)
     def test_area_desconhecida_404(self, api: TestClient, rota: str) -> None:
@@ -497,47 +719,69 @@ class TestAreaNomeada:
         assert "não encontrad" in resp.json()["detail"]
 
 
-# ------------------------------------------------------------------ pontos
+# ------------------------------------------------------------------ pontos (um por local)
 
 
-def test_pontos_mais_recentes_quando_trunca(api: TestClient) -> None:
+def test_pontos_um_por_local_mais_recentes_quando_trunca(api: TestClient) -> None:
     colecao = post(api, "pontos", {}, limite=3)
     assert colecao["type"] == "FeatureCollection"
-    assert (colecao["total"], colecao["truncado"]) == (len(ATE_QUADRA), True)
-    assert [f["id"] for f in colecao["features"]] == [T9, T8, T5]
-    assert colecao["features"][0] == {
-        "type": "Feature",
-        "id": T9,
-        "geometry": {"type": "Point", "coordinates": pytest.approx(xy("G"), abs=1e-6)},
-        "properties": {
-            "v": 1_000_000.0,
-            "m2": 5000.0,
-            "t": "comercial",
-            "d": "2026-08-20",
-            "p": "lote",
-        },
+    # 7 guias em 4 locais (A e G são o mesmo ponto); os 3 com a guia mais recente
+    assert (colecao["total"], colecao["locais"], colecao["truncado"]) == (7, 4, True)
+    assert [f["id"] for f in colecao["features"]] == [local("A"), local("B"), local("D")]
+    ag, b, d = colecao["features"]
+    assert ag["geometry"] == {"type": "Point", "coordinates": pytest.approx(xy("A"), abs=1e-6)}
+    props = ag["properties"]
+    assert props.pop("t") in {"apartamento", "garagem", "comercial"}  # empate: qualquer um
+    assert props == {
+        "n": 3,  # T1, T5 e T9
+        "m2": 5000.0,  # mediana de 5000, nulo (garagem) e 5000
+        "v": 300_000.0,  # mediana do valor integral
+        "d": "2026-08-20",
+        "p": "lote",
+        "u": 1,  # unidades distintas: "11"
+        "e": None,
     }
-    assert colecao["features"][2]["properties"]["m2"] is None  # garagem
+    assert b["properties"] | {"t": None} == {
+        "n": 2,  # T2 e T8; T10 (atípica) fica de fora
+        "m2": 6000.0,
+        "v": 550_000.0,
+        "d": "2026-08-15",
+        "t": None,
+        "p": "condominio",
+        "u": 1,
+        "e": "Edifício Teste",
+    }
+    assert d["properties"]["t"] == "terreno"
 
 
 def test_pontos_sem_coordenada_ficam_fora(api: TestClient) -> None:
     colecao = post(api, "pontos", {"precisao": "qualquer"})
-    assert colecao["total"] == 8
+    assert (colecao["total"], colecao["locais"]) == (8, 5)
     assert not colecao["truncado"]
-    assert {f["id"] for f in colecao["features"]} == TODAS - {T7}
+    assert {f["id"] for f in colecao["features"]} == {local(p) for p in "ABCDE"}
     assert {f["properties"]["p"] for f in colecao["features"]} == set(PRECISOES)
 
 
-def test_pontos_nao_materializa_o_filtro(api: TestClient) -> None:
-    """Contagem e top-N leem a tabela direto: sem CTE materializada (cópia de tudo filtrado)."""
+def test_pontos_atipicos(api: TestClient) -> None:
+    colecao = post(api, "pontos", {"atipicos": "somente"})
+    assert (colecao["total"], colecao["locais"]) == (1, 1)
+    (feicao,) = colecao["features"]
+    assert feicao["id"] == local("B")
+    assert (feicao["properties"]["v"], feicao["properties"]["m2"]) == (11_000.0, None)
+    assert post(api, "pontos", {"atipicos": "incluir"})["total"] == 8
+
+
+def test_pontos_materializa_so_a_agregacao_por_local(api: TestClient) -> None:
+    """As guias filtradas não vão para um buffer (~100 MiB na cidade inteira); a agregação
+    por local (uma linha por ponto), lida três vezes, sim."""
     db = api.app.state.db  # type: ignore[attr-defined]
     with db.cursor() as cur:
         plano = cur.execute(
             "EXPLAIN " + queries._PONTOS_SQL.replace("{where}", "tipo = ?"), ["casa", 10]
         ).fetchall()
     texto = "\n".join(linha[1] for linha in plano)
-    assert "CTE" not in texto
-    assert texto.count("Seq Scan") >= 2
+    assert "CTE Name: g " in texto
+    assert "CTE Name: f " not in texto
 
 
 def test_pontos_vazio(api: TestClient) -> None:
@@ -546,9 +790,308 @@ def test_pontos_vazio(api: TestClient) -> None:
     assert resp.json() == {
         "type": "FeatureCollection",
         "total": 0,
+        "locais": 0,
         "truncado": False,
         "features": [],
     }
+
+
+# ------------------------------------------------------------------ local (guias de um ponto)
+
+
+def pagina_local(client: TestClient, ponto: str, **corpo: Any) -> Any:
+    return post(client, "local", {"local": local(ponto), **corpo})
+
+
+def test_local_do_condominio(api: TestClient) -> None:
+    resposta = pagina_local(api, "B")
+    lon, lat = xy("B")
+    assert {k: v for k, v in resposta.items() if k != "linhas"} == {
+        "local": local("B"),
+        "lon": pytest.approx(lon, abs=1e-6),
+        "lat": pytest.approx(lat, abs=1e-6),
+        "precisao": "condominio",
+        "endereco": "Rua Teste, 22",  # o mais frequente no local (T8 e T10)
+        "edificio": "Edifício Teste",
+        "distrito": {"id": "01", "nome": "Sé"},
+        "subprefeitura": {"id": "09", "nome": "Sé"},
+        "guias": 3,  # todas as do local, sem filtros
+        "resumo": {
+            "n": 2,
+            "valor_mediano": 550_000.0,
+            "rs_m2_mediano": 6000.0,
+            "periodo": {"min": "2018-01-10", "max": "2026-08-15"},
+            "unidades": 1,
+            "blocos": 1,
+            "atipicos_ocultos": 1,
+        },
+        "total": 2,
+    }
+    assert [linha["id"] for linha in resposta["linhas"]] == [T8, T2]
+    assert resposta["linhas"][0] == {
+        "id": T8,
+        "data": "2026-08-15",
+        "endereco": "Rua Teste, 22",
+        "complemento": "-BL 2; AP 3",
+        "unidade": "3",
+        "bloco": "2",
+        "vagas": None,
+        "tipo": "apartamento",
+        "area": 75.0,
+        "valor": 600_000.0,
+        "valor_integral": 600_000.0,
+        "proporcao": 100.0,
+        "valor_referencia": 550_000.0,
+        "base_calculo": 600_000.0,
+        "rs_m2": 8000.0,
+        "natureza": "Compra e venda",
+        "financiamento": None,
+        "valor_atipico": False,
+        "na_planta": False,
+    }
+
+
+def test_local_com_atipicos(api: TestClient) -> None:
+    incluir = pagina_local(api, "B", consulta={"atipicos": "incluir"})
+    assert incluir["total"] == 3
+    # a mediana de valor do local é sempre das guias típicas
+    assert incluir["resumo"]["valor_mediano"] == 550_000.0
+    assert incluir["resumo"]["atipicos_ocultos"] == 0
+    t10 = next(linha for linha in incluir["linhas"] if linha["id"] == T10)
+    assert (t10["valor"], t10["valor_referencia"], t10["valor_atipico"]) == (
+        11_000.0,
+        130_000.0,
+        True,
+    )
+    somente = pagina_local(api, "B", consulta={"atipicos": "somente"})
+    assert [linha["id"] for linha in somente["linhas"]] == [T10]
+    assert somente["resumo"]["valor_mediano"] is None
+
+
+@pytest.mark.parametrize(
+    ("ordem", "direcao", "esperado"),
+    [
+        ("unidade", "asc", [T8, T10, T2]),  # "3" < "44"; sem unidade no fim
+        ("unidade", "desc", [T10, T8, T2]),
+        ("data", "asc", [T2, T10, T8]),
+        ("valor", "desc", [T8, T2, T10]),
+        ("bloco", "asc", [T10, T8, T2]),  # empate no bloco: pelo id
+    ],
+)
+def test_local_ordenacao(api: TestClient, ordem: str, direcao: str, esperado: list[int]) -> None:
+    resposta = pagina_local(
+        api, "B", consulta={"atipicos": "incluir"}, ordem=ordem, direcao=direcao
+    )
+    assert [linha["id"] for linha in resposta["linhas"]] == esperado
+
+
+def test_local_ignora_a_area_e_segue_os_filtros(api: TestClient) -> None:
+    longe = {"tipo": "circulo", "lon": xy("E")[0], "lat": xy("E")[1], "raio_m": 50}
+    assert pagina_local(api, "B", consulta={"area": longe})["total"] == 2
+    casas = pagina_local(api, "B", consulta={"tipos": ["casa"]})
+    assert [linha["id"] for linha in casas["linhas"]] == [T2]
+    assert casas["guias"] == 3
+
+
+def test_local_paginacao_e_mesmo_ponto_de_duas_chaves(api: TestClient) -> None:
+    # A e G: duas chaves de geocodificação, um ponto
+    resposta = pagina_local(api, "A", por_pagina=2, pagina=2)
+    assert (resposta["total"], [linha["id"] for linha in resposta["linhas"]]) == (3, [T1])
+    assert resposta["endereco"] in {"Rua Teste, 10", "Rua Teste, s/n", "Rua Teste, 1577A"}
+
+
+def test_local_inexistente_404(api: TestClient) -> None:
+    resp = api.post("/api/itbi/local", json={"local": tabela.local_de(-46.5, -23.6)})
+    assert resp.status_code == 404
+    assert "não encontrado" in resp.json()["detail"]
+
+
+@pytest.mark.parametrize(
+    "corpo",
+    [
+        {},
+        {"local": -1},
+        {"local": tabela.LOCAL_MAX + 1},
+        {"local": "abc"},
+        {"local": 1, "ordem": "id"},
+        {"local": 1, "por_pagina": 201},
+        {"local": 1, "extra": True},
+    ],
+)
+def test_local_invalido_422(api: TestClient, corpo: dict[str, Any]) -> None:
+    assert api.post("/api/itbi/local", json=corpo).status_code == 422
+
+
+def test_unidades_na_planta_contam_bloco_e_unidade(tmp_path: Path) -> None:
+    """Na planta, todas as unidades estão sob o SQL do lote-mãe: contar SQLs daria 1."""
+    settings = Settings(data_dir=tmp_path / "dados")
+    escreve_cenario(settings.processed_dir)
+    pasta = settings.processed_dir / "itbi"
+    for mes in ("2025/07", "2026/08"):
+        ano, m = mes.split("/")
+        parte = pasta / "transacoes" / f"ref_year={ano}" / f"ref_month={m}" / "part.parquet"
+        pl.read_parquet(parte).with_columns(na_planta=pl.col("id").is_in([T8, T10])).write_parquet(
+            parte
+        )
+    tabela.build_from_outputs(pasta / "transacoes", pasta)
+
+    with TestClient(create_app(settings, watch=False)) as client:
+        todas = {"atipicos": "incluir"}
+        # B: T2 (o SQL do lote) + T8 (bloco 2, ap 3) e T10 (bloco 2, ap 44), as duas na planta
+        resumo = post(client, "local", {"local": local("B"), "consulta": todas})["resumo"]
+        assert (resumo["n"], resumo["unidades"]) == (3, 3)
+        feicoes = post(client, "pontos", todas)["features"]
+        assert next(f for f in feicoes if f["id"] == local("B"))["properties"]["u"] == 3
+
+
+# ------------------------------------------------------------------ número da rua (busca)
+
+
+def endereco(client: TestClient, logradouro: str, numero: int) -> Any:
+    return client.get("/api/itbi/endereco", params={"logradouro": logradouro, "numero": numero})
+
+
+def test_endereco_numero_exato(api: TestClient) -> None:
+    resp = endereco(api, "R TESTE", 22)
+    assert resp.status_code == 200, resp.text
+    lon, lat = xy("B")
+    assert resp.json() == {
+        "local": local("B"),
+        "lon": pytest.approx(lon, abs=1e-6),
+        "lat": pytest.approx(lat, abs=1e-6),
+        "numero": 22,
+        "exato": True,
+        "guias": 2,  # T8 e T10 (a atípica também: a busca não usa os filtros)
+        "endereco": "Rua Teste, 22",
+    }
+    # o nome como digitado (minúsculas, espaços) também vale
+    assert endereco(api, "  r   teste ", 10).json()["local"] == local("A")
+    # guia com localização só aproximada (centro da quadra) também
+    assert endereco(api, "R TESTE", 30).json()["local"] == local("C")
+
+
+def test_endereco_numero_mais_proximo(api: TestClient) -> None:
+    # 21: 20 (T2) e 22 (T8, T10) à mesma distância → o de mais guias
+    resposta = endereco(api, "R TESTE", 21).json()
+    assert (resposta["numero"], resposta["exato"], resposta["local"]) == (22, False, local("B"))
+    assert endereco(api, "R TESTE", 12).json()["numero"] == 10
+
+
+@pytest.mark.parametrize(
+    ("logradouro", "numero"),
+    [
+        ("R TESTE", 10 + queries.NUMERO_TOLERANCIA + 21),  # longe demais de 30
+        ("R SEM PONTO", 1),  # a guia da rua não foi geocodificada
+        ("R INEXISTENTE", 10),
+        ("R TESTE'; DROP TABLE itbi; --", 10),
+    ],
+)
+def test_endereco_sem_guia_perto_404(api: TestClient, logradouro: str, numero: int) -> None:
+    resp = endereco(api, logradouro, numero)
+    assert resp.status_code == 404
+    assert "nenhuma guia" in resp.json()["detail"]
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        {"logradouro": "R TESTE"},
+        {"numero": 10},
+        {"logradouro": "R TESTE", "numero": 0},
+        {"logradouro": "R TESTE", "numero": 100_000},
+        {"logradouro": "R TESTE", "numero": "dez"},
+        {"logradouro": "", "numero": 10},
+        {"logradouro": "R" * 121, "numero": 10},
+    ],
+)
+def test_endereco_invalido_422(api: TestClient, params: dict[str, Any]) -> None:
+    assert api.get("/api/itbi/endereco", params=params).status_code == 422
+
+
+# ------------------------------------------------------------------ distritos e áreas
+
+
+def test_distritos(api: TestClient) -> None:
+    resposta = post(api, "distritos", {})
+    assert resposta == {
+        "nivel": "distrito",
+        "areas": [
+            # A, B e G (C e D ficam a leste do distrito); T10 atípica fora
+            {
+                "id": "01",
+                "nome": "Sé",
+                "n": 5,
+                "rs_m2_mediano": 5000.0,
+                "valor_mediano": 500_000.0,
+                "variacao_12m": None,
+            },
+            # só o ponto do setor (fora pela precisão padrão)
+            {
+                "id": "02",
+                "nome": "Bela Vista",
+                "n": 0,
+                "rs_m2_mediano": None,
+                "valor_mediano": None,
+                "variacao_12m": None,
+            },
+        ],
+        "quebras": [],
+        "n_min": queries.AREA_MIN_N,
+    }
+    # a área da consulta é ignorada; os outros filtros valem
+    assert post(api, "distritos", {"consulta": {"area": CIRCULO}}) == resposta
+    qualquer = post(api, "distritos", {"consulta": {"precisao": "qualquer"}})
+    assert [a["n"] for a in qualquer["areas"]] == [5, 1]
+    casas = post(api, "distritos", {"consulta": {"tipos": ["casa"]}})
+    assert casas["areas"][0]["n"] == 1
+    assert api.post("/api/itbi/distritos").json() == resposta  # corpo ausente
+
+
+def test_subprefeituras(api: TestClient) -> None:
+    resposta = post(api, "distritos", {"nivel": "subprefeitura"})
+    assert [(a["id"], a["nome"], a["n"]) for a in resposta["areas"]] == [("09", "Sé", 7)]
+
+
+def test_distritos_invalido_422(api: TestClient) -> None:
+    assert api.post("/api/itbi/distritos", json={"nivel": "bairro"}).status_code == 422
+
+
+def test_quebras() -> None:
+    assert queries._quebras([1.0, 2.0]) == []
+    assert queries._quebras([float(i) for i in range(8)]) == [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+
+
+def test_areas_geojson(api: TestClient) -> None:
+    resp = api.get("/api/itbi/areas.geojson", params={"tipo": "distrito"})
+    assert resp.status_code == 200
+    assert resp.headers["content-type"] == "application/geo+json"
+    assert resp.headers["content-encoding"] == "gzip"  # o TestClient aceita gzip
+    assert "max-age" in resp.headers["cache-control"]
+    colecao = resp.json()
+    assert colecao["type"] == "FeatureCollection"
+    assert [(f["id"], f["properties"]) for f in colecao["features"]] == [
+        ("01", {"id": "01", "nome": "Sé"}),
+        ("02", {"id": "02", "nome": "Bela Vista"}),
+    ]
+    anel = colecao["features"][0]["geometry"]["coordinates"][0]
+    assert all(len(str(c).split(".")[-1]) <= 6 for ponto in anel for c in ponto)
+    sem_gzip = api.get("/api/itbi/areas.geojson", headers={"Accept-Encoding": "identity"})
+    assert "content-encoding" not in sem_gzip.headers
+    assert sem_gzip.json()["features"][0]["id"] == "01"  # padrão: distritos
+    sub = api.get("/api/itbi/areas.geojson", params={"tipo": "subprefeitura"}).json()
+    assert [f["id"] for f in sub["features"]] == ["09"]
+    assert api.get("/api/itbi/areas.geojson", params={"tipo": "bairro"}).status_code == 422
+
+
+def test_areas_geojson_em_cache(api: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    db = api.app.state.db  # type: ignore[attr-defined]
+    primeiro = queries.areas_geojson(db, "distrito")
+
+    def falha(*args: Any) -> Any:
+        pytest.fail("deveria vir do cache")
+
+    monkeypatch.setattr(db, "fetch_scalar", falha)
+    assert queries.areas_geojson(db, "distrito") == primeiro
 
 
 # ------------------------------------------------------------------ transações
@@ -573,6 +1116,10 @@ def test_linhas_da_tabela(api: TestClient) -> None:
         "id": T8,
         "data": "2026-08-15",
         "endereco": "Rua Teste, 22",
+        "edificio": "Edifício Teste",
+        "bloco": "2",
+        "unidade": "3",
+        "vagas": None,
         "complemento": "-BL 2; AP 3",
         "bairro": "CENTRO",
         "cep": "01001000",
@@ -583,15 +1130,21 @@ def test_linhas_da_tabela(api: TestClient) -> None:
         "area_construida": 75.0,
         "area_terreno": 1000.0,
         "valor": 600_000.0,
+        "proporcao": 100.0,
+        "valor_integral": 600_000.0,
+        "valor_referencia": 550_000.0,
+        "valor_atipico": False,
         "rs_m2": 8000.0,
         "natureza": "Compra e venda",
         "financiamento": None,
         "acc_ano": 1990,
         "precisao": "condominio",
+        "local": local("B"),
         "lon": pytest.approx(lon, abs=1e-6),
         "lat": pytest.approx(lat, abs=1e-6),
     }
-    assert (linhas[T7]["lon"], linhas[T7]["precisao"]) == (None, None)
+    assert (linhas[T7]["lon"], linhas[T7]["precisao"], linhas[T7]["local"]) == (None, None, None)
+    assert linhas[T5]["vagas"] == 1
 
 
 @pytest.mark.parametrize(
@@ -658,20 +1211,42 @@ def test_exportar_csv(api: TestClient) -> None:
     texto = resp.content.decode("utf-8-sig")
     cabecalho, *linhas = texto.splitlines()
     assert cabecalho.split(";") == [rotulo for _, rotulo in queries.COLUNAS_CSV]
-    assert cabecalho.startswith("ID;Data da transação;Endereço;")
+    assert cabecalho.startswith(
+        "ID;Data da transação;Endereço;Edifício/condomínio;Bloco/torre;Unidade;Vagas;"
+    )
     assert len(linhas) == 9
-    primeira = linhas[0]
-    # mais recente primeiro; vírgula decimal; texto iniciado por "-" protegido
-    assert primeira.startswith(f"{T9};2026-08-20;Rua Teste, 1577A;LOJA;CENTRO;01001-000;comercial;")
-    assert ";200,0;1000,0;1000000,0;5000,0;Compra e venda;;1990;lote;" in primeira
+    # mais recente primeiro; vírgula decimal
+    assert linhas[0].startswith(f"{T9};2026-08-20;Rua Teste, 1577A;;;;;LOJA;CENTRO;01001-000;")
     t8 = next(linha for linha in linhas if linha.startswith(str(T8)))
-    assert ';"\'-BL 2; AP 3";' in t8  # contém ";" → entre aspas
-    campos = {int(c[0]): c for c in _csv(resp)[1:]}
-    assert len(campos[T8]) == len(queries.COLUNAS_CSV)
-    assert campos[T8][3] == "'-BL 2; AP 3"
-    lon, lat = (float(v.replace(",", ".")) for v in campos[T8][-2:])
+    assert ';"\'-BL 2; AP 3";' in t8  # contém ";" → entre aspas; "-" protegido
+    nomes = [rotulo for _, rotulo in queries.COLUNAS_CSV]
+    campos = {int(c[0]): dict(zip(nomes, c, strict=True)) for c in _csv(resp)[1:]}
+    assert {k: campos[T8][k] for k in nomes[3:7]} == {
+        "Edifício/condomínio": "Edifício Teste",
+        "Bloco/torre": "2",
+        "Unidade": "3",
+        "Vagas": "",
+    }
+    assert campos[T8]["Complemento"] == "'-BL 2; AP 3"
+    assert (
+        campos[T8]["Valor declarado (R$)"],
+        campos[T8]["Proporção transmitida (%)"],
+        campos[T8]["Valor integral (R$, 100%)"],
+        campos[T8]["Valor venal de referência (R$)"],
+        campos[T8]["Valor atípico"],
+        campos[T8]["R$/m²"],
+    ) == ("600000,0", "100,0", "600000,0", "550000,0", "não", "8000,0")
+    assert campos[T5]["Vagas"] == "1"
+    lon, lat = (float(campos[T8][k].replace(",", ".")) for k in ("Longitude", "Latitude"))
     assert (lon, lat) == pytest.approx(xy("B"), abs=1e-6)
-    assert campos[T7][-3:] == ["", "", ""]  # sem precisão nem coordenadas
+    assert [campos[T7][k] for k in nomes[-3:]] == ["", "", ""]  # sem precisão nem coordenadas
+
+
+def test_exportar_atipicos(api: TestClient) -> None:
+    resp = api.post("/api/itbi/exportar", json={"atipicos": "somente"})
+    nomes = [rotulo for _, rotulo in queries.COLUNAS_CSV]
+    (linha,) = [dict(zip(nomes, c, strict=True)) for c in _csv(resp)[1:]]
+    assert (linha["ID"], linha["Valor atípico"]) == (str(T10), "sim")
 
 
 def test_exportar_vazio_tem_cabecalho(api: TestClient) -> None:
@@ -692,6 +1267,23 @@ def test_exportar_trunca_e_lotes(api: TestClient, monkeypatch: pytest.MonkeyPatc
     assert (resp.headers["x-total-linhas"], resp.headers["x-linhas-exportadas"]) == ("9", "3")
     assert (resp.headers["x-truncado"], resp.headers["x-limite-linhas"]) == ("true", "3")
     assert [int(linha[0]) for linha in _csv(resp)[1:]] == [T9, T8, T7]
+
+
+_TEXTOS_LOTE = (
+    *("logradouro", "numero_txt", "complemento", "bairro", "uso", "padrao", "edificio"),
+    *("bloco", "unidade", "natureza", "financiamento", "precisao"),
+)
+_LINHA_VAZIA: dict[str, list[Any]] = {
+    "edificio": [None, None],
+    "bloco": [None, None],
+    "unidade": [None, None],
+    "vagas": [None, None],
+    "proporcao": [None, None],
+    "valor_integral": [None, None],
+    "valor_referencia": [None, None],
+    "valor_atipico": [False, None],
+    "local": [None, None],
+}
 
 
 def test_csv_lote_formata_e_protege_formulas() -> None:
@@ -718,23 +1310,23 @@ def test_csv_lote_formata_e_protege_formulas() -> None:
             "precisao": ["lote", None],
             "lon": [-46.5, None],
             "lat": [-23.5, None],
+            **_LINHA_VAZIA,
+            "unidade": ["12", "-3"],
+            "vagas": [2, None],
         },
-        schema_overrides={"uso": pl.String, "padrao": pl.String},
+        schema_overrides=dict.fromkeys(_TEXTOS_LOTE, pl.String)
+        | {"vagas": pl.Int16, "proporcao": pl.Float64},
     )
     linhas = queries.csv_lote(frame).splitlines()
     # CEP com hífen (a planilha não perde o zero); números negativos não são "fórmula"
     assert linhas[0] == (
-        "1;2025-01-02;Avenida Brigadeiro Faria Lima, 1;'=SOMA(A1);'@x;01452-000;comercial;não;;;"
-        "10,25;;1,5;;Compra e venda;;2000;lote;-46,5;-23,5"
+        "1;2025-01-02;Avenida Brigadeiro Faria Lima, 1;;;12;2;'=SOMA(A1);'@x;01452-000;comercial;"
+        "não;;;10,25;;1,5;;;;não;;Compra e venda;;2000;lote;-46,5;-23,5"
     )
-    # toda coluna de texto é protegida, não só as de endereço (financiamento, aqui)
-    assert linhas[1] == '2;;;"SALA ""2""";\'+y;;casa;;;;;1,0;2,0;;;\'=HYPERLINK(1);;;;'
-
-
-_TEXTOS_LOTE = (
-    *("logradouro", "numero_txt", "complemento", "bairro", "uso", "padrao"),
-    *("natureza", "financiamento", "precisao"),
-)
+    # toda coluna de texto é protegida, não só as de endereço (financiamento, unidade)
+    assert linhas[1] == (
+        '2;;;;;\'-3;;"SALA ""2""";\'+y;;casa;;;;;1,0;2,0;;;;;;;\'=HYPERLINK(1);;;;'
+    )
 
 
 def test_csv_lote_protege_qualquer_texto_e_cep_fora_do_padrao() -> None:
@@ -755,13 +1347,16 @@ def test_transacao_todas_as_colunas(api: TestClient) -> None:
     resp = api.get(f"/api/itbi/transacao/{T8}")
     assert resp.status_code == 200
     linha = resp.json()
-    assert set(linha) == set(SCHEMA) | {"lon", "lat", "precisao", "tier", "endereco"}
+    extras = {"lon", "lat", "precisao", "tier", "endereco", "local", "distrito", "subprefeitura"}
+    assert set(linha) == set(SCHEMA) | extras
     assert linha["id"] == T8
     assert (linha["ref_year"], linha["ref_month"], linha["aba"]) == (2026, 8, "M08-2026")
     assert (linha["precisao"], linha["tier"]) == ("condominio", 2)
+    assert (linha["local"], linha["distrito"], linha["subprefeitura"]) == (local("B"), "01", "09")
+    assert (linha["unidade"], linha["bloco"], linha["edificio"]) == ("3", "2", "Edifício Teste")
     assert linha["endereco"] == "Rua Teste, 22"
     assert linha["data_transacao"] == "2026-08-15"
-    assert linha["lon"] == pytest.approx(PONTOS["B"][0])
+    assert linha["lon"] == pytest.approx(PONTOS["B"][0], abs=1e-6)
 
 
 def test_transacao_sem_coordenada_e_numero_texto(api: TestClient) -> None:
@@ -884,8 +1479,24 @@ def _valor_mvt(buf: bytes) -> Any:
             return inteiro
 
 
+def _vertices(comandos: list[int]) -> list[tuple[int, int]]:
+    """Vértices absolutos de uma geometria MVT (MoveTo/LineTo; ClosePath não repete o 1º)."""
+    i, x, y, saida = 0, 0, 0, []
+    while i < len(comandos):
+        comando, vezes = comandos[i] & 7, comandos[i] >> 3
+        i += 1
+        if comando == 7:
+            continue
+        for _ in range(vezes):
+            x, y = x + _zigzag(comandos[i]), y + _zigzag(comandos[i + 1])
+            i += 2
+            saida.append((x, y))
+    return saida
+
+
 def decodifica_mvt(blob: bytes) -> dict[str, list[dict[str, Any]]]:
-    """Camadas → feições (propriedades + ``_xy`` do ponto) de um vector tile."""
+    """Camadas → feições (propriedades, ``_tipo`` 1 = ponto / 3 = polígono, ``_xy`` do 1º
+    vértice e ``_vertices``) de um vector tile."""
     camadas: dict[str, list[dict[str, Any]]] = {}
     for campo, _, camada in _campos(blob):
         assert campo == 3
@@ -908,18 +1519,27 @@ def decodifica_mvt(blob: bytes) -> dict[str, list[dict[str, Any]]]:
         saida = []
         for feicao in feicoes:
             props: dict[str, Any] = {}
-            for c, _, dados in _campos(feicao):
+            for c, inteiro, dados in _campos(feicao):
                 if c == 2:
                     tags = _packed(dados)
                     props |= {
                         chaves[k]: valores[v] for k, v in zip(tags[::2], tags[1::2], strict=True)
                     }
+                elif c == 3:
+                    props["_tipo"] = inteiro
                 elif c == 4:
-                    _, zx, zy = _packed(dados)[:3]
-                    props["_xy"] = (_zigzag(zx), _zigzag(zy))
+                    vertices = _vertices(_packed(dados))
+                    props["_xy"] = vertices[0]
+                    props["_vertices"] = vertices
             saida.append(props)
         camadas[nome] = saida
     return camadas
+
+
+def _area_em_tela(vertices: list[tuple[int, int]]) -> float:
+    """Área com sinal (fórmula do agrimensor) com y para baixo: > 0 = sentido horário."""
+    pares = zip(vertices, [*vertices[1:], vertices[0]], strict=True)
+    return sum(x0 * y1 - x1 * y0 for (x0, y0), (x1, y1) in pares) / 2
 
 
 def tile(client: TestClient, z: int, x: int, y: int, **params: Any) -> bytes:
@@ -930,6 +1550,10 @@ def tile(client: TestClient, z: int, x: int, y: int, **params: Any) -> bytes:
     return bytes(resp.content)
 
 
+def _props(feicao: dict[str, Any]) -> dict[str, Any]:
+    return {k: v for k, v in feicao.items() if not k.startswith("_")}
+
+
 class TestTiles:
     def test_pontos_um_por_local(self, api: TestClient) -> None:
         camadas = decodifica_mvt(tile(api, _Z, _TX, _TY))
@@ -938,17 +1562,18 @@ class TestTiles:
         # A e G (mesma posição) viram uma feição com 3 guias; a mais recente é T9
         assert [f["n"] for f in feicoes] == [3, 2, 1, 1]
         centro = feicoes[0]
-        assert {k: v for k, v in centro.items() if k != "_xy"} == {
+        assert _props(centro) == {
+            "local": local("A"),
             "id": T9,
-            "v": 1_000_000.0,
+            "v": 1_000_000.0,  # valor integral da mais recente
             "m2": 5000.0,  # mediana de 5000 (T1), nulo (garagem) e 5000 (T9)
             "t": "comercial",
             "d": "2026-08-20",
             "n": 3,
         }
-        assert centro["_xy"] == (2048, 2048)  # centro do tile
-        assert feicoes[1]["id"] == T8
-        assert feicoes[1]["m2"] == 6000.0
+        assert (centro["_tipo"], centro["_xy"]) == (1, (2048, 2048))  # centro do tile
+        assert (feicoes[1]["id"], feicoes[1]["local"]) == (T8, local("B"))
+        assert feicoes[1]["m2"] == 6000.0  # T10 (atípica) fora
 
     def test_filtros(self, api: TestClient) -> None:
         casas = decodifica_mvt(tile(api, _Z, _TX, _TY, tipo="casa"))["itbi"]
@@ -960,6 +1585,10 @@ class TestTiles:
         )
         assert sorted(f["id"] for f in periodo["itbi"]) == [T3, T4]
         assert tile(api, _Z, _TX, _TY, data_ini="2030-01-01") == b""
+        (atipica,) = decodifica_mvt(tile(api, _Z, _TX, _TY, atipicos="somente"))["itbi"]
+        assert (atipica["id"], atipica["n"], atipica["v"]) == (T10, 1, 11_000.0)
+        incluir = decodifica_mvt(tile(api, _Z, _TX, _TY, atipicos="incluir"))["itbi"]
+        assert sum(f["n"] for f in incluir) == len(ATE_QUADRA) + 1
 
     def test_filtros_de_valor_area_e_endereco_valem_nos_tiles(self, api: TestClient) -> None:
         # os mesmos filtros do resumo/tabela: o mapa não pode mostrar outra seleção
@@ -967,6 +1596,7 @@ class TestTiles:
             {"valor_min": 600_000},
             {"area_max": 90},
             {"valor_min": 100_000, "valor_max": 900_000, "area_min": 50},
+            {"atipicos": "incluir", "valor_max": 600_000},
         ):
             resumo = api.post("/api/itbi/resumo", json=params).json()
             camadas = decodifica_mvt(tile(api, _Z, _TX, _TY, **params))
@@ -977,16 +1607,24 @@ class TestTiles:
         url = f"/api/itbi/tiles/{_Z}/{_TX}/{_TY}.mvt"
         assert api.get(url, params={"valor_min": 10, "valor_max": 5}).status_code == 422
         assert api.get(url, params={"cep": "abc"}).status_code == 422
+        assert api.get(url, params={"atipicos": "talvez"}).status_code == 422
 
-    def test_grade_abaixo_de_z14(self, api: TestClient) -> None:
+    def test_grade_de_celulas_abaixo_de_z14(self, api: TestClient) -> None:
         z = 12
         x, y = _TX >> 2, _TY >> 2
         camadas = decodifica_mvt(tile(api, z, x, y))
         assert list(camadas) == ["itbi_agg"]
         celulas = camadas["itbi_agg"]
         assert sum(c["n"] for c in celulas) == len(ATE_QUADRA)
-        assert all(set(c) <= {"n", "m2", "_xy"} for c in celulas)
-        assert all(c["_xy"][0] % queries.GRADE == queries.GRADE // 2 for c in celulas)
+        assert all(set(_props(c)) <= {"n", "m2"} for c in celulas)
+        g = queries.GRADE
+        for celula in celulas:
+            # quadrado alinhado à grade, anel externo no sentido horário (y para baixo)
+            assert celula["_tipo"] == 3
+            x0, y0 = celula["_xy"]
+            assert (x0 % g, y0 % g) == (0, 0)
+            assert celula["_vertices"] == [(x0, y0), (x0 + g, y0), (x0 + g, y0 + g), (x0, y0 + g)]
+            assert _area_em_tela(celula["_vertices"]) == g * g
         qualquer = decodifica_mvt(tile(api, z, x, y, precisao="qualquer"))["itbi_agg"]
         assert sum(c["n"] for c in qualquer) == 8  # sem a guia sem coordenada
 
@@ -1032,8 +1670,9 @@ class TestTiles:
         assert tile(api, _Z, _TX, _TY, tipo=["apartamento", "casa"]) == primeiro
         assert chamadas == []
         tile(api, _Z, _TX, _TY, tipo="casa")
-        assert chamadas == [1]
-        assert len(itbi_api.CACHE_TILES) == 2
+        tile(api, _Z, _TX, _TY, tipo="casa", atipicos="incluir")  # outra chave
+        assert chamadas == [1, 1]
+        assert len(itbi_api.CACHE_TILES) == 3
 
 
 def test_tile_cache_lru() -> None:
@@ -1048,6 +1687,24 @@ def test_tile_cache_lru() -> None:
     assert len(cache) == 2
     cache.put("grande", b"x" * 11)  # maior que o limite: ignorado
     assert cache.get("grande") is None
+
+
+def test_cache_por_carga_vale_ate_a_recarga(api: TestClient) -> None:
+    db = api.app.state.db  # type: ignore[attr-defined]
+    cache = queries.CachePorCarga(max_itens=2)
+    chamadas: list[int] = []
+
+    def calcula() -> int:
+        chamadas.append(1)
+        return len(chamadas)
+
+    assert cache.obter(db, "x", calcula) == 1
+    assert cache.obter(db, "x", calcula) == 1
+    db.refresh()  # dados recarregados: outra chave
+    assert cache.obter(db, "x", calcula) == 2
+    for chave in "abc":
+        cache.obter(db, chave, calcula)
+    assert len(cache._itens) == 2
 
 
 # ------------------------------------------------------------------ validações (422)
@@ -1091,6 +1748,7 @@ _ANEL = [[_W, _S], [_W + 0.001, _S], [_W + 0.001, _S + 0.001], [_W, _S]]
         ({"tipos": ["mansao"]}, "tipos"),
         ({"naturezas": [0]}, "naturezas"),
         ({"precisao": "exata"}, "precisao"),
+        ({"atipicos": "talvez"}, "atipicos"),
         ({"cep": "0100"}, "cep"),
         ({"cep": "'; DROP TABLE itbi; --"}, "cep"),
         ({"data_ini": "ontem"}, "data_ini"),
@@ -1099,8 +1757,10 @@ _ANEL = [[_W, _S], [_W + 0.001, _S], [_W + 0.001, _S + 0.001], [_W, _S]]
     ],
 )
 def test_consulta_invalida_422(api: TestClient, corpo: dict[str, Any], trecho: str) -> None:
-    for rota in ("resumo", "transacoes"):
-        enviado = {"consulta": corpo} if rota == "transacoes" else corpo
+    # /distritos ignora a área: o polígono só é conferido no banco por quem o usa
+    no_banco = trecho in {"grande", "sem área"}
+    for rota in ("resumo", "transacoes") if no_banco else ("resumo", "transacoes", "distritos"):
+        enviado = {"consulta": corpo} if rota != "resumo" else corpo
         resp = api.post(f"/api/itbi/{rota}", json=enviado)
         assert resp.status_code == 422, resp.text
         assert trecho in resp.text
@@ -1111,6 +1771,7 @@ def test_consulta_invalida_422(api: TestClient, corpo: dict[str, Any], trecho: s
     [
         ({"ordem": "data; DROP TABLE itbi"}, "ordem"),
         ({"ordem": "id"}, "ordem"),
+        ({"ordem": "unidade"}, "ordem"),  # só no /local
         ({"direcao": "lado"}, "direcao"),
         ({"pagina": 0}, "pagina"),
         ({"por_pagina": 0}, "por_pagina"),
@@ -1154,11 +1815,13 @@ def test_injecao_no_logradouro_nao_vaza(api: TestClient, logradouro: str) -> Non
     assert post(api, "resumo", corpo)["total"] == 0
     assert post(api, "transacoes", {"consulta": corpo})["linhas"] == []
     assert post(api, "pontos", corpo)["features"] == []
+    assert all(a["n"] == 0 for a in post(api, "distritos", {"consulta": corpo})["areas"])
+    assert post(api, "local", {"local": local("B"), "consulta": corpo})["total"] == 0
     resp = api.post("/api/itbi/exportar", json=corpo)
     assert resp.status_code == 200
     assert len(_csv(resp)) == 1
     # a tabela continua lá, inteira
-    assert api.get("/api/itbi/meta").json()["total"] == 9
+    assert api.get("/api/itbi/meta").json()["total"] == 10
 
 
 # ------------------------------------------------------------------ áreas do lote (na planta)
@@ -1168,21 +1831,23 @@ def test_area_do_lote_nao_vale_como_area_da_unidade(tmp_path: Path) -> None:
     """Na planta (T8) e fração < 10% (T9): as áreas do IPTU são do lote inteiro."""
     settings = Settings(data_dir=tmp_path / "dados")
     escreve_cenario(settings.processed_dir)
-    parte = (
-        settings.processed_dir / "itbi" / "transacoes" / "ref_year=2026" / "ref_month=08"
-    ) / "part.parquet"
+    pasta = settings.processed_dir / "itbi"
+    parte = pasta / "transacoes" / "ref_year=2026" / "ref_month=08" / "part.parquet"
     pl.read_parquet(parte).with_columns(
         na_planta=pl.col("id") == T8,
         area_construida_m2=pl.when(pl.col("id") == T8).then(3997.0).otherwise(0.0),
         proporcao_pct=pl.when(pl.col("id") == T9).then(5.0).otherwise(100.0),
     ).write_parquet(parte)
+    tabela.build_from_outputs(pasta / "transacoes", pasta)
 
     with TestClient(create_app(settings, watch=False)) as client:
         todas = {"precisao": "qualquer"}
         assert T8 not in ids(client, {**todas, "area_min": 1000})
         assert T9 not in ids(client, {**todas, "area_max": 80})
         assert not {T8, T9} & ids(client, {**todas, "area_min": 0})
-        com_lotes = [g[6] if g[2] == "terreno" else g[5] for g in GUIAS if g[0][:2] != (2026, 8)]
+        com_lotes = [
+            g[6] if g[2] == "terreno" else g[5] for g in GUIAS[:9] if g[0][:2] != (2026, 8)
+        ]
         assert post(client, "resumo", todas)["area_mediana"] == statistics.median(com_lotes)
 
         corpo = {"consulta": todas, "ordem": "area", "direcao": "asc", "por_pagina": 200}

@@ -1,1 +1,495 @@
 /* Estilos específicos da tela ITBI · São Paulo (carregado após app.css). */
+
+/* ------------------------------------------------------------------ selos */
+
+/* o texto do selo diz o que é; a cor da borda só reforça */
+.badge {
+  display: inline-flex;
+  align-items: center;
+  height: 18px;
+  padding: 0 6px;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  background: var(--surface-2);
+  color: var(--text-secondary);
+  font-size: 10.5px;
+  font-weight: 600;
+  line-height: 1;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.badge--warn {
+  border-color: var(--warning);
+  color: var(--text-primary);
+}
+
+.value-cell {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 1px;
+}
+
+.value-line {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 4px;
+}
+
+.value-line--start {
+  justify-content: flex-start;
+}
+
+.value-sub {
+  color: var(--text-muted);
+  font-size: var(--fs-xs);
+}
+
+/* endereço com o nome do edifício embaixo (tabela de transações) */
+.itbi-addr {
+  display: inline-flex;
+  flex-direction: column;
+}
+
+.itbi-addr small {
+  color: var(--text-muted);
+  font-size: var(--fs-xs);
+}
+
+/* ---------------------------------------------------- controles sobre o mapa */
+
+.itbi-mapcolor {
+  top: var(--space-3);
+  left: var(--space-3);
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-1) var(--space-1) var(--space-1) var(--space-3);
+}
+
+.itbi-mapcolor-label {
+  color: var(--text-secondary);
+  font-size: var(--fs-xs);
+  white-space: nowrap;
+}
+
+.itbi-mapcolor .segmented {
+  width: auto;
+}
+
+.itbi-mapcolor .segmented span {
+  padding: 3px var(--space-2);
+  font-size: var(--fs-xs);
+}
+
+/* legenda: notas longas quebram a linha em vez de alargar o cartão */
+.itbi-legend {
+  max-width: 290px;
+}
+
+/* celular: legenda compacta (a nota de uso sai; o mapa tem só 55% da altura) */
+@media (max-width: 860px) {
+  .itbi-legend {
+    min-width: 0;
+    width: min(240px, calc(100% - 2 * var(--space-3)));
+    padding: 6px var(--space-2);
+  }
+
+  .itbi-legend > .legend-nodata:not(:has(i)) {
+    display: none;
+  }
+}
+
+/* legenda: amostra do tamanho (nº de guias no endereço) */
+.legend-nodata i.itbi-legend-size {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: none;
+  border: 1.5px solid var(--text-secondary);
+}
+
+/* ------------------------------------------------------------------ painel */
+
+.itbi-compare {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.itbi-compare:empty {
+  display: none;
+}
+
+.itbi-chip {
+  display: inline-block;
+  padding: 3px 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  background: var(--surface-2);
+  color: var(--text-primary);
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.itbi-regiao-note {
+  color: var(--text-secondary);
+}
+
+.itbi-rank-title {
+  margin: var(--space-2) 0 0;
+  color: var(--text-muted);
+  font-size: var(--fs-xs);
+  font-weight: 650;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.itbi-rank .rank-name small {
+  display: block;
+  font-size: var(--fs-xs);
+}
+
+.itbi-rank-all {
+  margin-top: var(--space-2);
+  font-size: var(--fs-sm);
+}
+
+.itbi-rank-all summary {
+  width: max-content;
+  color: var(--link);
+  cursor: pointer;
+  font-weight: 550;
+}
+
+/* "Qual valor é este?" */
+.value-help {
+  color: var(--text-secondary);
+  font-size: var(--fs-sm);
+}
+
+.value-help summary {
+  width: max-content;
+  color: var(--link);
+  cursor: pointer;
+  font-weight: 550;
+}
+
+.value-help dl {
+  display: grid;
+  gap: 2px;
+  margin: var(--space-2) 0 0;
+}
+
+.value-help dt {
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.value-help dd {
+  margin: 0 0 var(--space-2);
+  font-size: var(--fs-xs);
+  line-height: 1.5;
+}
+
+/* ------------------------------------------------------- ficha do endereço */
+
+.sheet {
+  position: absolute;
+  z-index: 8;
+  top: var(--space-3);
+  right: var(--space-3);
+  /* acima do cabeçalho da gaveta de transações */
+  bottom: calc(var(--space-3) + 60px);
+  width: min(560px, calc(100% - 2 * var(--space-3)));
+  display: flex;
+  flex-direction: column;
+  background: var(--surface-1);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow);
+  overflow: hidden;
+}
+
+/* com a ficha aberta, os botões de zoom do mapa vão para o lado dela (não ficam por baixo) */
+@media (min-width: 861px) {
+  .map-wrap:has(> .sheet:not([hidden])) .maplibregl-ctrl-top-right {
+    right: calc(min(560px, 100% - 2 * var(--space-3)) + var(--space-3));
+  }
+}
+
+.sheet-head {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-2);
+  padding: var(--space-3) var(--space-2) var(--space-3) var(--space-4);
+  border-bottom: 1px solid var(--border);
+}
+
+.sheet-heading {
+  flex: 1;
+  min-width: 0;
+}
+
+.sheet-kicker {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 10px;
+  font-weight: 650;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.sheet-title {
+  margin: 2px 0 0;
+  font-size: var(--fs-lg);
+  font-weight: 650;
+  overflow-wrap: anywhere;
+}
+
+.sheet-title:focus {
+  outline: none;
+}
+
+.sheet-title:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.sheet-sub {
+  margin: 2px 0 0;
+  color: var(--text-secondary);
+  font-size: var(--fs-xs);
+}
+
+.sheet-sub:empty {
+  display: none;
+}
+
+.sheet-body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-4) var(--space-4);
+}
+
+.sheet-stats {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.sheet-stats .tile {
+  padding: var(--space-2);
+}
+
+.sheet-stats .tile-value {
+  font-size: var(--fs-lg);
+}
+
+.sheet-body > .section-subtitle {
+  margin-top: calc(-1 * var(--space-2));
+}
+
+.sheet-body > .section-subtitle:empty {
+  display: none;
+}
+
+.sheet-approx {
+  margin: 0;
+  font-size: var(--fs-xs);
+}
+
+.sheet-approx:empty {
+  display: none;
+}
+
+.sheet-controls {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.sheet-controls:empty {
+  display: none;
+}
+
+/* no computador o cabeçalho da tabela ordena; o seletor é para o celular */
+.sheet-sort {
+  display: none;
+}
+
+.sheet-table-wrap {
+  margin: 0 calc(-1 * var(--space-4));
+  overflow-x: auto;
+}
+
+.sheet-table th {
+  position: static;
+}
+
+.sheet-type {
+  margin-bottom: var(--space-1);
+  padding: 0 var(--space-4);
+}
+
+.sheet-table th,
+.sheet-table td {
+  padding: 5px var(--space-2);
+  vertical-align: top;
+}
+
+.sheet-table th:first-child,
+.sheet-table td:first-child {
+  padding-left: var(--space-4);
+}
+
+.sheet-table th:last-child,
+.sheet-table td:last-child {
+  padding-right: var(--space-4);
+}
+
+.sheet-table tbody tr.sheet-row.is-atypical td {
+  color: var(--text-secondary);
+}
+
+.sheet-table tbody tr.sheet-detail:hover {
+  background: none;
+}
+
+.sheet-detail td {
+  background: var(--surface-2);
+  white-space: normal;
+}
+
+.sheet-dl {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 2px var(--space-3);
+  margin: 0 0 var(--space-1);
+  font-size: var(--fs-xs);
+}
+
+.sheet-dl dt {
+  color: var(--text-muted);
+}
+
+.sheet-dl dd {
+  margin: 0;
+  color: var(--text-primary);
+}
+
+.sheet-table td.sheet-empty {
+  padding: var(--space-3) var(--space-4);
+  white-space: normal;
+}
+
+.sheet .pager {
+  padding: 0;
+}
+
+.sheet-help {
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--border);
+}
+
+/* celular: folha que sobe do rodapé (o mapa fica em cima, o painel embaixo) e cartões */
+@media (max-width: 860px) {
+  .sheet {
+    position: fixed;
+    z-index: 40;
+    top: auto;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    width: auto;
+    max-height: 85vh;
+    max-height: 85dvh;
+    border-bottom: 0;
+    border-radius: var(--radius-lg) var(--radius-lg) 0 0;
+  }
+
+  .sheet-stats {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .sheet-sort {
+    display: block;
+  }
+
+  .sheet-table-wrap {
+    margin: 0;
+    overflow: visible;
+  }
+
+  .sheet-type {
+    padding: 0;
+  }
+
+  .sheet-table thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+  }
+
+  .sheet-table,
+  .sheet-table tbody,
+  .sheet-table tr,
+  .sheet-table td {
+    display: block;
+  }
+
+  .sheet-table tbody tr.sheet-row {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: var(--space-2) var(--space-3);
+    padding: var(--space-2) 0;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .sheet-table td,
+  .sheet-table td.num,
+  .sheet-table th:first-child,
+  .sheet-table td:first-child,
+  .sheet-table td:last-child {
+    padding: 0;
+    border: 0;
+    text-align: left;
+    white-space: normal;
+  }
+
+  .sheet-table td[data-label="Endereço da guia"] {
+    grid-column: 1 / -1;
+  }
+
+  .sheet-table td::before {
+    content: attr(data-label);
+    display: block;
+    color: var(--text-muted);
+    font-size: 10px;
+  }
+
+  .sheet-table .value-cell {
+    align-items: flex-start;
+  }
+
+  .sheet-table .value-line {
+    flex-wrap: wrap;
+    justify-content: flex-start;
+  }
+
+  .sheet-table tr.sheet-detail td {
+    padding: var(--space-2);
+    border-radius: var(--radius-sm);
+  }
+
+  .sheet-table td.sheet-empty {
+    padding: var(--space-3) 0;
+  }
+}
