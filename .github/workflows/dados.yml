@@ -1,0 +1,92 @@
+# Atualiza o pacote de dados do site: ingere todas as fontes do zero, empacota os processados e
+# publica na Release "dados" (o servidor baixa de lá na partida; veja docs/deploy.md).
+#
+# Algumas fontes (página e WFS da Prefeitura de SP) podem recusar máquinas de nuvem: se a
+# ingestão falhar aqui, a Release anterior continua valendo e dá para publicar de um computador
+# local com os comandos da seção "Atualizar os dados" de docs/deploy.md.
+name: Dados
+
+on:
+  workflow_dispatch:
+    inputs:
+      perfil:
+        description: "Perfil do pacote (enxuto = sem colunas só da ingestão; serve o site igual)"
+        type: choice
+        options: [enxuto, completo]
+        default: enxuto
+  schedule:
+    # dia 5 de cada mês, 06:00 em Brasília: a Prefeitura e a ANEEL já publicaram o mês anterior
+    - cron: "0 9 5 * *"
+
+concurrency:
+  group: dados
+  cancel-in-progress: false
+
+jobs:
+  pacote:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: write # criar/atualizar a Release "dados"
+    env:
+      PACOTE: dist/observatorio-dados.tar
+      INDICE: dist/observatorio-dados.json
+      PERFIL: ${{ inputs.perfil || 'enxuto' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Instalar uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Dependências
+        run: uv sync --locked --no-dev
+
+      - name: Versão do DuckDB
+        id: duckdb
+        run: echo "version=$(uv run --no-dev python -c 'import duckdb; print(duckdb.__version__)')" >> "$GITHUB_OUTPUT"
+
+      - name: Cache das extensões do DuckDB
+        uses: actions/cache@v4
+        with:
+          path: ~/.duckdb/extensions
+          key: duckdb-extensions-${{ runner.os }}-${{ steps.duckdb.outputs.version }}
+
+      - name: Ingestão (todas as fontes)
+        run: uv run --no-dev observatorio ingest all
+
+      - name: Pacote
+        run: |
+          if [ "$PERFIL" = "enxuto" ]; then extra="--enxuto"; else extra=""; fi
+          uv run --no-dev observatorio bundle criar "$PACOTE" $extra
+          du -h "$PACOTE"
+
+      - name: Publicar na Release "dados"
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          criado=$(jq -r .criado_em "$INDICE")
+          tamanho=$(jq -r '.pacote.tamanho / 1e6 | floor' "$INDICE")
+          notas="Dados processados do observatório (perfil $PERFIL, $tamanho MB), gerados em $criado pela Action Dados. Baixe com: observatorio bundle baixar <URL do .tar>."
+          if ! gh release view dados > /dev/null 2>&1; then
+            gh release create dados --title "Dados processados" --notes "$notas" \
+              --target "$GITHUB_SHA" --latest=false
+          fi
+          # o .tar antes do índice: um servidor que veja o índice novo já encontra o pacote novo
+          gh release upload dados "$PACOTE" --clobber
+          gh release upload dados "$INDICE" --clobber
+          gh release edit dados --notes "$notas"
+
+      # Opcional: reinicia o Space do Hugging Face para pegar os dados novos na hora (sem isso,
+      # ele confere o índice a cada 24 h e em toda partida). Precisa da variável HF_SPACE
+      # (ex.: usuario/observatorio) e do segredo HF_TOKEN (token com permissão de escrita).
+      - name: Reiniciar o Space
+        if: ${{ vars.HF_SPACE != '' }}
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_SPACE: ${{ vars.HF_SPACE }}
+        run: |
+          curl --fail --silent --show-error -X POST \
+            -H "Authorization: Bearer $HF_TOKEN" \
+            "https://huggingface.co/api/spaces/$HF_SPACE/restart"

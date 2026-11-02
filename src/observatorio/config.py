@@ -28,6 +28,18 @@ class Settings(BaseSettings):
         default=None,
         description="Anos a ingerir; padrão: ano corrente e o anterior.",
     )
+    # ANEEL — polígonos dos conjuntos elétricos (BDGD no ArcGIS Online; SIGEL como reserva)
+    aneel_conjuntos: bool = Field(
+        default=True, description="Atualiza os polígonos dos conjuntos na ingestão da ANEEL."
+    )
+    aneel_arcgis_api: str = "https://www.arcgis.com/sharing/rest"
+    aneel_bdgd_owner: str = "aneel_aneel"
+    aneel_sigel_conjuntos_url: str = (
+        "https://sigel.aneel.gov.br/arcgis/rest/services/SRD/Conjuntos/FeatureServer/0/query"
+    )
+    aneel_sigel_max_age_days: int = Field(
+        default=90, description="Rebaixa os conjuntos do SIGEL (base 2020) após este nº de dias."
+    )
 
     # ITBI — Prefeitura de São Paulo
     itbi_page_url: str = "https://prefeitura.sp.gov.br/web/fazenda/w/acesso_a_informacao/31501"
@@ -56,6 +68,18 @@ class Settings(BaseSettings):
     # 0.0.0.0/::. "testserver" é o Host do TestClient (nome sem domínio, não resolve fora daqui).
     allowed_hosts: list[str] = Field(
         default_factory=lambda: ["127.0.0.1", "localhost", "[::1]", "testserver"]
+    )
+
+    # Pacote de dados publicado (``observatorio bundle``, docs/deploy.md): com ``bundle_url``,
+    # o servidor baixa os dados prontos na partida quando faltam ou há um pacote mais novo.
+    bundle_url: str | None = Field(
+        default=None, description="URL (https://…) ou caminho do pacote .tar publicado."
+    )
+    bundle_index_url: str | None = Field(
+        default=None, description="Índice do pacote; padrão: bundle_url com extensão .json."
+    )
+    bundle_check_hours: float = Field(
+        default=24.0, description="Intervalo entre verificações de pacote novo (0 = só na partida)."
     )
 
     @property

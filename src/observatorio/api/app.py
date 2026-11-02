@@ -23,6 +23,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from observatorio import __version__
 from observatorio.aneel import api as aneel_api
 from observatorio.api import meta, search
+from observatorio.bundle import BundleGate, BundleUpdater
 from observatorio.config import Settings, configure_logging, get_settings
 from observatorio.db import Database, Dataset
 from observatorio.itbi import api as itbi_api
@@ -130,6 +131,7 @@ class _VersionWatcher:
         self.db = db
         self.path = processed_dir / VERSION_FILE
         self._stop = threading.Event()
+        self._check_lock = threading.Lock()
         self._mtime = self._current()
         self._thread = threading.Thread(target=self._loop, name="data-reload", daemon=True)
 
@@ -139,16 +141,22 @@ class _VersionWatcher:
         except FileNotFoundError:
             return 0.0
 
+    def check(self) -> None:
+        """Recarrega agora se ``.version`` mudou; volta só depois da recarga (de quem a fizer)."""
+        with self._check_lock:
+            mtime = self._current()
+            if mtime == self._mtime:
+                return
+            self._mtime = mtime
+            log.info("dados novos detectados; recarregando")
+            try:
+                self.db.refresh()
+            except Exception:
+                log.exception("falha ao recarregar dados")
+
     def _loop(self) -> None:
         while not self._stop.wait(RELOAD_INTERVAL_S):
-            mtime = self._current()
-            if mtime != self._mtime:
-                self._mtime = mtime
-                log.info("dados novos detectados; recarregando")
-                try:
-                    self.db.refresh()
-                except Exception:
-                    log.exception("falha ao recarregar dados")
+            self.check()
 
     def start(self) -> None:
         self._thread.start()
@@ -182,9 +190,21 @@ def create_app(settings: Settings | None = None, *, watch: bool = True) -> FastA
         watcher = _VersionWatcher(db, settings.processed_dir) if watch else None
         if watcher:
             watcher.start()
+        # pacote publicado (OBSERVATORIO_BUNDLE_URL): baixado em segundo plano; até lá, as
+        # rotas de dados respondem 503 com o andamento (``BundleGate``)
+        updater = (
+            BundleUpdater(settings, on_installed=watcher.check if watcher else db.refresh)
+            if settings.bundle_url
+            else None
+        )
+        app.state.bundle = updater
+        if updater:
+            updater.start()
         try:
             yield
         finally:
+            if updater:
+                updater.stop()
             if watcher:
                 watcher.stop()
             db.close()
@@ -200,6 +220,7 @@ def create_app(settings: Settings | None = None, *, watch: bool = True) -> FastA
     # nível 5: quase a mesma taxa do 9 em metade do tempo (GeoJSON de 20 mil pontos ~3,8 MB)
     app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=5)
     app.add_middleware(_BodyLimit)
+    app.add_middleware(BundleGate)
     # por último = mais externo: Host desconhecido nem chega às rotas
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=allowed_hosts(settings))
     if settings.host in _WILDCARD_BINDS:
