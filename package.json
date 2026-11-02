@@ -1,6 +1,7 @@
 {
   "name": "observatorio-web",
   "private": true,
+  "license": "MIT",
   "description": "Só a checagem de tipos do frontend (JSDoc + // @ts-check). Sem dependências de execução: o navegador carrega MapLibre e terra-draw do CDN (import map do index.html), nas mesmas versões.",
   "type": "module",
   "scripts": {

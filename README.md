@@ -84,7 +84,7 @@ Abra <http://127.0.0.1:8000>. A documentação interativa da API fica em `/api/d
 Sem ingerir (usa o pacote de dados já publicado, ~590 MB):
 
 ```bash
-uv run observatorio bundle baixar https://github.com/<usuario>/<repo>/releases/download/dados/observatorio-dados.tar
+uv run observatorio bundle baixar https://github.com/rafaelgfig/observatorio/releases/download/dados/observatorio-dados.tar
 uv run observatorio serve
 ```
 
@@ -93,7 +93,7 @@ uv run observatorio serve
 ```bash
 docker build -t observatorio .
 docker run --rm -p 7860:7860 \
-  -e OBSERVATORIO_BUNDLE_URL=https://github.com/<usuario>/<repo>/releases/download/dados/observatorio-dados.tar \
+  -e OBSERVATORIO_BUNDLE_URL=https://github.com/rafaelgfig/observatorio/releases/download/dados/observatorio-dados.tar \
   observatorio
 ```
 
@@ -210,7 +210,9 @@ tela, que guarda os filtros) ou um *pull request*. As checagens, as convenções
 refazer as capturas de tela estão em [CONTRIBUTING.md](CONTRIBUTING.md). Nunca grave nem exponha
 dados pessoais (nomes das partes, CPF/CNPJ).
 
-## Licença
+## Autor e licença
 
-A definir. Os dados vêm de fontes públicas (ANEEL, Prefeitura de São Paulo/GeoSampa, IBGE) e
-seguem os termos de cada uma.
+Feito por Rafael Figueira ([LinkedIn](https://www.linkedin.com/in/rafaelgfig/)). O código é
+distribuído sob a [licença MIT](LICENSE). Os dados vêm de fontes públicas (ANEEL, Prefeitura de
+São Paulo/GeoSampa, IBGE) e seguem os termos de cada uma; o site não é publicação oficial de
+nenhuma delas.

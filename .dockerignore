@@ -1,10 +1,11 @@
-# Lista do que entra (o resto fica de fora): pyproject.toml, uv.lock, README.md e src/ — só o
-# necessário para instalar o pacote. Os dados entram em tempo de execução (pacote publicado) ou
+# Lista do que entra (o resto fica de fora): pyproject.toml, uv.lock, README.md, LICENSE e src/ —
+# só o necessário para instalar o pacote. Os dados entram em tempo de execução (pacote publicado) ou
 # pelo ARG BUNDLE_URL; data/, .venv/, .git/, testes e documentação nunca vão para o contexto.
 *
 !pyproject.toml
 !uv.lock
 !README.md
+!LICENSE
 !src/
 **/__pycache__/
 **/*.py[cod]

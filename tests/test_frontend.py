@@ -10,6 +10,7 @@ import json
 import re
 import shutil
 import subprocess
+import tomllib
 from pathlib import Path
 from typing import Any, get_args
 
@@ -86,6 +87,17 @@ def test_clique_que_fecha_o_desenho_nao_abre_a_ficha() -> None:
     guarda = clique.index("performance.now() - drawFinishedAt < DRAW_CLICK_GRACE_MS")
     assert clique.index('state.ferramenta !== "none"') < guarda < clique.index("pick(ev.point)")
     assert 0 < _inteiro("views/itbi.js", "DRAW_CLICK_GRACE_MS") <= 1_000
+
+
+def test_rodape_aponta_para_o_repositorio_e_a_licenca() -> None:
+    raiz = JS.parent.parent.parent.parent
+    projeto = tomllib.loads((raiz / "pyproject.toml").read_text(encoding="utf-8"))["project"]
+    repo = projeto["urls"]["Repository"]
+    html = (JS.parent / "index.html").read_text(encoding="utf-8")
+    assert f'href="{repo}"' in html
+    assert f'href="{repo}/blob/main/LICENSE"' in html
+    assert projeto["license"] == "MIT"
+    assert (raiz / "LICENSE").read_text(encoding="utf-8").startswith("MIT License")
 
 
 @pytest.mark.parametrize("arquivo", ["views/itbi.js", "components/location-sheet.js"])

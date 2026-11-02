@@ -236,8 +236,32 @@ select {
   padding: var(--space-4);
   display: flex;
   flex-direction: column;
-  gap: var(--space-4);
+  gap: var(--space-5);
   scrollbar-gutter: stable;
+}
+
+/* conteúdo da view (ctx.panel); o rodapé fica fora dele e sobrevive à troca de rota */
+.panel-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+/* autoria e licença: no pé do painel, ou logo depois do conteúdo quando ele é mais longo */
+.credits {
+  margin-top: auto;
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--border);
+  color: var(--text-muted);
+  font-size: var(--fs-xs);
+}
+
+.credits p {
+  margin: 0;
+}
+
+.credits p + p {
+  margin-top: var(--space-1);
 }
 
 .map-wrap {

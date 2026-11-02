@@ -5,7 +5,7 @@
 #
 #   docker build -t observatorio .
 #   docker run --rm -p 7860:7860 \
-#     -e OBSERVATORIO_BUNDLE_URL=https://github.com/<usuario>/<repo>/releases/download/dados/observatorio-dados.tar \
+#     -e OBSERVATORIO_BUNDLE_URL=https://github.com/rafaelgfig/observatorio/releases/download/dados/observatorio-dados.tar \
 #     observatorio
 
 ARG PYTHON_VERSION=3.13
@@ -24,7 +24,7 @@ WORKDIR /src
 # dependências primeiro: esta camada só é refeita quando o uv.lock muda
 COPY pyproject.toml uv.lock ./
 RUN uv sync --locked --no-dev --no-install-project
-COPY README.md ./
+COPY README.md LICENSE ./
 COPY src ./src
 RUN uv sync --locked --no-dev --no-editable
 

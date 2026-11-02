@@ -3,6 +3,8 @@ name = "observatorio"
 version = "0.1.0"
 description = "Explorador web de dados abertos: interrupções de energia (ANEEL) e transações imobiliárias (ITBI São Paulo)."
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [
     { name = "Rafael Goncalves Figueira" }
 ]
@@ -19,11 +21,16 @@ dependencies = [
     "uvicorn[standard]>=0.54.0",
 ]
 
+[project.urls]
+Repository = "https://github.com/rafaelgfig/observatorio"
+Issues = "https://github.com/rafaelgfig/observatorio/issues"
+
 [project.scripts]
 observatorio = "observatorio.cli:app"
 
 [build-system]
-requires = ["hatchling"]
+# 1.27+: `license` como expressão SPDX e `license-files` (PEP 639)
+requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
 [dependency-groups]

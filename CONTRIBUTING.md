@@ -1,7 +1,8 @@
 # Como contribuir
 
 Obrigado pelo interesse! Problemas e ideias entram como *issue*; mande o link da tela, que já
-guarda os filtros. Correções e melhorias entram como *pull request* para `main`.
+guarda os filtros. Correções e melhorias entram como *pull request* para `main` e, como o resto
+do código, ficam sob a [licença MIT](LICENSE).
 
 ## Ambiente
 
