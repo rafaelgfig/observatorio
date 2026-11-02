@@ -420,16 +420,6 @@ select {
   color: var(--text-primary);
 }
 
-.btn-primary {
-  background: var(--accent);
-  border-color: var(--accent);
-  color: var(--text-on-accent);
-}
-
-.btn-primary:hover {
-  background: var(--accent-hover);
-}
-
 .btn-ghost {
   background: transparent;
   border-color: transparent;
@@ -565,14 +555,6 @@ input[type="range"] {
   top: 11px;
   color: var(--text-muted);
   pointer-events: none;
-}
-
-.combobox-clear {
-  position: absolute;
-  right: 4px;
-  top: 4px;
-  height: 32px;
-  width: 32px;
 }
 
 .listbox {
@@ -1056,21 +1038,6 @@ button.hbar {
   background: #ec7622;
 }
 
-.map-toolbar {
-  top: var(--space-3);
-  left: var(--space-3);
-  display: flex;
-  gap: var(--space-1);
-  padding: var(--space-1);
-}
-
-.map-status {
-  top: var(--space-3);
-  left: 50%;
-  transform: translateX(-50%);
-  white-space: nowrap;
-}
-
 /* --------------------------------------------------------- results drawer */
 
 .drawer {
@@ -1189,27 +1156,6 @@ button.hbar {
 
 /* ---------------------------------------------------- MapLibre overrides */
 
-.maplibregl-popup-content {
-  background: var(--surface-1) !important;
-  color: var(--text-primary);
-  border: 1px solid var(--border-strong);
-  border-radius: var(--radius-md) !important;
-  box-shadow: var(--shadow) !important;
-  padding: var(--space-3) !important;
-  font: var(--fs-sm) / 1.45 var(--font-sans);
-}
-
-.maplibregl-popup-tip {
-  border-top-color: var(--surface-1) !important;
-  border-bottom-color: var(--surface-1) !important;
-}
-
-.maplibregl-popup-close-button {
-  color: var(--text-muted);
-  font-size: 18px;
-  padding: 0 6px;
-}
-
 .maplibregl-ctrl-group {
   background: var(--surface-1) !important;
   border: 1px solid var(--border);
@@ -1232,25 +1178,6 @@ button.hbar {
   color: var(--text-secondary);
 }
 
-.popup-title {
-  font-weight: 650;
-  margin-bottom: 2px;
-}
-
-.popup-grid {
-  display: grid;
-  grid-template-columns: auto auto;
-  gap: 2px var(--space-3);
-  color: var(--text-secondary);
-}
-
-.popup-grid b {
-  color: var(--text-primary);
-  font-weight: 600;
-  text-align: right;
-  font-variant-numeric: tabular-nums;
-}
-
 /* ---------------------------------------------------------- misc helpers */
 
 .muted {
@@ -1271,10 +1198,14 @@ button.hbar {
   border-left-color: var(--critical);
 }
 
-.kbd {
-  font-family: var(--font-mono);
-  font-size: 11px;
-  border: 1px solid var(--border);
-  border-radius: 4px;
-  padding: 0 4px;
+/* escala do MapLibre nas cores do tema */
+.maplibregl-ctrl-scale {
+  background: var(--overlay) !important;
+  color: var(--text-secondary) !important;
+  border-color: var(--text-muted) !important;
+}
+
+/* com a gaveta de resultados (ITBI), os controles de baixo do mapa sobem acima dela */
+.map-wrap:has(.drawer) .maplibregl-ctrl-bottom-right {
+  bottom: 64px;
 }

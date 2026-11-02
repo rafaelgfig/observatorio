@@ -20,7 +20,7 @@ O mesmo contêiner roda no Google Cloud Run ou em qualquer servidor com Docker (
 
 ## 1. O pacote de dados
 
-A ingestão baixa ~1,3 GB das fontes e leva minutos; o servidor público não faz isso. Quem já
+A ingestão baixa ~1,4 GB das fontes e leva minutos; o servidor público não faz isso. Quem já
 tem os dados (a Action ou o seu computador) gera um **pacote** com `data/processed` e
 `data/manifest` — nunca `data/raw` — e o servidor só baixa e instala esse pacote.
 
@@ -218,7 +218,9 @@ docker run -d --name observatorio --restart unless-stopped -p 127.0.0.1:8000:786
 Detalhes da imagem: Python 3.13 *slim* em duas etapas (dependências instaladas com `uv sync
 --locked --no-dev`), usuário sem privilégios (uid 1000), extensão `spatial` do DuckDB já
 instalada (nada é baixado de `extensions.duckdb.org` em execução), `HEALTHCHECK` em
-`/api/health` e cabeçalhos `X-Forwarded-*` aceitos do proxy da plataforma.
+`/api/health` e cabeçalhos `X-Forwarded-*` aceitos do proxy da plataforma. A cada *pull
+request* e a cada push na `main`, o CI (job "Imagem Docker" de `.github/workflows/ci.yml`)
+constrói a imagem, sem publicá-la, e confere que o servidor sobe.
 
 ## 6. Atualizar os dados
 

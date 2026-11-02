@@ -22,6 +22,7 @@ import { debounce, el, errorNotice, field, fmt, icon, kpiTile, MONTHS, preserveF
 import { SAO_PAULO_BOUNDS } from "../map.js";
 
 /** @typedef {import("../main.js").ViewContext} ViewContext */
+/** @typedef {import("../map.js").ExpressionSpecification} ExpressionSpecification */
 
 /** Tipos de imóvel aceitos pela API (`queries.Tipo`); os nomes vêm de `/itbi/meta` (`tipos`). */
 const TIPO_IDS = ["apartamento", "casa", "terreno", "comercial", "garagem", "outros"];
@@ -52,6 +53,11 @@ const DISTRICT_OPACITY = 0.82;
 const GRID_OPACITY = 0.88;
 /** Rótulo com o nº de guias nos pontos a partir deste zoom (antes colidiriam quase todos). */
 const LABEL_MIN_ZOOM = 15;
+/**
+ * O clique que fecha um polígono/retângulo chega ao mapa logo depois do "finish" do terra-draw
+ * (no mesmo gesto, já sem ferramenta): cliques até este tempo (ms) depois do fim são ignorados.
+ */
+const DRAW_CLICK_GRACE_MS = 400;
 const SP_LAT = -23.55;
 
 /**
@@ -135,8 +141,10 @@ let distritosById = new Map();
 let hoveredDistrict = null;
 let page = 1;
 let sort = { key: "data", dir: /** @type {"asc" | "desc"} */ ("desc") };
-/** @type {any} */
+/** @type {import("terra-draw").TerraDraw | null} */
 let draw = null;
+/** Quando o último desenho terminou (`performance.now()`; ver `DRAW_CLICK_GRACE_MS`). */
+let drawFinishedAt = -Infinity;
 /** Caixa [w, s, e, n] do logradouro/CEP escolhido (para o raio cobrir a rua inteira). */
 let viaBbox = /** @type {[number, number, number, number] | null} */ (null);
 /** URL atual dos vector tiles (evita recarregar os tiles quando os filtros deles não mudam). */
@@ -856,9 +864,9 @@ function buildFilters() {
   });
 
   const precisao = el("select", { className: "select", "aria-label": "Precisão da localização", dataset: { focusKey: "precisao" } }, [
-    el("option", { value: "lote", textContent: "Só lote/condomínio exato", selected: state.precisao === "lote" }),
-    el("option", { value: "quadra", textContent: "Até o centro da quadra", selected: state.precisao === "quadra" }),
-    el("option", { value: "qualquer", textContent: "Qualquer precisão", selected: state.precisao === "qualquer" }),
+    el("option", { value: "lote", textContent: "Lote exato", title: "Só guias localizadas no lote ou no condomínio", selected: state.precisao === "lote" }),
+    el("option", { value: "quadra", textContent: "Até a quadra", title: "Inclui guias localizadas pelo centro da quadra", selected: state.precisao === "quadra" }),
+    el("option", { value: "qualquer", textContent: "Qualquer", title: "Inclui localizações aproximadas pelo setor", selected: state.precisao === "qualquer" }),
   ]);
   precisao.addEventListener("change", () => {
     state.precisao = /** @type {State["precisao"]} */ (precisao.value);
@@ -1089,7 +1097,7 @@ const fetchArea = latest((signal, /** @type {string} */ tipo, /** @type {string}
   api(`/itbi/area/${tipo}/${encodeURIComponent(id)}`, { signal: scoped(signal) }),
 );
 
-/** @param {any} geometry GeoJSON Polygon */
+/** @param {import("geojson").Polygon} geometry */
 function setPolygon(geometry) {
   state.regiao = { tipo: "poligono", payload: { tipo: "poligono", geometria: geometry }, label: "Área desenhada", geometry };
   state.via = null;
@@ -1177,14 +1185,17 @@ async function startDrawing(mode) {
     import("terra-draw-maplibre-gl-adapter"),
   ]);
   if (!ctx || state.ferramenta !== mode) return;
-  const accent = cssVar("--accent");
+  // o terra-draw só aceita cores hexadecimais (o token --accent é uma)
+  const accent = /** @type {import("terra-draw").HexColor} */ (cssVar("--accent"));
+  /** @type {import("terra-draw").HexColor} */
+  const white = "#ffffff";
   const styles = {
-    fillColor: /** @type {any} */ (accent),
-    outlineColor: /** @type {any} */ (accent),
+    fillColor: accent,
+    outlineColor: accent,
     fillOpacity: 0.12,
     outlineWidth: 2,
-    closingPointColor: /** @type {any} */ (accent),
-    closingPointOutlineColor: /** @type {any} */ ("#ffffff"),
+    closingPointColor: accent,
+    closingPointOutlineColor: white,
   };
   draw = new TerraDraw({
     adapter: new TerraDrawMapLibreGLAdapter({ map: ctx.map }),
@@ -1193,11 +1204,13 @@ async function startDrawing(mode) {
   draw.start();
   draw.setMode(mode);
   draw.on("finish", (/** @type {string | number} */ id) => {
+    drawFinishedAt = performance.now();
     const feature = draw?.getSnapshotFeature(id);
     const geometry = feature?.geometry;
     stopDrawing();
     state.ferramenta = "none";
-    if (geometry && (geometry.type === "Polygon" || geometry.type === "MultiPolygon")) setPolygon(geometry);
+    // os modos polígono e retângulo do terra-draw só produzem Polygon
+    if (geometry?.type === "Polygon") setPolygon(geometry);
     else renderTools();
   });
 }
@@ -1725,14 +1738,20 @@ function mapLevel() {
  * Raio do ponto pelo nº de guias no endereço (√n, com teto: um condomínio grande não cobre a
  * quadra). `extra` alarga (anel da ficha aberta).
  * @param {number} [extra]
+ * @returns {ExpressionSpecification}
  */
 function pointRadius(extra = 0) {
+  /** @type {ExpressionSpecification} */
   const n = ["coalesce", ["get", "n"], 1];
-  const r = (/** @type {number} */ base, /** @type {number} */ k, /** @type {number} */ cap) => ["min", cap + extra, ["+", base + extra, ["*", k, ["sqrt", ["-", n, 1]]]]];
+  /** @type {(base: number, k: number, cap: number) => ExpressionSpecification} */
+  const r = (base, k, cap) => ["min", cap + extra, ["+", base + extra, ["*", k, ["sqrt", ["-", n, 1]]]]];
   return ["interpolate", ["linear"], ["zoom"], 11, r(2.5, 0.45, 7), 14, r(3.5, 0.9, 12), 17, r(5, 1.6, 22)];
 }
 
-/** Rótulo com o nº de guias (n > 1) — fontes do estilo do OpenFreeMap. */
+/**
+ * Rótulo com o nº de guias (n > 1) — fontes do estilo do OpenFreeMap.
+ * @returns {import("../map.js").SymbolLayerSpecification["layout"]}
+ */
 function countLabelLayout() {
   return {
     "text-field": ["to-string", ["get", "n"]],
@@ -1744,8 +1763,13 @@ function countLabelLayout() {
   };
 }
 
-/** Opacidade que entra (`rising`) ou sai em torno de GRID_ZOOM. */
-function fade(/** @type {number} */ max, /** @type {boolean} */ rising) {
+/**
+ * Opacidade que entra (`rising`) ou sai em torno de GRID_ZOOM.
+ * @param {number} max
+ * @param {boolean} rising
+ * @returns {ExpressionSpecification}
+ */
+function fade(max, rising) {
   return ["interpolate", ["linear"], ["zoom"], GRID_ZOOM - GRID_FADE, rising ? 0 : max, GRID_ZOOM + GRID_FADE, rising ? max : 0];
 }
 
@@ -1760,7 +1784,11 @@ function addLayers() {
   if (!map.getSource(SRC_DIST)) map.addSource(SRC_DIST, { type: "geojson", data: "/api/itbi/areas.geojson?tipo=distrito", promoteId: "id" });
   for (const id of [SRC_POINTS, SRC_AREA, SRC_SEL]) if (!map.getSource(id)) map.addSource(id, { type: "geojson", data: emptyFc() });
 
-  const add = (/** @type {any} */ layer, /** @type {string | undefined} */ beforeId) => {
+  /**
+   * @param {import("maplibre-gl").AddLayerObject} layer
+   * @param {string} [beforeId]
+   */
+  const add = (layer, beforeId) => {
     if (!map.getLayer(layer.id)) map.addLayer(layer, beforeId);
   };
   const distMax = GRID_ZOOM + GRID_FADE;
@@ -1772,6 +1800,7 @@ function addLayers() {
   add({ id: L.areaFill, type: "fill", source: SRC_AREA, paint: { "fill-opacity": 0.07 } }, before);
   add({ id: L.areaLine, type: "line", source: SRC_AREA, paint: { "line-width": 2 } }, before);
   // endereços acima dos rótulos do basemap; os menores por cima dos maiores
+  /** @type {() => Pick<import("../map.js").CircleLayerSpecification, "layout" | "paint">} */
   const circle = () => ({
     layout: { "circle-sort-key": ["-", ["coalesce", ["get", "n"], 1]] },
     paint: { "circle-radius": pointRadius(), "circle-opacity": 0.92, "circle-stroke-width": 1 },
@@ -1799,6 +1828,7 @@ function removeLayers(context) {
   for (const id of [SRC_TILES, SRC_POINTS, SRC_AREA, SRC_DIST, SRC_SEL]) if (map.getSource(id)) map.removeSource(id);
 }
 
+/** @returns {import("geojson").FeatureCollection} */
 function emptyFc() {
   return { type: "FeatureCollection", features: [] };
 }
@@ -1863,7 +1893,7 @@ function paintDistricts() {
   const nodata = cssVar("--nodata");
   // `step` exige ao menos um limite: sem quebras (ainda carregando), uma cor só
   const scale = breaks.length ? stepExpression(["feature-state", "v"], colors, breaks) : colors[0];
-  ctx.map.setPaintProperty(L.distFill, "fill-color", /** @type {any} */ (["case", ["==", ["feature-state", "v"], null], nodata, scale]));
+  ctx.map.setPaintProperty(L.distFill, "fill-color", ["case", ["==", ["feature-state", "v"], null], nodata, scale]);
 }
 
 /** p90 de `n` por célula no zoom do tile (`step`: o tile de zoom z vale até z + 1). */
@@ -1878,14 +1908,15 @@ function gridP90(/** @type {number} */ zoom) {
 function paintGrid() {
   if (!ctx?.map.getLayer(L.grid)) return;
   const ramp = cssRamp("--seq-price");
-  const color = (/** @type {number} */ z) => {
+  /** @type {(z: number) => ExpressionSpecification} */
+  const color = (z) => {
     const stops = [0, 0.25, 0.45, 0.6, 0.75, 0.9, 1];
     return ["interpolate", ["linear"], ["/", ["ln", ["+", 1, ["coalesce", ["get", "n"], 0]]], Math.log(1 + gridP90(z))], ...stops.flatMap((s, i) => [s, ramp[i]])];
   };
-  /** @type {unknown[]} */
-  const expr = ["step", ["zoom"], color(HEAT_P90[0][0])];
-  for (const [z] of HEAT_P90.slice(1)) expr.push(z, color(z));
-  ctx.map.setPaintProperty(L.grid, "fill-color", /** @type {any} */ (expr));
+  /** @type {(number | ExpressionSpecification)[]} */
+  const steps = [];
+  for (const [z] of HEAT_P90.slice(1)) steps.push(z, color(z));
+  ctx.map.setPaintProperty(L.grid, "fill-color", ["step", ["zoom"], color(HEAT_P90[0][0]), ...steps]);
 }
 
 /**
@@ -1894,8 +1925,9 @@ function paintGrid() {
  * são estreitas demais para endereços: nos Jardins todos cairiam na classe de cima.
  */
 function cityBreaks() {
-  if (!cityMedian) return /** @type {number[]} */ (distritos?.quebras ?? []);
-  return POINT_FACTORS.map((f) => Math.round((f * cityMedian) / 100) * 100);
+  const median = cityMedian;
+  if (!median) return /** @type {number[]} */ (distritos?.quebras ?? []);
+  return POINT_FACTORS.map((f) => Math.round((f * median) / 100) * 100);
 }
 
 function paintPoints() {
@@ -1903,14 +1935,15 @@ function paintPoints() {
   const { map } = ctx;
   if (!map.getLayer(L.points)) return;
   const nodata = cssVar("--nodata");
-  const color = (/** @type {number[]} */ breaks) => [
+  /** @type {(breaks: number[]) => ExpressionSpecification} */
+  const color = (breaks) => [
     "case",
     ["==", ["get", "m2"], null],
     nodata,
     breaks.length ? stepExpression(["get", "m2"], rampFor(breaks.length + 1), breaks) : rampFor(1)[0],
   ];
-  map.setPaintProperty(L.tilePoints, "circle-color", /** @type {any} */ (color(cityBreaks())));
-  map.setPaintProperty(L.points, "circle-color", /** @type {any} */ (color(regionBreaks.length ? regionBreaks : cityBreaks())));
+  map.setPaintProperty(L.tilePoints, "circle-color", color(cityBreaks()));
+  map.setPaintProperty(L.points, "circle-color", color(regionBreaks.length ? regionBreaks : cityBreaks()));
   // contorno neutro: a classe mais barata (que recua para o fundo) e o cinza "sem R$/m²" seguem
   // visíveis nos dois temas, e círculos sobrepostos se separam
   for (const id of [L.tilePoints, L.points]) map.setPaintProperty(id, "circle-stroke-color", cssVar("--text-muted"));
@@ -1930,7 +1963,7 @@ function updateVisibility() {
 function setPoints() {
   if (!ctx) return;
   const { map } = ctx;
-  const src = /** @type {any} */ (map.getSource(SRC_POINTS));
+  const src = /** @type {import("maplibre-gl").GeoJSONSource | undefined} */ (map.getSource(SRC_POINTS));
   updateVisibility();
   if (!src) return;
   src.setData(points ?? emptyFc());
@@ -1953,7 +1986,7 @@ function setPoints() {
 
 function drawRegiao() {
   if (!ctx) return;
-  const src = /** @type {any} */ (ctx.map.getSource(SRC_AREA));
+  const src = /** @type {import("maplibre-gl").GeoJSONSource | undefined} */ (ctx.map.getSource(SRC_AREA));
   if (!src) return;
   const geometry = state.regiao?.geometry;
   src.setData(geometry ? { type: "Feature", properties: {}, geometry } : emptyFc());
@@ -1962,14 +1995,14 @@ function drawRegiao() {
 /** Anel em volta do endereço da ficha aberta. */
 function drawSelected() {
   if (!ctx) return;
-  const src = /** @type {any} */ (ctx.map.getSource(SRC_SEL));
+  const src = /** @type {import("maplibre-gl").GeoJSONSource | undefined} */ (ctx.map.getSource(SRC_SEL));
   if (!src) return;
   src.setData(selected ? { type: "Feature", properties: { n: selected.n }, geometry: { type: "Point", coordinates: [selected.lon, selected.lat] } } : emptyFc());
 }
 
 function updateTiles() {
   if (!ctx) return;
-  const src = /** @type {any} */ (ctx.map.getSource(SRC_TILES));
+  const src = /** @type {import("maplibre-gl").VectorTileSource | undefined} */ (ctx.map.getSource(SRC_TILES));
   const url = tileUrl();
   if (!src || url === tilesUrl) return;
   tilesUrl = url;
@@ -2172,6 +2205,8 @@ function bindMapEvents(context) {
       return;
     }
     if (state.ferramenta !== "none") return;
+    // clique que fechou o desenho: não abre a ficha do endereço que estiver sob o último vértice
+    if (performance.now() - drawFinishedAt < DRAW_CLICK_GRACE_MS) return;
     const hit = pick(ev.point);
     if (!hit) return;
     hideTooltip();

@@ -1655,6 +1655,11 @@ class TestTiles:
         assert "data_ini deve ser menor" in resp.text
         assert api.get(url, params={"data_ini": "2025-01-01", "data_fim": "2025-01-01"}).is_success
 
+    def test_mensagem_do_422_sem_prefixo_repetido(self, api: TestClient) -> None:
+        url = f"/api/itbi/tiles/{_Z}/{_TX}/{_TY}.mvt"
+        detalhe = api.get(url, params={"cep": "1"}).json()["detail"]
+        assert detalhe[0]["msg"] == "Value error, cep deve ter 8 dígitos (ou 5 a 7 como prefixo)"
+
     def test_cache(self, api: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
         itbi_api.CACHE_TILES.clear()
         primeiro = tile(api, _Z, _TX, _TY, tipo=["casa", "apartamento"])

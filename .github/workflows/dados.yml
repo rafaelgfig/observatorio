@@ -3,7 +3,7 @@
 #
 # Algumas fontes (página e WFS da Prefeitura de SP) podem recusar máquinas de nuvem: se a
 # ingestão falhar aqui, a Release anterior continua valendo e dá para publicar de um computador
-# local com os comandos da seção "Atualizar os dados" de docs/deploy.md.
+# local com os comandos de "Se a Action falhar na ingestão" (seção 2 de docs/deploy.md).
 name: Dados
 
 on:

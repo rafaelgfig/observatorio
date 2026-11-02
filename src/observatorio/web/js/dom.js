@@ -3,9 +3,11 @@
 
 /**
  * Cria um elemento com propriedades (sem innerHTML — dados externos entram como texto).
+ * `style` é o texto CSS (como no atributo: o setter de `style` aceita string); `aria-*`, `role`
+ * e `for` viram atributos.
  * @template {keyof HTMLElementTagNameMap} K
  * @param {K} tag
- * @param {Partial<HTMLElementTagNameMap[K]> & Record<string, unknown>} [props]
+ * @param {Partial<Omit<HTMLElementTagNameMap[K], "style">> & { style?: string } & Record<string, unknown>} [props]
  * @param {(Node | string | null | undefined | false)[]} [children]
  * @returns {HTMLElementTagNameMap[K]}
  */

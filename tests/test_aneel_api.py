@@ -643,6 +643,35 @@ class TestConjuntos:
         assert [a["id"] for a in por_codigo if a["tipo"] == "conjunto"] == ["201"]
 
 
+@pytest.fixture
+def fec_oficial_faltando(dados_conjuntos: None, settings: Settings) -> None:
+    """O cenário com os conjuntos, sem o FEC oficial de fev/2025 do 101 (o DEC continua lá)."""
+    arquivo = settings.processed_dir / "aneel" / "conj_mes.parquet"
+    falta = (pl.col("conj") == 101) & (pl.col("ano") == 2025) & (pl.col("mes") == 2)
+    tabela = pl.read_parquet(arquivo)
+    tabela.with_columns(
+        fec_oficial=pl.when(falta).then(None).otherwise(pl.col("fec_oficial"))
+    ).write_parquet(arquivo)
+
+
+@pytest.mark.usefixtures("fec_oficial_faltando")
+def test_oficial_do_periodo_exige_cada_indicador_em_todos_os_meses(client: TestClient) -> None:
+    # o DEC oficial está nos dois meses: sai no painel do conjunto, como no mapa
+    kpis = get(client, "resumo", ano=2025, conj=101)["kpis"]
+    assert kpis["dec_oficial"] == pytest.approx(0.33)
+    assert kpis["fec_oficial"] is None  # antes: os dois sumiam
+    mapa = get(client, "mapa", ano=2025, nivel="conjunto", metrica="fec_oficial")
+    assert "101" not in mapa["valores"]
+    assert mapa["valores"]["102"] == pytest.approx(0.04)
+    # tabela de conjuntos do recorte: sem somar só os meses que têm o FEC (antes: 0,11)
+    conjuntos = get(client, "resumo", ano=2025, agente=ELETROPAULO.cnpj14)["conjuntos"]
+    oficiais = {c["id"]: (c["dec_oficial"], c["fec_oficial"]) for c in conjuntos}
+    assert oficiais == {
+        101: (pytest.approx(0.33), None),
+        102: (pytest.approx(0.2), pytest.approx(0.04)),
+    }
+
+
 @pytest.mark.usefixtures("dados_aneel")
 def test_nivel_conjunto_sem_poligonos_responde_503(client: TestClient) -> None:
     resp = client.get("/api/aneel/mapa", params={"nivel": "conjunto"})

@@ -32,6 +32,15 @@ export const SAO_PAULO_BOUNDS = [
 ];
 
 /**
+ * Tipos do estilo do MapLibre usados no JSDoc das views (o pacote os reexporta da style-spec).
+ * @typedef {maplibregl.ExpressionSpecification} ExpressionSpecification
+ * @typedef {maplibregl.FillLayerSpecification} FillLayerSpecification
+ * @typedef {maplibregl.LineLayerSpecification} LineLayerSpecification
+ * @typedef {maplibregl.CircleLayerSpecification} CircleLayerSpecification
+ * @typedef {maplibregl.SymbolLayerSpecification} SymbolLayerSpecification
+ */
+
+/**
  * @typedef {object} MapContext
  * @property {maplibregl.Map} map
  * @property {typeof maplibregl} maplibregl

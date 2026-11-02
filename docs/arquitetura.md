@@ -46,9 +46,11 @@ src/observatorio/
   itbi/            sources.py, parse.py, ingest.py, geosampa.py, geocode.py, tabela.py,
                    queries.py, api.py
   api/             app.py (fábrica), deps.py (DB, require, run_query), meta.py, search.py
-  web/             index.html, css/, js/ (main.js, map.js, views/, components/)
+  web/             index.html, css/, js/ (main.js, map.js, views/, components/), jsconfig.json
+                   (checagem de tipos do JSDoc: `npm run typecheck`, package.json na raiz)
 tests/             pytest (sem rede por padrão; `-m network` roda os que consultam as fontes)
-docs/
+docs/              arquitetura.md, deploy.md (publicação), img/ (capturas do README; como
+                   refazê-las em CONTRIBUTING.md)
 ```
 
 Cada domínio expõe em `<dominio>/api.py`:
@@ -304,7 +306,9 @@ datas ISO-8601. Erros: `{"detail": "mensagem"}`; dados ainda não ingeridos → 
 `OBSERVATORIO_BUNDLE_URL`, enquanto o primeiro pacote é baixado/instalado, `/api/*` e `/dados/*`
 (menos `/api/health` e a documentação) respondem 503 com o andamento no `detail` e `Retry-After`,
 e `GET /` devolve uma página de espera (200) que consulta `/api/meta` a cada 3 s e recarrega o
-site quando a resposta deixa de ser esse 503.
+site quando a resposta deixa de ser esse 503. Uma tela já aberta (servidor reiniciado) não
+mostra o erro: o cliente (`js/api.js`) repete o 503 com `Retry-After` depois da espera pedida
+(1–60 s, até 40 vezes); o 503 sem `Retry-After` (dados não ingeridos) falha na hora.
 
 ### Comuns
 
@@ -350,8 +354,9 @@ conjunto**, `dec_oficial`/`fec_oficial` (soma dos indicadores oficiais mensais; 
 
 Nível (`nivel`, em `mapa` e `ranking`): `municipio` (padrão) ou `conjunto`. Por conjunto nada é
 estimado: numerador do `conj_dim` sobre a base do `conj_mes`, mês a mês, com as mesmas regras de
-lacuna (um conjunto-mês está todo em lacuna ou não; o oficial não depende das lacunas). O
-oficial do período só sai se todos os meses do conjunto o têm.
+lacuna (um conjunto-mês está todo em lacuna ou não; o oficial não depende das lacunas). Cada
+indicador oficial do período (DEC, FEC) só sai se todos os meses do conjunto o têm — no mapa,
+no ranking, no painel do conjunto e na lista de conjuntos do `resumo`.
 
 * `GET /api/aneel/meta` →
   ```json
@@ -640,6 +645,11 @@ memória 1,0 GB contra 1,45 GB da junção na carga que havia antes), ~106 MiB e
 ## Frontend
 
 * `web/index.html` com import map (MapLibre 6.16.0, terra-draw 1.39.0 + adaptador 1.5.0).
+* Sem etapa de build: o navegador carrega os ES modules como estão. Os tipos do JSDoc
+  (`// @ts-check`) são conferidos por `npm run typecheck` (`tsc` com `web/jsconfig.json`:
+  `strict`, sem emitir nada) contra os tipos do MapLibre, do terra-draw e do GeoJSON instalados
+  em `node_modules/` nas mesmas versões do import map — o `package.json` só tem dependências de
+  desenvolvimento, e o CI roda a checagem.
 * `js/main.js` — roteamento por hash (`#/apagoes`, `#/itbi`), mapa único compartilhado; cada
   view exporta `mount(ctx)` / `unmount()` e reage a `ctx.onStyle(fn)` (troca de tema recria o estilo).
 * `views/apagoes.js` — "Mapa por: Municípios | Conjuntos elétricos" (`nivel=conjunto` e
@@ -664,7 +674,8 @@ memória 1,0 GB contra 1,45 GB da junção na carga que havia antes), ~106 MiB e
 * Componentes: `components/autocomplete.js`, `charts.js` (SVG: colunas, linha, barras horizontais,
   com tooltip), `legend.js`, `table.js` (`render` devolve texto ou nó), `location-sheet.js` (ficha
   do endereço do ITBI: painel lateral, folha inferior no celular); utilitários em `dom.js` (`el`, `fmt`, `field`, `kpiTile`,
-  `showError`, `debounce`…), `api.js` (`api`, `latest`, `isAbort`). Nomes de métricas (ANEEL) e de
+  `showError`, `debounce`…), `api.js` (`api`, `latest`, `isAbort`; `api` repete sozinho um 503
+  com `Retry-After` depois da espera pedida, até 40 vezes, e cancela a espera pelo `AbortSignal`). Nomes de métricas (ANEEL) e de
   tipos de imóvel (ITBI) vêm dos `/meta`; o frontend guarda só os ids, a formatação e os textos de
   ajuda.
 * Tema escuro padrão; tokens CSS em `css/app.css`. Cores de dados: rampa sequencial única por

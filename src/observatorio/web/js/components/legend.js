@@ -3,6 +3,8 @@
 
 import { el } from "../dom.js";
 
+/** @typedef {import("../map.js").ExpressionSpecification} ExpressionSpecification */
+
 /**
  * @typedef {object} LegendOptions
  * @property {string} title
@@ -88,16 +90,16 @@ export function cssVar(name) {
 
 /**
  * Expressão MapLibre "step" que mapeia valor → classe de cor.
- * @param {unknown} input  expressão de entrada (ex.: ["feature-state", "v"])
+ * @param {ExpressionSpecification} input  expressão de entrada (ex.: ["feature-state", "v"])
  * @param {string[]} colors
  * @param {number[]} breaks
- * @returns {unknown[]}
+ * @returns {ExpressionSpecification}
  */
 export function stepExpression(input, colors, breaks) {
-  /** @type {unknown[]} */
-  const expr = ["step", input, colors[0]];
+  /** @type {(number | string)[]} */
+  const stops = [];
   breaks.forEach((b, i) => {
-    expr.push(b, colors[Math.min(i + 1, colors.length - 1)]);
+    stops.push(b, colors[Math.min(i + 1, colors.length - 1)]);
   });
-  return expr;
+  return ["step", input, colors[0], ...stops];
 }

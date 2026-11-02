@@ -320,7 +320,8 @@ class FiltroTile(BaseModel):
         try:
             self.consulta()
         except ValidationError as exc:
-            raise ValueError(exc.errors()[0]["msg"]) from exc
+            # o pydantic põe "Value error, " de novo na mensagem que sai daqui
+            raise ValueError(exc.errors()[0]["msg"].removeprefix("Value error, ")) from exc
         return self
 
     def consulta(self) -> ConsultaItbi:

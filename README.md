@@ -3,29 +3,64 @@
 Onde falta energia no Brasil e por quanto se vendem os imóveis em São Paulo — em mapa, a partir
 de dados abertos oficiais, sem cadastro e sem chave de API.
 
-<!-- Capturas de tela: adicionar docs/img/apagoes.png e docs/img/itbi.png (ex.: 1600×1000). -->
-![Apagões: DEC por município, com painel do escopo e evolução mensal](docs/img/apagoes.png)
-![ITBI: transações num raio a partir de um endereço, com mediana de R$/m²](docs/img/itbi.png)
+![Apagões: DEC de 2026 por município em todo o Brasil, com filtros e indicadores no painel](docs/img/apagoes.png)
 
 ## Funcionalidades
 
-* **Apagões** — interrupções de energia nas redes de distribuição
-  ([ANEEL](https://dadosabertos.aneel.gov.br/dataset/interrupcoes-de-energia-eletrica-nas-redes-de-distribuicao)),
-  ano corrente e anterior: coroplético por município **ou por conjunto elétrico** (DEC, FEC,
-  consumidores afetados, interrupções…; por conjunto também o DEC/FEC oficial, sem
-  estimativa), busca com autocompletar, evolução mensal, calculado × oficial, causas, ranking e
-  as maiores interrupções de cada lugar.
-* **ITBI São Paulo** — guias de ITBI pagas
-  ([Prefeitura de SP](https://prefeitura.sp.gov.br/web/fazenda/w/acesso_a_informacao/31501)),
-  de 2015 até hoje, **geocodificadas** pelo cadastro de lotes do GeoSampa: pesquisa por raio
-  a partir de um endereço, por polígono desenhado ou por distrito; filtros por período, tipo
-  de imóvel, valor e área; mediana de R$/m², série mensal, tabela e exportação CSV.
+### Apagões (ANEEL)
 
-* **Para todos**: links compartilháveis (o estado da tela vai no endereço), tema escuro por
-  padrão, basemap do [OpenFreeMap](https://openfreemap.org) (sem chaves de API), tabelas como
-  alternativa acessível aos gráficos e API JSON documentada em `/api/docs`.
-* **Dados em dia**: ingestão incremental (só baixa e reprocessa o que mudou nas fontes) e um
-  pacote de dados publicado no GitHub para o site público, atualizado todo mês por uma Action.
+Interrupções de energia nas redes de distribuição
+([ANEEL](https://dadosabertos.aneel.gov.br/dataset/interrupcoes-de-energia-eletrica-nas-redes-de-distribuicao)),
+ano corrente e anterior, mês a mês.
+
+* **Mapa por município**: DEC, FEC, CHI, consumidores afetados, interrupções e duração média.
+  Em 2025 a fonte não traz o município, e os valores são estimados a partir dos conjuntos
+  elétricos (a tela sinaliza).
+* **Mapa por conjunto elétrico** — o recorte em que a ANEEL publica os indicadores: DEC/FEC
+  calculados das interrupções de cada conjunto ao lado do **DEC/FEC oficial**, sem estimativa
+  (polígonos da BDGD).
+* Busca por município, estado, distribuidora ou conjunto, com autocompletar; para o recorte
+  escolhido, evolução mensal, calculado × oficial, causas, ranking dos municípios ou conjuntos
+  com maior valor da métrica e as maiores interrupções. Meses que faltam nos arquivos da ANEEL ficam marcados, sem virar
+  zero.
+
+![Apagões por conjunto elétrico no estado de São Paulo: DEC oficial de 2026](docs/img/conjuntos.png)
+
+### ITBI São Paulo
+
+Guias de ITBI pagas
+([Prefeitura de SP](https://prefeitura.sp.gov.br/web/fazenda/w/acesso_a_informacao/31501)),
+de 2015 até hoje, **geocodificadas** pelo cadastro de lotes do GeoSampa.
+
+* **Mapa em três níveis**: de longe, os distritos coloridos pelo R$/m² mediano ou pelo número de
+  transações; ao aproximar, uma grade com o número de guias; de perto, um ponto por endereço
+  (lote ou condomínio).
+* Região por raio a partir de um endereço, por polígono ou retângulo desenhado ou por
+  distrito/subprefeitura. Filtros por período, tipo de imóvel, natureza, valor, área e precisão
+  da localização.
+* **Valor declarado × referência**: o valor declarado, levado a 100% do imóvel, aparece ao lado
+  do valor venal de referência da Prefeitura. Declarações muito abaixo ou acima da referência
+  são marcadas como **atípicas** e ficam fora das medianas por padrão; dá para incluí-las ou
+  vê-las sozinhas.
+* **Ficha do endereço**: todas as guias do lote ou condomínio (de qualquer data, tipo e
+  natureza), com bloco/torre, unidade, vagas, declarado, referência e R$/m², e a contagem de
+  unidades e blocos. A busca aceita "Rua X, 600" e abre direto a ficha do número.
+* Mediana de R$/m², séries mensais, ranking dos distritos, tabela de transações e exportação
+  CSV.
+
+![ITBI: R$/m² mediano por distrito na cidade de São Paulo](docs/img/itbi.png)
+
+![Ficha da Rua Inacio Monteiro, 600: 64 guias, 54 unidades em 20 blocos, valor declarado × referência e guias atípicas marcadas](docs/img/itbi-ficha.png)
+
+### Para todos
+
+* **Links compartilháveis**: o estado da tela vai no endereço. Tema escuro por padrão, basemap
+  do [OpenFreeMap](https://openfreemap.org) (sem chaves de API), tabelas como alternativa
+  acessível aos gráficos e API JSON documentada em `/api/docs`.
+* **Dados em dia**: a ingestão é incremental (só baixa e reprocessa o que mudou nas fontes), e
+  uma Action do GitHub publica todo mês um pacote de dados pronto.
+* **Publicação**: o servidor baixa e instala sozinho esse pacote (`.tar` com sha256) na partida.
+  A imagem Docker roda no Hugging Face Spaces, no Cloud Run ou num servidor qualquer.
 
 ## Requisitos
 
@@ -35,6 +70,8 @@ de dados abertos oficiais, sem cadastro e sem chave de API.
 * ~2 GB de RAM livres para o servidor (o ITBI é carregado em memória e comprimido)
 
 ## Começando
+
+### Com uv
 
 ```bash
 uv sync
@@ -60,8 +97,9 @@ docker run --rm -p 7860:7860 \
   observatorio
 ```
 
-Abra <http://localhost:7860>: o contêiner sobe na hora e baixa os dados em segundo plano; até
-lá, uma página de espera mostra o andamento e abre o site sozinha quando os dados chegam.
+Abra <http://localhost:7860>. O contêiner sobe na hora e baixa os dados em segundo plano;
+enquanto isso, uma página de espera mostra o andamento e abre o site sozinha quando os dados
+chegam.
 
 ### Atualizar os dados
 
@@ -79,13 +117,19 @@ uv run observatorio status               # o que foi baixado/processado e quando
 uv run observatorio bundle criar dist/observatorio-dados.tar --enxuto   # pacote para publicar
 ```
 
-## Publicar o site
+## Publicar
 
-O GitHub Pages sozinho não serve: o site precisa de um servidor Python. O código e os dados
-ficam no GitHub (os dados como asset da Release `dados`, gerado pela Action
-[`dados.yml`](.github/workflows/dados.yml)) e o app roda num contêiner — de graça no
-[Hugging Face Spaces](https://huggingface.co/spaces), ou no Cloud Run ou num servidor
-qualquer. Passo a passo, custos e limites em [docs/deploy.md](docs/deploy.md).
+O GitHub Pages sozinho não serve, porque o site precisa de um servidor Python. O caminho
+recomendado é gratuito:
+
+1. **Código no GitHub**: este repositório, público.
+2. **Pacote de dados numa Release**: a Action [`dados.yml`](.github/workflows/dados.yml)
+   ingere as fontes todo mês e publica `observatorio-dados.tar` na Release `dados`.
+3. **App no Hugging Face Spaces**: um Space Docker com `OBSERVATORIO_BUNDLE_URL` apontando para
+   esse pacote, que ele baixa na partida.
+
+Passo a passo, alternativas (Cloud Run, VPS com Docker), custos e limites estão em
+[docs/deploy.md](docs/deploy.md).
 
 ## Desenvolvimento
 
@@ -96,7 +140,12 @@ uv run ruff check . && uv run ruff format .
 uv run mypy
 uv run pre-commit install     # roda ruff + mypy a cada commit
 uv run observatorio serve --reload
+npm ci && npm run typecheck   # tipos do JSDoc do frontend (Node 22+; só para conferir)
 ```
+
+O frontend não tem etapa de build: o `package.json` só instala, para a checagem, o TypeScript e
+os tipos do MapLibre e do terra-draw nas versões do import map do `index.html` (o navegador
+continua carregando as bibliotecas do CDN). Ao mudar uma dessas versões, troque nos dois lugares.
 
 Configuração por variáveis de ambiente com prefixo `OBSERVATORIO_` (ou arquivo `.env`), por
 exemplo `OBSERVATORIO_DATA_DIR`, `OBSERVATORIO_ITBI_MIN_YEAR`, `OBSERVATORIO_PORT`,
@@ -156,16 +205,10 @@ A arquitetura, os esquemas dos dados processados e os contratos da API estão em
 
 ## Contribuindo
 
-Sugestões e correções são bem-vindas — abra uma *issue* descrevendo o problema (com o link da
-tela, que guarda os filtros) ou um *pull request*:
-
-1. `uv sync` e `uv run pre-commit install`;
-2. mantenha o estilo do código: tipagem estrita (`mypy`), `ruff`, docstrings e mensagens em
-   português; no frontend, ES modules sem etapa de build, `// @ts-check` e dados sempre como
-   texto (nunca `innerHTML`);
-3. inclua testes (`uv run pytest`; eles não acessam as fontes de dados) e atualize
-   [docs/arquitetura.md](docs/arquitetura.md) quando mudar um contrato da API ou um esquema;
-4. nunca grave nem exponha dados pessoais (nomes das partes, CPF/CNPJ).
+Sugestões e correções são bem-vindas: abra uma *issue* descrevendo o problema (com o link da
+tela, que guarda os filtros) ou um *pull request*. As checagens, as convenções do código e como
+refazer as capturas de tela estão em [CONTRIBUTING.md](CONTRIBUTING.md). Nunca grave nem exponha
+dados pessoais (nomes das partes, CPF/CNPJ).
 
 ## Licença
 

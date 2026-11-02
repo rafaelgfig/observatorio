@@ -1,0 +1,16 @@
+{
+  "name": "observatorio-web",
+  "private": true,
+  "description": "Só a checagem de tipos do frontend (JSDoc + // @ts-check). Sem dependências de execução: o navegador carrega MapLibre e terra-draw do CDN (import map do index.html), nas mesmas versões.",
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc -p src/observatorio/web/jsconfig.json"
+  },
+  "devDependencies": {
+    "@types/geojson": "7946.0.16",
+    "maplibre-gl": "6.16.0",
+    "terra-draw": "1.39.0",
+    "terra-draw-maplibre-gl-adapter": "1.5.0",
+    "typescript": "7.0.2"
+  }
+}

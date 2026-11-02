@@ -17,6 +17,7 @@ import { el, errorNotice, field, fmt, icon, kpiTile, MONTHS, preserveFocus, show
 import { BRASIL_BOUNDS } from "../map.js";
 
 /** @typedef {import("../main.js").ViewContext} ViewContext */
+/** @typedef {import("../map.js").ExpressionSpecification} ExpressionSpecification */
 
 /**
  * @typedef {object} Metric
@@ -157,8 +158,12 @@ let state = {
 let meta = null;
 /** @type {any} */
 let mapData = null;
-/** @type {Record<string, HTMLElement>} */
-const ui = {};
+/**
+ * Elementos do painel (criados em `buildPanel`, antes de qualquer uso).
+ * @typedef {Record<string, HTMLElement> & { status: ReturnType<typeof statusRegion> }} Ui
+ */
+/** @type {Ui} */
+const ui = /** @type {Ui} */ ({});
 /** @type {ReturnType<typeof createLegend> | null} */
 let legend = null;
 /** @type {ReturnType<typeof columnChart> | null} */
@@ -203,7 +208,10 @@ export function unmount() {
   mapData = null;
 }
 
-/** @param {URLSearchParams} p */
+/**
+ * @param {URLSearchParams} p
+ * @returns {State}
+ */
 function stateFromParams(p) {
   /** @type {Escopo} */
   let escopo = { tipo: "brasil" };
@@ -1215,18 +1223,29 @@ const LAYERS = [
 const UNSTABLE_OPACITY = 0.6;
 const STABLE_OPACITY = 0.85;
 
-/** Largura do contorno tracejado: `width` nas feições instáveis, 0 nas demais. */
-function unstableWidth(/** @type {number} */ width) {
+/**
+ * Largura do contorno tracejado: `width` nas feições instáveis, 0 nas demais.
+ * @param {number} width
+ * @returns {ExpressionSpecification}
+ */
+function unstableWidth(width) {
   return ["case", ["boolean", ["feature-state", "instavel"], false], width, 0];
 }
 
-/** Filtro do ano nos conjuntos: um código antigo e o novo podem ter o mesmo polígono. */
+/**
+ * Filtro do ano nos conjuntos: um código antigo e o novo podem ter o mesmo polígono.
+ * @returns {ExpressionSpecification}
+ */
 function yearFilter() {
   return ["in", String(state.ano ?? ""), ["get", "anos"]];
 }
 
-/** Id do filtro de seleção de cada nível (nada selecionado: um id que não existe). */
-function selectedFilter(/** @type {Nivel} */ nivel) {
+/**
+ * Id do filtro de seleção de cada nível (nada selecionado: um id que não existe).
+ * @param {Nivel} nivel
+ * @returns {ExpressionSpecification}
+ */
+function selectedFilter(nivel) {
   const e = state.escopo;
   if (nivel === "conjunto") return ["==", ["id"], e.tipo === "conjunto" ? Number(e.id) : -1];
   return ["==", ["get", "cod"], e.tipo === "municipio" ? Number(e.id) : -1];
@@ -1242,7 +1261,9 @@ function addLevelLayers(nivel, before) {
   const { map } = ctx;
   const l = LEVEL_LAYERS[nivel];
   const filter = nivel === "conjunto" ? yearFilter() : null;
-  /** @param {any} spec */
+  /**
+   * @param {(import("../map.js").FillLayerSpecification | import("../map.js").LineLayerSpecification) & { filter?: ExpressionSpecification }} spec
+   */
   const add = (spec) => {
     if (map.getLayer(spec.id)) return;
     map.addLayer(filter ? { ...spec, filter: spec.filter ? ["all", filter, spec.filter] : filter } : spec, before);

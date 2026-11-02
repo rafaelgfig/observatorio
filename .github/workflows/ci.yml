@@ -22,6 +22,17 @@ jobs:
       - name: Dependências
         run: uv sync --locked
 
+      # Node só para conferir o frontend (tipos do JSDoc, sintaxe e o teste do cliente da API);
+      # o site não tem build e não usa node_modules em execução.
+      - name: Instalar Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Dependências do frontend (só tipos)
+        run: npm ci --ignore-scripts
+
       # A extensão spatial do DuckDB é baixada de extensions.duckdb.org no 1º uso; com o cache
       # (chave = versão do DuckDB), os testes não dependem desse servidor a cada execução.
       - name: Versão do DuckDB
@@ -45,6 +56,9 @@ jobs:
       - name: Tipos
         run: uv run mypy
 
+      - name: Tipos do frontend
+        run: npm run typecheck
+
       - name: Testes
         run: uv run pytest --cov --cov-report=term-missing
 
@@ -53,3 +67,40 @@ jobs:
           for f in $(find src/observatorio/web/js -name '*.js'); do
             node --input-type=module --check < "$f"
           done
+
+  # Constrói a imagem do Dockerfile da raiz (a mesma do Hugging Face/Cloud Run) sem publicar
+  # nada, e confere que o servidor sobe. O cache das camadas fica no cache do Actions: sem
+  # mudança no uv.lock, só as camadas do código são refeitas.
+  docker:
+    name: Imagem Docker
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Construir a imagem (sem push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: observatorio:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # sem pacote de dados: o servidor sobe vazio e /api/health responde mesmo assim
+      - name: Servidor sobe
+        run: |
+          docker run -d --name observatorio -p 7860:7860 observatorio:ci
+          for _ in $(seq 30); do
+            if curl --fail --silent http://127.0.0.1:7860/api/health; then
+              docker rm -f observatorio > /dev/null
+              exit 0
+            fi
+            sleep 2
+          done
+          docker logs observatorio
+          exit 1

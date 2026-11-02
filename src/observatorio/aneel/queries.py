@@ -875,15 +875,16 @@ def _mensal_conjunto(db: Database, filtro: FiltroAneel, ano: int) -> list[dict[s
 def _oficial_conjunto(
     filtro: FiltroAneel, mensal: list[dict[str, Any]]
 ) -> dict[str, float | None] | None:
-    """DEC/FEC oficiais do período (soma dos meses) — só se todos os meses têm o indicador."""
+    """DEC/FEC oficiais do período (soma dos meses), cada um só se todos os meses o têm — a
+    regra do mapa e do ranking por conjunto (um FEC que falta num mês não esconde o DEC)."""
     if not filtro.comparavel_oficial or not mensal:
         return None
-    if any(m["dec_oficial"] is None or m["fec_oficial"] is None for m in mensal):
-        return None
-    return {
-        "dec": sum(float(m["dec_oficial"]) for m in mensal),
-        "fec": sum(float(m["fec_oficial"]) for m in mensal),
-    }
+
+    def soma(campo: str) -> float | None:
+        valores = [m[campo] for m in mensal]
+        return None if None in valores else sum(float(v) for v in valores)
+
+    return {"dec": soma("dec_oficial"), "fec": soma("fec_oficial")}
 
 
 def _causas_conjunto(
@@ -973,8 +974,12 @@ def _conjuntos(db: Database, filtro: FiltroAneel, ano: int, alvo: Escopo) -> lis
         params.append(int(filtro.mun))
     alvo_sql = " AND ".join(conds)
     num = _where_numerador(filtro, ano)
+    # oficial do período só com o indicador em todos os meses (``sum`` pularia os que faltam)
     dec_oficial, fec_oficial = (
-        ("sum(c.dec_oficial)", "sum(c.fec_oficial)")
+        (
+            "CASE WHEN count(c.dec_oficial) = count(*) THEN sum(c.dec_oficial) END",
+            "CASE WHEN count(c.fec_oficial) = count(*) THEN sum(c.fec_oficial) END",
+        )
         if filtro.comparavel_oficial
         else ("NULL::DOUBLE", "NULL::DOUBLE")
     )

@@ -1,6 +1,6 @@
 """Pacote de dados: os dados processados num só arquivo, para publicar e servir o site.
 
-O site público não roda a ingestão (ela baixa ~1,3 GB das fontes, leva minutos e algumas
+O site público não roda a ingestão (ela baixa ~1,4 GB das fontes, leva minutos e algumas
 fontes recusam servidores na nuvem). Quem tem os dados prontos — a Action ``dados.yml`` ou um
 computador local — empacota ``data/processed`` e ``data/manifest`` com
 ``observatorio bundle criar`` e publica o arquivo (Release ``dados`` do GitHub); o servidor

@@ -160,7 +160,7 @@ def bundle_criar(
         bool,
         typer.Option(
             "--enxuto",
-            help="Sem as colunas do fato da ANEEL que só a ingestão usa (~25% menor; só serve "
+            help="Sem as colunas do fato da ANEEL que só a ingestão usa (~26% menor; só serve "
             "o site).",
         ),
     ] = False,
