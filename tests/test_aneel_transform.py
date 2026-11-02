@@ -296,13 +296,59 @@ def test_agente_mes_marca_lacunas(con: duckdb.DuckDBPyConnection) -> None:
     assert rows(con, "SELECT DISTINCT typeof(linhas) FROM agente_mes") == [("BIGINT",)]
 
 
+def test_conj_dim_reproduz_o_numerador_do_conj_mes(con: duckdb.DuckDBPyConnection) -> None:
+    # regulatório no conj_dim = chi_reg / consumidores_reg do conj_mes, conjunto a conjunto
+    assert (
+        rows(
+            con,
+            """
+        SELECT c.ano, c.mes, c.conj, c.chi_reg, d.chi, c.consumidores_reg, d.consumidores
+        FROM conj_mes c JOIN (
+            SELECT ano, mes, conj, sum(chi) AS chi, sum(consumidores) AS consumidores
+            FROM conj_dim WHERE regulatorio GROUP BY ALL
+        ) d USING (ano, mes, conj)
+        WHERE abs(c.chi_reg - d.chi) > 1e-9 OR abs(c.consumidores_reg - d.consumidores) > 1e-9
+        """,
+        )
+        == []
+    )
+    # 101 em jan/2025: A1 (meio ambiente, 200) e A4 (alteração, programada, 30); 3 eventos
+    # no total (A2, A3 fora do critério também contam como eventos, cada um uma vez)
+    assert rows(
+        con,
+        "SELECT causa, programada, chi, eventos FROM conj_dim"
+        " WHERE ano = 2025 AND mes = 1 AND conj = 101 AND regulatorio ORDER BY chi DESC",
+    ) == [("Meio ambiente", False, 200.0, 1.0), ("Alteração", True, 30.0, 1.0)]
+    [(eventos,)] = rows(con, "SELECT sum(eventos) FROM conj_dim WHERE ano = 2025 AND conj = 101")
+    assert eventos == pytest.approx(5)  # A1, A2, A3, A4 e A6
+
+
+def test_places_dos_conjuntos(con: duckdb.DuckDBPyConnection) -> None:
+    lugares = {
+        r[0]: r[1:]
+        for r in rows(
+            con,
+            "SELECT id, rotulo, detalhe, norm, peso, lon, lat, bbox_w, bbox_e FROM places"
+            " WHERE tipo = 'conjunto'",
+        )
+    }
+    assert set(lugares) == {"101", "102", "201", "301"}
+    rotulo, detalhe, norm, peso, lon, lat, bbox_w, bbox_e = lugares["101"]
+    assert (rotulo, detalhe, norm) == ("CENTRO", ELETROPAULO.sigla, "centro 101")
+    assert peso == 1000  # base média do último ano
+    # sem polígono ainda: o enquadramento dos municípios principais (São Paulo e Campinas)
+    assert (lon, lat) == (-46.6, -23.6)
+    assert (bbox_w, bbox_e) == (pytest.approx(-47.3), pytest.approx(-46.4))
+    assert lugares["201"][1] == CELG.sigla  # sigla mais recente da distribuidora
+
+
 def test_places_das_distribuidoras(con: duckdb.DuckDBPyConnection) -> None:
     lugares = {
         r[0]: r[1:]
         for r in rows(
             con,
             "SELECT id, escopo, tipo, rotulo, detalhe, norm, peso, lon, lat, bbox_w, bbox_e"
-            " FROM places",
+            " FROM places WHERE tipo = 'distribuidora'",
         )
     }
     assert set(lugares) == {ELETROPAULO.cnpj14, CELG.cnpj14, LIGHT.cnpj14}

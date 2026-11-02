@@ -9,12 +9,13 @@ from collections.abc import Callable
 from datetime import date, datetime
 from typing import Annotated, Any, Literal
 
-from fastapi import APIRouter, Query, status
+from fastapi import APIRouter, HTTPException, Query, Request, status
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 
-from observatorio.aneel import queries
-from observatorio.aneel.queries import FiltroAneel, Metrica, Ordem, TipoEscopo
-from observatorio.api.deps import DB, run_query
+from observatorio.aneel import conjuntos, queries
+from observatorio.aneel.queries import FiltroAneel, Metrica, Nivel, Ordem, TipoEscopo
+from observatorio.api.deps import DB, AppSettings, run_query
 from observatorio.db import Database, Dataset
 
 DATASETS: list[Dataset] = [
@@ -22,8 +23,10 @@ DATASETS: list[Dataset] = [
     Dataset("aneel_mun_mes", "aneel/mun_mes.parquet", materialize=True, order_by="ano, mes"),
     Dataset("aneel_mun_base", "aneel/mun_base.parquet", materialize=True, order_by="ano, mes"),
     Dataset("aneel_conj_mes", "aneel/conj_mes.parquet", materialize=True),
+    Dataset("aneel_conj_dim", "aneel/conj_dim.parquet", materialize=True, order_by="ano, mes"),
     Dataset("aneel_agente_mes", "aneel/agente_mes.parquet", materialize=True),
     Dataset("aneel_conj_mun_pesos", "aneel/conj_mun_pesos.parquet", materialize=True),
+    Dataset("aneel_conjuntos", "aneel/conjuntos.parquet", materialize=True),
 ]
 
 router = APIRouter(prefix="/api/aneel", tags=["aneel"])
@@ -46,6 +49,7 @@ class MetricaInfo(BaseModel):
     nome: str
     unidade: str
     descricao: str
+    niveis: list[Nivel]
 
 
 class Lacuna(BaseModel):
@@ -56,11 +60,20 @@ class Lacuna(BaseModel):
     cobertura: float
 
 
+class InfoConjuntos(BaseModel):
+    poligonos: int
+    sigel: int
+    sem_poligono: int
+    substituidos: int = 0
+    data_base: date | None
+
+
 class MetaAneel(BaseModel):
     anos: list[AnoDisponivel]
     causas: list[str]
     metricas: list[MetricaInfo]
     lacunas: list[Lacuna]
+    conjuntos: InfoConjuntos | None
 
 
 class Mapa(BaseModel):
@@ -72,12 +85,16 @@ class Mapa(BaseModel):
     pouca_base: list[str]
     lacuna: list[str]
     n: int
+    nivel: Nivel
+    sem_geometria: list[str]
 
 
 class EscopoInfo(BaseModel):
     tipo: TipoEscopo
     id: str | None
     nome: str
+    uf: str | None = None
+    bbox: tuple[float, float, float, float] | None = None  # [w, s, e, n] para enquadrar
 
 
 class Kpis(BaseModel):
@@ -99,6 +116,8 @@ class Mes(BaseModel):
     chi: float | None
     consumidores: float | None
     eventos: int | None
+    dec_oficial: float | None = None
+    fec_oficial: float | None = None
 
 
 class ParcelaCausa(BaseModel):
@@ -138,9 +157,10 @@ class Resumo(BaseModel):
 class ItemRanking(BaseModel):
     cod: str
     nome: str
-    uf: str
+    uf: str | None
     valor: float
     consumidores_base: float
+    sigla: str | None = None  # distribuidora (ranking de conjuntos)
 
 
 class Interrupcao(BaseModel):
@@ -164,6 +184,7 @@ class Interrupcao(BaseModel):
 
 _ERROS: dict[type[Exception], int] = {
     queries.AnoIndisponivelError: status.HTTP_422_UNPROCESSABLE_CONTENT,
+    queries.MetricaIndisponivelError: status.HTTP_422_UNPROCESSABLE_CONTENT,
     queries.EscopoNaoEncontradoError: status.HTTP_404_NOT_FOUND,
 }
 
@@ -174,18 +195,61 @@ def _run[T](db: Database, names: tuple[str, ...], query: Callable[[], T]) -> T:
 
 
 _MUNICIPAL = ("aneel_agente_mes", "aneel_mun_mes", "aneel_mun_base")
+# nível conjunto: numerador do conj_dim, base do conj_mes; o mapa precisa dos polígonos
+_CONJUNTO = ("aneel_agente_mes", "aneel_conj_mes", "aneel_conj_dim", "aneel_conj_mun_pesos")
+
+NivelQuery = Annotated[
+    Nivel,
+    Query(description="`municipio` (padrão) ou `conjunto` (conjuntos elétricos, sem estimativa)."),
+]
 
 
 @router.get("/meta", response_model=MetaAneel)
 def meta(db: DB) -> dict[str, Any]:
-    """Anos e meses disponíveis, causas, métricas e lacunas conhecidas dos dados."""
+    """Anos e meses disponíveis, causas, métricas, lacunas e polígonos dos conjuntos."""
     return _run(db, ("aneel_agente_mes",), lambda: queries.meta(db))
 
 
 @router.get("/mapa", response_model=Mapa)
-def mapa(db: DB, filtro: Filtro, metrica: Metrica = "dec") -> dict[str, Any]:
-    """Valor da métrica por município (coroplético) com quebras de classe."""
-    return _run(db, _MUNICIPAL, lambda: queries.mapa(db, filtro, metrica))
+def mapa(
+    db: DB, filtro: Filtro, metrica: Metrica = "dec", nivel: NivelQuery = "municipio"
+) -> dict[str, Any]:
+    """Valor da métrica por município ou por conjunto (coroplético) com quebras de classe."""
+    names = (*_CONJUNTO, "aneel_conjuntos") if nivel == "conjunto" else _MUNICIPAL
+    return _run(db, names, lambda: queries.mapa(db, filtro, metrica, nivel))
+
+
+@router.get("/conjuntos.geojson", include_in_schema=False)
+def conjuntos_geojson(settings: AppSettings, request: Request) -> Response:
+    """Polígonos dos conjuntos (pré-comprimidos). O navegador revalida a cada carga: com o
+    mesmo ETag a resposta é um 304 sem corpo (o arquivo tem ~3 MB comprimido)."""
+    path, gz, _ = conjuntos.outputs(settings.processed_dir / "aneel")
+    if not path.exists():
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "Polígonos dos conjuntos ainda não gerados: rode `observatorio ingest aneel`.",
+        )
+    headers = {"Cache-Control": "no-cache", "Vary": "Accept-Encoding"}
+    arquivo = path
+    if gz.exists() and "gzip" in request.headers.get("accept-encoding", ""):
+        headers["Content-Encoding"] = "gzip"
+        arquivo = gz
+    response = FileResponse(
+        arquivo, media_type="application/geo+json", headers=headers, stat_result=arquivo.stat()
+    )
+    etag = response.headers["etag"]
+    if _etag_confere(request.headers.get("if-none-match"), etag):
+        cabecalhos = {"ETag": etag, "Cache-Control": "no-cache", "Vary": "Accept-Encoding"}
+        return Response(status_code=status.HTTP_304_NOT_MODIFIED, headers=cabecalhos)
+    return response
+
+
+def _etag_confere(if_none_match: str | None, etag: str) -> bool:
+    """``If-None-Match`` (lista, ``W/`` ou ``*``) contém o ETag atual?"""
+    if not if_none_match:
+        return False
+    pedidos = {t.strip().removeprefix("W/") for t in if_none_match.split(",")}
+    return "*" in pedidos or etag.removeprefix("W/") in pedidos
 
 
 @router.get("/resumo", response_model=Resumo)
@@ -197,8 +261,12 @@ def resumo(
         Query(description="`ano`: série mensal do ano inteiro (KPIs continuam do período)."),
     ] = "periodo",
 ) -> dict[str, Any]:
-    """Painel do recorte: KPIs, série mensal, causas, distribuidoras e conjuntos."""
-    names = (*_MUNICIPAL, "aneel_conj_mes", "aneel_conj_mun_pesos", "aneel_fato")
+    """Painel do recorte: KPIs, série mensal, causas, distribuidoras e conjuntos.
+
+    Com ``conj``, o painel é o do conjunto: DEC/FEC calculados e oficiais por mês."""
+    names: tuple[str, ...] = (*_MUNICIPAL, "aneel_conj_mes", "aneel_conj_mun_pesos", "aneel_fato")
+    if filtro.conj:
+        names = (*names, "aneel_conj_dim")
     return _run(
         db,
         (*names, "municipios", "ufs"),
@@ -215,13 +283,21 @@ def ranking(
     ordem: Ordem = "desc",
     limite: Annotated[int, Query(ge=1, le=200)] = 20,
     min_consumidores: Annotated[float, Query(ge=0)] = queries.POUCA_BASE,
+    nivel: NivelQuery = "municipio",
 ) -> list[dict[str, Any]]:
-    """Municípios ordenados pela métrica (com base mínima de consumidores)."""
+    """Municípios (ou conjuntos) ordenados pela métrica (com base mínima de consumidores)."""
+    names = _CONJUNTO if nivel == "conjunto" else (*_MUNICIPAL, "municipios")
     return _run(
         db,
-        (*_MUNICIPAL, "municipios"),
+        names,
         lambda: queries.ranking(
-            db, filtro, metrica, ordem=ordem, limite=limite, min_consumidores=min_consumidores
+            db,
+            filtro,
+            metrica,
+            ordem=ordem,
+            limite=limite,
+            min_consumidores=min_consumidores,
+            nivel=nivel,
         ),
     )
 

@@ -31,7 +31,10 @@ RECURSOS = {
 
 @pytest.fixture
 def settings_ckan(settings: Settings) -> Settings:
-    return settings.model_copy(update={"aneel_ckan_api": API, "aneel_years": [2025, 2026]})
+    # a etapa dos polígonos (ArcGIS/SIGEL) tem testes próprios em test_aneel_conjuntos
+    return settings.model_copy(
+        update={"aneel_ckan_api": API, "aneel_years": [2025, 2026], "aneel_conjuntos": False}
+    )
 
 
 def mock_fontes(

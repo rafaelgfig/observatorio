@@ -1,1 +1,57 @@
 /* Estilos específicos da tela Apagões (carregado após app.css). */
+
+/* "Mapa por": opção indisponível (sem polígonos dos conjuntos) */
+.segmented input:disabled + span {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+/* filtros fixados pela definição oficial (métrica DEC/FEC oficial) */
+.switch:has(input:disabled),
+.chip:has(input:disabled) span {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.apagoes-locked {
+  margin-top: calc(-1 * var(--space-1));
+}
+
+/* conjunto selecionado: aviso informativo (não é alerta) */
+.notice.apagoes-official {
+  border-left-color: var(--accent);
+}
+
+/* calculado × oficial, mês a mês */
+.apagoes-compare {
+  overflow-x: auto;
+}
+
+.apagoes-compare .table th,
+.apagoes-compare .table td {
+  padding: 5px var(--space-2);
+}
+
+.apagoes-compare .table thead th {
+  cursor: default;
+}
+
+.apagoes-compare .table tbody th {
+  position: static;
+  cursor: default;
+  background: none;
+  color: var(--text-secondary);
+  font-size: var(--fs-sm);
+  font-weight: 500;
+}
+
+/* meses fora do período escolhido ficam discretos */
+.apagoes-compare tr.is-outside th,
+.apagoes-compare tr.is-outside td {
+  color: var(--text-muted);
+}
+
+.apagoes-compare + .section-subtitle,
+.chart-table .section-subtitle {
+  margin-top: var(--space-2);
+}

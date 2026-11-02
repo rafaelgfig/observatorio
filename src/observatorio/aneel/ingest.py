@@ -9,6 +9,10 @@ Uma reconstrução completa leva ~10–20 s, então qualquer mudança refaz tudo
 (``transform.TRANSFORM_VERSION``) também fica no manifesto: quando o código muda, a reconstrução
 regrava o fato de **todos** os anos em disco (a partir dos brutos guardados), não só o dos anos
 pedidos com ``--year``.
+
+Depois das tabelas vem a etapa dos polígonos dos conjuntos elétricos (``conjuntos``: BDGD e
+SIGEL, incremental, pulada quando em dia). Ela nunca derruba a ingestão: sem ArcGIS/SIGEL, avisa
+e mantém as saídas anteriores. Desligue com ``OBSERVATORIO_ANEEL_CONJUNTOS=false``.
 """
 
 from __future__ import annotations
@@ -17,7 +21,7 @@ import logging
 import time
 from pathlib import Path
 
-from observatorio.aneel import sources, transform
+from observatorio.aneel import conjuntos, sources, transform
 from observatorio.config import Settings
 from observatorio.downloads import Manifest, fetch, file_sha256, http_client
 from observatorio.storage import touch_version
@@ -59,11 +63,47 @@ def run(settings: Settings, *, force: bool = False) -> None:
 
     geo, _ = file_sha256(municipios)
     motivos = _rebuild_reasons(manifest, found, out_dir, geo, force=force)
-    if not motivos:
+    if motivos:
+        log.info("aneel: reprocessando (%s)", ", ".join(motivos))
+        _rebuild(manifest, found, paths, municipios, out_dir, raw_dir, geo)
+    else:
         log.info("aneel: fontes sem mudanças e saídas presentes (use --force para refazer)")
-        return
-    log.info("aneel: reprocessando (%s)", ", ".join(motivos))
+    poligonos = _update_conjuntos(settings, force=force)
+    if poligonos:
+        transform.write_places(out_dir, municipios)  # posição dos conjuntos na busca
+    if motivos or poligonos:
+        touch_version(settings.processed_dir)
+        log.info("aneel: concluído em %.1fs (%s)", time.perf_counter() - started, _sizes(out_dir))
 
+
+def _update_conjuntos(settings: Settings, *, force: bool) -> bool:
+    """Etapa dos polígonos; qualquer falha vira aviso (as saídas anteriores ficam)."""
+    if not settings.aneel_conjuntos:
+        return False
+    try:
+        with http_client(settings.user_agent, settings.http_timeout) as client:
+            return conjuntos.run(settings, client, force=force)
+    except Exception as exc:  # fonte opcional: nunca derruba a ingestão da ANEEL
+        log.warning(
+            "aneel: polígonos dos conjuntos não atualizados (%s: %s); mantidas as saídas"
+            " anteriores",
+            type(exc).__name__,
+            exc,
+            exc_info=log.isEnabledFor(logging.DEBUG),
+        )
+        return False
+
+
+def _rebuild(  # noqa: PLR0917 - etapa interna, chamada uma vez por run()
+    manifest: Manifest,
+    found: sources.Sources,
+    paths: dict[str, Path],
+    municipios: Path,
+    out_dir: Path,
+    raw_dir: Path,
+    geo: str,
+) -> None:
+    """Reconstrói o fato e os agregados e marca as fontes como processadas."""
     interrupcoes = {year: paths[res.key] for year, res in found.interrupcoes.items()}
     if manifest.metadata(found.indqual.key).get(TRANSFORM_EXTRA) != transform.TRANSFORM_VERSION:
         interrupcoes |= _older_years(out_dir, raw_dir, skip=set(interrupcoes))
@@ -85,8 +125,6 @@ def run(settings: Settings, *, force: bool = False) -> None:
     manifest.mark_processed(
         found.indqual.key, **{GEO_EXTRA: geo, TRANSFORM_EXTRA: transform.TRANSFORM_VERSION}
     )
-    touch_version(settings.processed_dir)
-    log.info("aneel: concluído em %.1fs (%s)", time.perf_counter() - started, _sizes(out_dir))
 
 
 def _rebuild_reasons(

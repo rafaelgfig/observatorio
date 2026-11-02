@@ -63,11 +63,18 @@ usa-se o do arquivo. ``dec``/``fec`` calculados com o critério regulatório; ``
 do conjunto. Inclui conjunto-mês sem interrupções (só no oficial) das distribuidoras presentes
 no arquivo do ano (cooperativas não constam da fonte de interrupções e ficam de fora).
 
+``conj_dim.parquet`` — ``ano, mes, conj, cnpj, programada, causa, regulatorio, consumidores
+DOUBLE, chi DOUBLE, eventos DOUBLE``: agregado conjunto × mês × dimensões (o numerador do DEC/FEC
+por conjunto com qualquer filtro). ``eventos`` soma ``1/n`` por linha, com ``n`` = linhas do
+evento no conjunto (soma = eventos distintos que atingiram o conjunto).
+
 ``agente_mes.parquet`` — ``ano, mes, cnpj, sigla, nome, linhas BIGINT, base, dec, fec, dec_oficial,
 fec_oficial, cobertura (dec / dec_oficial), lacuna BOOLEAN, gerado_em DATE,
 municipio_observado BOOLEAN`` — completude por distribuidora × mês.
 
-``places.parquet`` — distribuidoras para a busca (esquema em ``docs/arquitetura.md``).
+``places.parquet`` — distribuidoras e conjuntos para a busca (esquema em
+``docs/arquitetura.md``); gravado por :func:`write_places` a partir das saídas em disco, para que
+a etapa dos polígonos (``conjuntos``) possa regravá-lo sozinha.
 """
 
 from __future__ import annotations
@@ -162,7 +169,7 @@ DETALHES_ALIASES: dict[str, str] = {
 # Versão das regras de transformação: incremente ao mudar qualquer regra que altere as saídas — a
 # ingestão grava a versão no manifesto e refaz tudo (inclusive o fato de anos já ingeridos)
 # quando ela muda.
-TRANSFORM_VERSION = 2
+TRANSFORM_VERSION = 3  # 3: conj_dim.parquet e conjuntos na busca
 
 DURACAO_MIN_REGULATORIA_S = 180  # 3 minutos
 TENSOES_INVALIDAS = (0, 9999, 999999)
@@ -192,6 +199,7 @@ AGGREGATES = (
     "mun_mes.parquet",
     "mun_base.parquet",
     "conj_mes.parquet",
+    "conj_dim.parquet",
     "agente_mes.parquet",
     "places.parquet",
 )
@@ -316,6 +324,7 @@ def build(inputs: Inputs, out_dir: Path) -> dict[int, FatoStats]:
         build_aggregates(con, out_dir)
     finally:
         con.close()
+    write_places(out_dir, inputs.municipios)
     log.info("aneel: tabelas reconstruídas em %.1fs", time.perf_counter() - started)
     return stats
 
@@ -657,6 +666,7 @@ def build_aggregates(con: duckdb.DuckDBPyConnection, out_dir: Path) -> None:
     _limit_pesos(con)
     _mark_principal(con)
     _build_mun_tables(con)
+    _build_conj_dim(con)
     _build_agente_mes(con)
     _write_aggregates(con, out_dir)
     log.info("aneel: agregados gravados em %.1fs", time.perf_counter() - started)
@@ -1011,6 +1021,26 @@ def _build_mun_tables(con: duckdb.DuckDBPyConnection) -> None:
     )
 
 
+def _build_conj_dim(con: duckdb.DuckDBPyConnection) -> None:
+    """Numerador por conjunto × mês × dimensões (mesmas linhas do ``conj_mes``: com duração)."""
+    con.execute(
+        """
+        CREATE OR REPLACE TABLE conj_dim AS
+        SELECT ano, mes, conj, cnpj, programada, causa, regulatorio,
+               sum(consumidores)::DOUBLE AS consumidores,
+               sum(chi) AS chi,
+               sum(evento_conj) AS eventos
+        FROM (
+            SELECT ano, mes, conj, cnpj, programada, causa, regulatorio, consumidores, chi,
+                   1.0 / count(*) OVER (PARTITION BY ano, evento, conj) AS evento_conj
+            FROM fato WHERE duracao IS NOT NULL AND mes IS NOT NULL
+        )
+        GROUP BY ano, mes, conj, cnpj, programada, causa, regulatorio
+        ORDER BY ano, mes, conj
+        """
+    )
+
+
 def _build_agente_mes(con: duckdb.DuckDBPyConnection) -> None:
     con.execute(
         f"""
@@ -1083,8 +1113,90 @@ _PLACES_SELECT = f"""
            coalesce(p.consumidores, 0)::DOUBLE AS peso,
            g.lon, g.lat, g.bbox_w, g.bbox_s, g.bbox_e, g.bbox_n
     FROM agentes a LEFT JOIN geo g USING (cnpj) LEFT JOIN peso p USING (cnpj)
-    ORDER BY peso DESC
 """
+
+# Conjuntos: nome oficial mais recente; o mesmo nome com códigos diferentes na mesma
+# distribuidora (renumeração) ganha os anos no detalhe. Posição: o polígono
+# (``conjuntos.parquet``, quando já existe) ou os municípios principais do conjunto.
+_PLACES_CONJUNTOS = """
+    WITH c AS (
+        SELECT conj, max(ano) AS ano, list(DISTINCT ano ORDER BY ano) AS anos,
+               arg_max(conj_nome, ano::INTEGER * 100 + mes) AS nome,
+               arg_max(cnpj, ano::INTEGER * 100 + mes) AS cnpj
+        FROM conj_mes WHERE conj > 0 GROUP BY conj
+    ),
+    base AS (
+        SELECT m.conj, avg(m.base) AS base
+        FROM conj_mes m JOIN c ON c.conj = m.conj AND c.ano = m.ano
+        WHERE m.base > 0 GROUP BY m.conj
+    ),
+    mun AS (
+        SELECT p.conj, arg_max(m.lon, p.w) AS lon, arg_max(m.lat, p.w) AS lat,
+               min(m.bbox_w) AS bbox_w, min(m.bbox_s) AS bbox_s,
+               max(m.bbox_e) AS bbox_e, max(m.bbox_n) AS bbox_n
+        FROM conj_mun_pesos p JOIN municipios m ON m.cod = p.cod_mun
+        WHERE p.principal GROUP BY p.conj
+    ),
+    homonimos AS (
+        SELECT conj, count(*) OVER (PARTITION BY cnpj, norm_text(nome)) AS n FROM c
+    )
+    SELECT 'aneel' AS escopo, 'conjunto' AS tipo, c.conj::VARCHAR AS id, c.nome AS rotulo,
+           a.sigla || CASE WHEN h.n > 1 THEN ' · ' || array_to_string(c.anos, ', ') ELSE '' END
+               AS detalhe,
+           norm_text(c.nome || ' ' || c.conj) AS norm,
+           coalesce(b.base, 0)::DOUBLE AS peso,
+           coalesce(g.lon, u.lon) AS lon, coalesce(g.lat, u.lat) AS lat,
+           coalesce(g.bbox_w, u.bbox_w) AS bbox_w, coalesce(g.bbox_s, u.bbox_s) AS bbox_s,
+           coalesce(g.bbox_e, u.bbox_e) AS bbox_e, coalesce(g.bbox_n, u.bbox_n) AS bbox_n
+    FROM c
+    JOIN homonimos h USING (conj)
+    LEFT JOIN agentes a USING (cnpj)
+    LEFT JOIN base b USING (conj)
+    LEFT JOIN conjuntos g ON g.id = c.conj AND g.fonte IS NOT NULL
+    LEFT JOIN mun u USING (conj)
+    WHERE c.nome IS NOT NULL
+"""
+
+
+def write_places(out_dir: Path, municipios: Path) -> None:
+    """Grava ``places.parquet`` (distribuidoras e conjuntos) lendo as saídas de ``out_dir``.
+
+    Usa ``conjuntos.parquet`` (polígonos) quando existe; sem ele, os conjuntos ficam com o
+    enquadramento dos municípios que atendem.
+    """
+    con = connect()
+    try:
+        for name in ("mun_base", "agente_mes", "conj_mes", "conj_mun_pesos"):
+            path = sql_path(out_dir / f"{name}.parquet")
+            con.execute(f"CREATE VIEW {name} AS SELECT * FROM read_parquet({path})")
+        con.execute(f"CREATE VIEW municipios AS SELECT * FROM read_parquet({sql_path(municipios)})")
+        # sigla e nome mais recentes de cada distribuidora (os de agente_mes vêm de ``agentes``)
+        con.execute(
+            """
+            CREATE VIEW agentes AS
+            SELECT cnpj, arg_max(sigla, ano::INTEGER * 100 + mes) AS sigla,
+                   arg_max(nome, ano::INTEGER * 100 + mes) AS nome
+            FROM agente_mes GROUP BY cnpj
+            """
+        )
+        conjuntos = out_dir / "conjuntos.parquet"
+        if conjuntos.exists():
+            con.execute(
+                f"CREATE VIEW conjuntos AS SELECT * FROM read_parquet({sql_path(conjuntos)})"
+            )
+        else:
+            con.execute(
+                "CREATE TABLE conjuntos (id BIGINT, fonte VARCHAR, lon DOUBLE, lat DOUBLE,"
+                " bbox_w DOUBLE, bbox_s DOUBLE, bbox_e DOUBLE, bbox_n DOUBLE)"
+            )
+        copy_query(
+            con,
+            f"SELECT * FROM ({_PLACES_SELECT}) UNION ALL SELECT * FROM ({_PLACES_CONJUNTOS})"
+            " ORDER BY tipo DESC, peso DESC, id",
+            out_dir / "places.parquet",
+        )
+    finally:
+        con.close()
 
 
 def _write_aggregates(con: duckdb.DuckDBPyConnection, out_dir: Path) -> None:
@@ -1093,8 +1205,8 @@ def _write_aggregates(con: duckdb.DuckDBPyConnection, out_dir: Path) -> None:
         "mun_mes.parquet": "SELECT * FROM mun_mes",
         "mun_base.parquet": "SELECT * FROM mun_base",
         "conj_mes.parquet": "SELECT * FROM conj_mes",
+        "conj_dim.parquet": "SELECT * FROM conj_dim",
         "agente_mes.parquet": "SELECT * FROM agente_mes",
-        "places.parquet": _PLACES_SELECT,
     }
     for name, query in tables.items():
         copy_query(con, query, out_dir / name)
