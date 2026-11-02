@@ -37,10 +37,14 @@ src/observatorio/
                    sql_path() (caminho como literal SQL)
   storage.py       escrita atômica (COPY … TO), gzip, touch_version
   text.py          normalização de textos (search_key, street_label/expand_street)
-  cli.py           Typer: ingest geo|aneel|itbi|all, serve, status
+  cli.py           Typer: ingest geo|aneel|itbi|all, serve, status, bundle criar|baixar
+  bundle.py        pacote de dados (.tar + índice com sha256) p/ publicar; download na partida
+                   (BundleUpdater) e 503 enquanto instala (BundleGate) — ver docs/deploy.md
   geo/ibge.py      municípios/UFs (malha simplificada, população, places)
-  aneel/           sources.py, transform.py, ingest.py, queries.py, api.py
-  itbi/            sources.py, parse.py, ingest.py, geosampa.py, geocode.py, queries.py, api.py
+  aneel/           sources.py, transform.py, ingest.py, conjuntos.py (polígonos), queries.py,
+                   api.py
+  itbi/            sources.py, parse.py, ingest.py, geosampa.py, geocode.py, tabela.py,
+                   queries.py, api.py
   api/             app.py (fábrica), deps.py (DB, require, run_query), meta.py, search.py
   web/             index.html, css/, js/ (main.js, map.js, views/, components/)
 tests/             pytest (sem rede por padrão; `-m network` roda os que consultam as fontes)
@@ -143,20 +147,72 @@ Tabelas (detalhes de colunas em `aneel/transform.py`):
 * `mun_base.parquet` — base de consumidores estimada por município × mês × agente (NumCon
   oficial quando plausível, entre 0,5× e 2× a contagem do arquivo; senão a do arquivo);
 * `conj_mes.parquet` — DEC/FEC calculado vs. oficial por conjunto × mês;
+* `conj_dim.parquet` — agregado conjunto × mês × dimensões (programada, causa, regulatório) com
+  `consumidores`, `chi` e `eventos` (eventos distintos que atingiram o conjunto): o numerador do
+  mapa por conjunto com qualquer filtro;
 * `agente_mes.parquet` — completude por distribuidora × mês (lacunas conhecidas);
-* `places.parquet` — distribuidoras (escopo `aneel`).
+* `places.parquet` — distribuidoras e conjuntos (escopo `aneel`; `transform.write_places`, que
+  a etapa dos polígonos também chama). Conjunto: `id` = código ANEEL, `rotulo` = nome oficial,
+  `detalhe` = sigla da distribuidora (com os anos quando o mesmo nome tem dois códigos),
+  `norm` inclui o código, `peso` = base; caixa do polígono ou, sem ele, dos municípios.
+
+#### Polígonos dos conjuntos (`aneel/conjuntos.py`)
+
+Etapa separada dentro de `ingest aneel`, depois das tabelas; incremental e **nunca derruba a
+ingestão** (ArcGIS/SIGEL fora do ar: aviso e as saídas anteriores ficam). Desligue com
+`OBSERVATORIO_ANEEL_CONJUNTOS=false`.
+
+* **BDGD** (ArcGIS Online, dono `aneel_aneel`, um *File Geodatabase* zipado por distribuidora,
+  título `<Nome>_<código>_<data-base>_V11_<gerado>`): vale a data-base mais recente de cada
+  distribuidora. O zip (até 4 GB) é lido por **HTTP Range** (`RangeReader` + `zipfile`): fim do
+  zip, tabelas de sistema do geodatabase e só os arquivos da camada `CONJ` (4 requisições,
+  ~0,5–3 MB por distribuidora); o GDAL do DuckDB (`ST_Read`, OpenFileGDB) lê a pasta extraída.
+  Extrato em `raw/aneel/conjuntos/bdgd/<código>.parquet` (`conj, nome, dist, base, item, geom`),
+  refeito só quando o `modified` do item muda (`raw/aneel/conjuntos/index.json`).
+* **SIGEL** (`SRD/Conjuntos`, base 2020): reserva, baixada só se algum conjunto dos dados não tem
+  polígono de mesmo código na BDGD; renovada a cada `aneel_sigel_max_age_days` (90).
+* **Vínculo** com `conj_mes`: código; senão, conjunto renumerado = mesmo nome normalizado na mesma
+  distribuidora (código DIST ↔ CNPJ aprendido dos vínculos por código), desde que os dois códigos
+  não apareçam no mesmo ano; ordem BDGD/código > BDGD/nome > SIGEL/código > SIGEL/nome.
+* **Código substituído**: alguns códigos antigos ainda aparecem em 1–3 meses depois da
+  renumeração, ao lado do sucessor de mesmo nome (ex.: 8 da Equatorial AL em 2025, 4 da COPEL em
+  2026 com base de 1 consumidor); os dois teriam polígono (o antigo, do SIGEL) e se sobreporiam.
+  Fica fora do mapa daquele ano o código da mesma distribuidora, mesmo nome e polígono
+  sobreposto (≥ 50% do menor) presente em menos meses (empate: o de código menor). Os dados dele
+  continuam na busca, no painel e no ranking.
+* **Saídas**: `conjuntos.geojson(.gz)` — um polígono por código dos dados, `ST_CoverageSimplify`
+  por distribuidora (tolerância 0,002°), **do maior para o menor** (um conjunto dentro de outro —
+  enclaves, áreas de distribuidoras que se sobrepõem na BDGD — fica por cima e continua
+  clicável), feature `id` = código e propriedades `nome, sigla, uf, anos` (texto, ex.
+  `"2025 2026"`: anos em que aparece no mapa; o mapa filtra pelo ano, porque o código antigo e o
+  novo podem ter o mesmo polígono) e `fonte` (`bdgd`|`sigel`); `conjuntos.parquet` — `id, nome,
+  sigla, cnpj, uf, ufs, anos, anos_mapa, fonte, vinculo, data_base, lon, lat, bbox_*`, uma linha
+  por conjunto dos dados (sem polígono: `fonte` e geometria nulas; `anos` = anos com dados,
+  `anos_mapa` = anos em que aparece no mapa, sem os de código substituído).
+* **Em dia** quando a impressão digital (versão, itens da BDGD, SIGEL, `conj_mes`,
+  `conj_mun_pesos`, municípios) bate com a do manifesto (chave `aneel:conjuntos`, com
+  `feicoes`, `cobertura` por ano — inclusive `substituidos` —, `baixado_bytes` e `falhas`).
+  `--force` remonta sem baixar.
+
+Medido (nov/2026, base 2025-12-31): 114 distribuidoras, **80 MB baixados** (de 31,6 GB de zips) em
+~98 s; 3.170 polígonos no mapa; cobertura 2025: 3.093/3.101 conjuntos (100% dos consumidores; os
+8 restantes são códigos substituídos); 2026: 3.084/3.123 (99,5% dos consumidores; 77 renumerados
+ligados pelo nome; 4 substituídos; os 35 sem polígono são conjuntos criados em 2026). Os 12
+polígonos do SIGEL eram todos de códigos substituídos. GeoJSON 11,5 MB (3,2 MB gzip). Reexecução
+sem novidades: só a busca no ArcGIS (~2 s); a montagem sozinha leva ~7 s.
 
 ### itbi/
 
 * `transacoes/ref_year=YYYY/ref_month=MM/part.parquet` — uma linha por guia paga
   (esquema na seção ITBI abaixo); um mês só é regravado quando o conteúdo normalizado muda
-  (impressão digital por mês no manifesto). `parse.PARSER_VERSION` (3: remoção de CPF/CNPJ)
-  no manifesto faz a
-  ingestão reprocessar sozinha quando as regras de normalização mudam.
+  (impressão digital por mês no manifesto). `parse.PARSER_VERSION` (4: unidade, bloco, vagas,
+  edifício, valor integral/referência/atípico; 5: números de porta `E 1341`/`A 1806` não viram
+  torre nem unidade) no manifesto faz a ingestão reprocessar sozinha
+  quando as regras de normalização mudam.
 * `geocode.parquet` — `sql, logradouro, numero, cep → lon, lat, precisao, tier` (uma linha por
-  chave; junção *null-safe* com `transacoes`). `geocode.GEOCODE_VERSION` fica em
-  `itbi/.geocode-version`; versão diferente refaz a geocodificação. `precisao` ∈ `lote`, `condominio`, `quadra`,
-  `setor`; `tier` 1–9:
+  chave; junção *null-safe* com `transacoes`). `geocode.GEOCODE_VERSION` (2: tabela da API) fica
+  em `itbi/.geocode-version`; versão diferente refaz a geocodificação e a tabela da API.
+  `precisao` ∈ `lote`, `condominio`, `quadra`, `setor`; `tier` 1–9:
 
   | tier | regra | precisão típica (p50/p90 vs. CNEFE) |
   |---|---|---|
@@ -176,6 +232,27 @@ Tabelas (detalhes de colunas em `aneel/transform.py`):
   (ex.: distrito `"37"`).
 * `places.parquet` — logradouros (id = nome como na fonte, ex. `R ISIDORO FARINA`), CEPs (8
   dígitos), distritos e subprefeituras (escopo `itbi`).
+* `tabela.parquet` — a tabela que a API carrega como `itbi` (`itbi/tabela.py`, ~2 s; refeita
+  junto com a geocodificação, ou sozinha com `tabela.build_from_outputs`): uma linha por guia de
+  `transacoes` com o ponto de `geocode` (junção *null-safe*), só as colunas da API, na ordem da
+  curva de Hilbert sobre a cidade (sem coordenada no fim). A API não junta nem ordena nada na
+  carga (0,3 s; ~106 MiB em memória). Colunas (`tabela.COLUNAS`):
+
+  | coluna | tipo | notas |
+  |---|---|---|
+  | id, sql | BIGINT | `sql` como inteiro (um por unidade: conta unidades distintas) |
+  | ref_year, ref_month, data_transacao, tipo, na_planta, natureza_cod, natureza | | como em `transacoes` |
+  | valor_transacao, valor_integral, valor_referencia, proporcao_pct, base_calculo | DOUBLE | `valor_integral` com 2 casas |
+  | valor_atipico | BOOLEAN | nunca nulo (nulo na origem → `true`) |
+  | rs_m2 | DOUBLE | 2 casas |
+  | area_construida_m2, area_terreno_m2, area_m2 | DOUBLE | construída nula quando a área do IPTU é a do lote (na planta, proporção < 10%); `area_m2` = construída, ou do terreno p/ `terreno` |
+  | logradouro, numero_txt, complemento, bairro, cep | VARCHAR | `numero_txt`: número para exibição (`s/n` para 0/99999/S-N) |
+  | unidade, bloco, vagas, edificio | | como em `transacoes` |
+  | uso, padrao, financiamento, acc_ano | | |
+  | lon, lat | DOUBLE | ponto com **6 casas**; nulos sem geocodificação |
+  | precisao, tier | VARCHAR, TINYINT | |
+  | local | BIGINT | chave do ponto (ver "ITBI — /api/itbi"); igual para todas as guias do ponto |
+  | distrito, subprefeitura | VARCHAR | código da área que contém o ponto (divisa: o menor código); 24 dos 282 mil locais ficam fora dos distritos simplificados |
 * `geo/` — tabelas auxiliares do GeoSampa (`lotes`, `quadras`, `setores`, `distritos`,
   `subprefeituras`), refeitas quando as camadas brutas mudam (`manifest/geosampa.json`;
   camadas rebaixadas após `geosampa_max_age_days` ou com `ingest itbi --geosampa`).
@@ -208,14 +285,26 @@ Tabelas (detalhes de colunas em `aneel/transform.py`):
 | acc_ano | SMALLINT | ano de construção corrigido; nulo fora de [1800, ref_year+1] |
 | tipo | VARCHAR | `apartamento`, `casa`, `terreno`, `comercial`, `garagem`, `outros` (pelo uso do IPTU; nas unidades na planta, pelo complemento: AP → apartamento, SALA/CJ → comercial, VG → garagem…) |
 | na_planta | BOOLEAN | unidade vendida sob o SQL de um lote ainda não desdobrado: uso terreno, ou fração < 10% de um lote cujo uso não é de unidade autônoma, com complemento de unidade |
-| rs_m2 | DOUBLE | valor / (área × proporção transmitida) — área construída, ou do terreno para `terreno`; nulo para garagem, na planta, proporção fora de 10–100%, valor < R$ 5 mil ou resultado fora de R$ 100–100 mil/m² |
+| unidade | VARCHAR | nº da unidade no complemento (`AP 44` → `44`, `APTO 1205`, `SALA 217`, `CASA Nº 12`, `UNID RESID 9`, `AP 9A` → `9A`; zeros à esquerda removidos); também `511 TORRE 1` → `511`, `BL9-12` → `12`, `1603 A` → `1603`. Números de porta não são unidade: `E 1341` (conjunção, "1337 e 1341"; nem torre E) e `A 1806` com o nº do imóvel a até 300 ("1802 a 1806"; `A 512` no nº 4228 continua torre A, unidade 512). 98,9% dos apartamentos |
+| bloco | VARCHAR | bloco/torre: do complemento (`BL 1`, `BLOCO B`, `TORRE 2`, `T 9`/`T9`/`TA` com unidade, `TR 3`, `BL. T2` → `T2`, `BLOCO II`), senão do bairro (`BLOCO 14`), senão da referência (`ED AUTUMN BL A`); só o identificador, sem zeros à esquerda; `TORR` cortado sem identificador → nulo. 38% dos apartamentos (47% desde 2022) |
+| vagas | SMALLINT | nº de vagas declarado: `E 4VGS` → 4, `AP 101 4 VG` → 4, `E 2 V` → 2, `E VG`/`E BOX`/`VG 45` → 1; plural sem número (`E VGS`) ou > 20 → nulo |
+| edificio | VARCHAR | nome do prédio/condomínio da referência, por extenso: prefixos `ED`/`EDIF`/`EDIFICIO` → Edifício, `COND`/`CD` → Condomínio, `RES`/`RESID` → Residencial, `CJ HAB`, `CJ RES`, `PQ RES`, `C R` (em cadeia: `CD RES AIRY` → "Condomínio Residencial Airy"), ou nomes com palavra típica (`RESIDENCE`, `TOWER`, `PARK`, `SPAZIO`…); nulo para bairros (`SAO PAULO`, `STO AMARO`), lote/matrícula e só bloco. 33% dos apartamentos |
+| valor_integral | DOUBLE | declarado ÷ proporção (10–100%; em branco = 100%); proporção < 10% → o declarado (preço da unidade); > 100% ou ≤ 0 → nulo |
+| valor_referencia | DOUBLE | `valor_venal_ref` (100%) quando a referência é do próprio imóvel (nem na planta, nem proporção < 10%) |
+| razao_referencia | DOUBLE | declarado ÷ `valor_venal_ref_prop`, nas mesmas condições |
+| valor_atipico | BOOLEAN | razão < 0,5 (garagem: < 0,2) ou > 5, ou valor integral < R$ 5 mil ou nulo |
+| rs_m2 | DOUBLE | valor integral / área — área construída, ou do terreno para `terreno`; nulo para atípico, garagem, na planta, proporção fora de 10–100% ou resultado fora de R$ 100–100 mil/m² |
 | possivel_duplicata | BOOLEAN | idêntica a uma linha anterior da mesma aba nas 28 colunas (a 1ª ocorrência fica `false`) |
 | aba | VARCHAR | nome da aba de origem (ex.: `JAN-2026`) |
 
 ## Contratos da API
 
 Todas as respostas são JSON (UTF-8). Valores monetários em R$, áreas em m², durações em horas,
-datas ISO-8601. Erros: `{"detail": "mensagem"}`; dados ainda não ingeridos → **503**.
+datas ISO-8601. Erros: `{"detail": "mensagem"}`; dados ainda não ingeridos → **503**. Com
+`OBSERVATORIO_BUNDLE_URL`, enquanto o primeiro pacote é baixado/instalado, `/api/*` e `/dados/*`
+(menos `/api/health` e a documentação) respondem 503 com o andamento no `detail` e `Retry-After`,
+e `GET /` devolve uma página de espera (200) que consulta `/api/meta` a cada 3 s e recarrega o
+site quando a resposta deixa de ser esse 503.
 
 ### Comuns
 
@@ -251,10 +340,18 @@ Parâmetros de filtro comuns (query string), modelo `FiltroAneel`:
 | `agente` | — | CNPJ (14 dígitos) da distribuidora |
 | `uf` | — | sigla, limita a uma UF |
 | `mun` | — | código IBGE (7 dígitos) |
+| `conj` | — | código ANEEL do conjunto (resumo, interrupções e nível conjunto; ignorado no nível município) |
 
 Métricas (`metrica`): `dec` (h/consumidor), `fec` (interrupções/consumidor), `chi`
 (consumidor-hora), `consumidores` (consumidores afetados, soma), `eventos` (interrupções),
-`duracao` (duração média por consumidor afetado, h = chi/consumidores).
+`duracao` (duração média por consumidor afetado, h = chi/consumidores) e, **só no nível
+conjunto**, `dec_oficial`/`fec_oficial` (soma dos indicadores oficiais mensais; exigem
+`criterio=regulatorio`, `programadas=true` e nenhuma `causa` — senão **422**).
+
+Nível (`nivel`, em `mapa` e `ranking`): `municipio` (padrão) ou `conjunto`. Por conjunto nada é
+estimado: numerador do `conj_dim` sobre a base do `conj_mes`, mês a mês, com as mesmas regras de
+lacuna (um conjunto-mês está todo em lacuna ou não; o oficial não depende das lacunas). O
+oficial do período só sai se todos os meses do conjunto o têm.
 
 * `GET /api/aneel/meta` →
   ```json
@@ -262,27 +359,44 @@ Métricas (`metrica`): `dec` (h/consumidor), `fec` (interrupções/consumidor), 
              "municipio_estimado": false}],
    "causas": ["Próprias do sistema", "Meio ambiente", "..."],
    "metricas": [{"id": "dec", "nome": "DEC", "unidade": "h",
-                 "descricao": "Duração equivalente de interrupção por consumidor"}],
+                 "descricao": "Duração equivalente de interrupção por consumidor",
+                 "niveis": ["municipio", "conjunto"]}],
    "lacunas": [{"agente": "COPEL-DIS", "cnpj": "...", "ano": 2025, "mes": 6,
-                "cobertura": 0.0}]}
+                "cobertura": 0.0}],
+   "conjuntos": {"poligonos": 3170, "sigel": 0, "sem_poligono": 35, "substituidos": 12,
+                 "data_base": "2025-12-31"}}
   ```
-* `GET /api/aneel/mapa?{filtro}&metrica=dec` → valores por município para o coroplético:
+  `conjuntos` é nulo sem `conjuntos.parquet` (a UI desliga o mapa por conjunto). `poligonos` e
+  `sigel` contam os conjuntos que aparecem no mapa de algum ano; `substituidos`, os que têm
+  polígono mas ficam fora do mapa (código substituído, ver "Polígonos dos conjuntos").
+* `GET /api/aneel/mapa?{filtro}&metrica=dec&nivel=municipio|conjunto` → valores por município
+  (código IBGE) ou por conjunto (código ANEEL) para o coroplético:
   ```json
   {"metrica": "dec", "unidade": "h", "estimado": true,
    "valores": {"3550308": 5.54, "...": 0.0},
    "quebras": [0.5, 1.2, 2.0, 3.4, 5.9, 10.1],
    "pouca_base": ["1100015"],
    "lacuna": ["1100023"],
-   "n": 5521}
+   "n": 5521,
+   "nivel": "municipio",
+   "sem_geometria": []}
   ```
-  `lacuna` = municípios com mais de 20% da base do período em meses sem dados da distribuidora
-  (valor parcial: a UI marca, ficam fora das quebras e do ranking).
-  `quebras` = 6 limites (quantis 1/7…6/7) → 7 classes de cor. `pouca_base` = municípios com
-  base estimada < 2.000 consumidores (DEC/FEC instáveis; a UI esmaece).
-* `GET /api/aneel/resumo?{filtro}&serie=periodo|ano` → painel do escopo (Brasil, UF, município
-  ou distribuidora); com `serie=ano`, `mensal` traz o ano inteiro (os KPIs seguem o período):
+  `lacuna` = municípios (conjuntos) com mais de 20% da base do período em meses sem dados da
+  distribuidora (valor parcial: a UI marca, ficam fora das quebras e do ranking; vazio nas
+  métricas oficiais). `quebras` = 6 limites (quantis 1/7…6/7) → 7 classes de cor.
+  `pouca_base` = base < 2.000 consumidores (DEC/FEC instáveis; a UI esmaece). `sem_geometria`
+  (nível conjunto) = conjuntos com valor que não aparecem no mapa do ano: sem polígono ou com o
+  código substituído (`anos_mapa` sem o ano). `estimado` é sempre `false` por conjunto. O nível
+  conjunto exige `conjuntos.parquet` (503 sem ele).
+* `GET /api/aneel/conjuntos.geojson` → polígonos dos conjuntos (gzip; `Cache-Control:
+  no-cache` + `ETag`: com `If-None-Match` igual, **304** sem corpo — o arquivo tem ~3 MB
+  comprimido; 503 antes da 1ª ingestão com polígonos).
+* `GET /api/aneel/resumo?{filtro}&serie=periodo|ano` → painel do escopo (Brasil, UF, município,
+  distribuidora ou conjunto — `conj`); com `serie=ano`, `mensal` traz o ano inteiro (os KPIs
+  seguem o período):
   ```json
-  {"escopo": {"tipo": "municipio", "id": "3550308", "nome": "São Paulo – SP"},
+  {"escopo": {"tipo": "municipio", "id": "3550308", "nome": "São Paulo – SP", "uf": "SP",
+              "bbox": [-46.83, -24.01, -46.36, -23.36]},
    "estimado": false,
    "kpis": {"dec": 3.1, "fec": 1.9, "chi": 2.1e7, "consumidores": 1.3e7,
             "eventos": 48211, "duracao": 1.6, "consumidores_base": 7.1e6,
@@ -298,11 +412,18 @@ Métricas (`metrica`): `dec` (h/consumidor), `fec` (interrupções/consumidor), 
   `meses_lacuna`: meses do período com > 20% da base em lacuna — ficam com valores nulos em
   `mensal` e os KPIs somam só os demais (DEC/FEC parciais; o oficial continua o do período).
   `dec_oficial`/`fec_oficial` só quando houver indicador oficial comparável (nulo caso contrário);
-  `distribuidoras` e `conjuntos` podem vir vazios conforme o escopo.
-* `GET /api/aneel/ranking?{filtro}&metrica=dec&ordem=desc&limite=20&min_consumidores=2000`
-  (sem os municípios em `lacuna`) →
-  `[{"cod": "3550308", "nome": "São Paulo", "uf": "SP", "valor": 3.1, "consumidores_base": 7.1e6}]`
-* `GET /api/aneel/interrupcoes?{filtro}&limite=20` → maiores interrupções (por CHI) do escopo:
+  em `mensal` eles aparecem por mês no conjunto e em Brasil/UF/distribuidora (média ponderada
+  pela base; nulos no município). `escopo.uf`: UF do município/da UF/principal do conjunto;
+  `escopo.bbox` (`[w, s, e, n]`): caixa para enquadrar (polígono do conjunto, município ou UF;
+  nula nos demais). `distribuidoras` e `conjuntos` podem vir vazios conforme o escopo (no
+  conjunto, `conjuntos` é vazio e `causas`/`distribuidoras` vêm do `conj_dim`).
+* `GET /api/aneel/ranking?{filtro}&metrica=dec&ordem=desc&limite=20&min_consumidores=2000&nivel=municipio`
+  (sem os municípios/conjuntos em `lacuna`) →
+  `[{"cod": "3550308", "nome": "São Paulo", "uf": "SP", "valor": 3.1, "consumidores_base": 7.1e6,
+  "sigla": null}]` — com `nivel=conjunto`, `cod` = código do conjunto, `nome` = nome oficial e
+  `sigla` = distribuidora (não precisa dos polígonos).
+* `GET /api/aneel/interrupcoes?{filtro}&limite=20` → maiores interrupções (por CHI) do escopo
+  (com `conj`, só as do conjunto):
   ```json
   [{"inicio": "2026-03-04T17:20:00", "fim": "2026-03-05T09:00:00", "duracao": 15.7,
     "consumidores": 12000, "chi": 188400, "causa": "Meio ambiente", "detalhe": "Vento",
@@ -322,7 +443,8 @@ Corpo comum das consultas (POST), modelo `ConsultaItbi`:
  "valor_min": null, "valor_max": null,
  "area_min": null, "area_max": null,
  "logradouro": null, "cep": null,
- "precisao": "quadra"}
+ "precisao": "quadra",
+ "atipicos": "excluir"}
 ```
 
 `area` (opcional, um de):
@@ -334,9 +456,36 @@ Corpo comum das consultas (POST), modelo `ConsultaItbi`:
 
 `precisao`: `lote` (só lote/condomínio exato), `quadra` (padrão: até centroide de quadra) ou
 `qualquer`. `tipos`/`naturezas` vazios ou nulos = todos. Datas filtram `data_transacao`.
-`area_min`/`area_max` usam a área construída (terrenos: a do terreno); nas unidades na planta e
-nas frações < 10% de um lote a área do IPTU é a do lote inteiro, então a guia fica sem área
-(fora do filtro, da mediana e no fim da ordenação por área).
+`valor_min`/`valor_max` filtram o **valor integral** (abaixo). `area_min`/`area_max` usam a área
+construída (terrenos: a do terreno); nas unidades na planta e nas frações < 10% de um lote a
+área do IPTU é a do lote inteiro, então a guia fica sem área (fora do filtro, da mediana e no
+fim da ordenação por área).
+
+`atipicos` (padrão `excluir`): `excluir` tira as guias com `valor_atipico`, `incluir` mantém
+todas, `somente` mostra só elas. Vale em **todas** as saídas: resumo, pontos, local,
+transações, exportação, distritos e tiles (parâmetro `atipicos=` na query string).
+
+Valores (colunas de `transacoes`, ver o esquema):
+
+* `valor` = **declarado** pelo contribuinte (`valor_transacao`);
+* `valor_integral` = declarado levado a 100% do imóvel (÷ proporção transmitida de 10–100%;
+  proporção em branco = 100%; abaixo de 10% o declarado já é o preço da unidade; proporção
+  acima de 100% → nulo). Medianas de valor e o filtro de valor usam este;
+* `valor_referencia` = valor venal de referência da Prefeitura (100%), nulo quando a referência
+  é a do lote-mãe (na planta ou proporção < 10%);
+* `valor_atipico` = declarado < 0,5× (vagas de garagem: < 0,2×) ou > 5× a referência
+  proporcional, ou valor integral < R$ 5 mil ou nulo; sem referência só valem as duas últimas
+  regras. Ex.: R. Inácio Monteiro, 600 (referência ~R$ 125–141 mil): R$ 27.213,63, R$ 11 mil,
+  R$ 0,01 e R$ 7 mil são atípicos (cessões de saldo de COHAB, valores simbólicos). 7,6% das guias
+  (8,2% das compras e vendas com proporção de 10–100%; 4,5% dos apartamentos, 10,6% das vagas);
+* `rs_m2` = valor integral ÷ área; nulo para atípicos, garagem, na planta, proporção fora de
+  10–100% e fora de R$ 100–100 mil/m².
+
+`local` (chave de um ponto geocodificado: lote ou condomínio) = `dx * 2^21 + dy`, com `dx`/`dy`
+em milionésimos de grau a partir de (-48°, -25°) sobre `lon`/`lat` com 6 casas — inteiro
+< 2^42 (exato em JavaScript); `tabela.ponto_do_local` decodifica. Todas as guias de um
+condomínio têm o mesmo `local` (as 64 da R. Inácio Monteiro, 600, por exemplo). É estável entre
+recargas enquanto a geocodificação do ponto não mudar.
 
 Observações para a implementação: `natureza` código 5 tem dois rótulos ao longo dos anos
 ("Excesso de meação…" até 2020, "Adjudicação compulsória" a partir de 2021) — agrupe por
@@ -347,53 +496,174 @@ Observações para a implementação: `natureza` código 5 tem dois rótulos ao 
                  "completo_ate": "2026-07-31"}, "atualizado_em": "...",
     "tipos": [{"id": "apartamento", "nome": "Apartamento"}],
     "naturezas": [{"cod": 1, "nome": "Compra e venda", "n": 1490420}],
-    "total": 1672712}`
+    "total": 1672712,
+    "atipicos": {"n": 127079, "razao_min": 0.5, "razao_min_garagem": 0.2, "razao_max": 5.0,
+                 "valor_min": 5000.0}}`
 
   `min`/`max` = datas de transação; `pago_ate` = fim do último mês de pagamento publicado;
   `completo_ate` = fim do mês anterior a ele (~20% das guias são pagas no mês seguinte ao da
   transação: os meses depois de `completo_ate` ainda vão crescer e a UI os marca como parciais).
+  `atipicos` = quantas guias são atípicas no total e os limites da regra (texto de ajuda).
 * `POST /api/itbi/resumo` →
   ```json
   {"total": 1234, "valor_total": 6.1e8, "valor_mediano": 420000, "rs_m2_mediano": 7850,
-   "area_mediana": 62,
+   "area_mediana": 62, "atipicos_ocultos": 98,
    "precisao": {"lote": 1100, "quadra": 120, "aproximado": 10, "sem_coordenada": 4},
    "mensal": [{"mes": "2025-01", "n": 98, "valor_mediano": 400000, "rs_m2_mediano": 7600}],
    "por_tipo": [{"tipo": "apartamento", "n": 900, "valor_mediano": 450000,
                  "rs_m2_mediano": 8100}],
-   "periodo": {"min": "2025-01-03", "max": "2026-08-30"}}
+   "periodo": {"min": "2025-01-03", "max": "2026-08-30"},
+   "comparacao": {"cidade_rs_m2_mediano": 3917.79, "variacao_12m": 0.04,
+                  "rs_m2_12m": 4830.04, "rs_m2_12m_anterior": 4644.27,
+                  "variacao_fim": "2026-07-31"}}
   ```
-* `POST /api/itbi/pontos?limite=20000` → GeoJSON `FeatureCollection` com
-  `properties: {"v": valor, "m2": rs_m2, "t": tipo, "d": "2025-03-01", "p": precisao}`,
-  `id` = id da transação, e membros extras `"total"` e `"truncado"`.
+  `valor_mediano` = mediana do valor integral; `valor_total` = soma do **declarado**.
+  `atipicos_ocultos` = guias que atendem aos filtros mas ficaram de fora por serem atípicas
+  (só com `atipicos: "excluir"`; 0 nos outros modos). `mensal`/`por_tipo` só trazem grupos com
+  `n > 0`. `comparacao`:
+  * `cidade_rs_m2_mediano` = mediana de R$/m² com os mesmos filtros **sem a área** (sem área,
+    é a própria `rs_m2_mediano`; em cache até a próxima recarga);
+  * `variacao_12m` = `rs_m2_12m / rs_m2_12m_anterior − 1` (fração: 0,04 = +4%), medianas de
+    R$/m² da seleção (com a área) nos 12 meses completos que terminam em `variacao_fim` contra
+    os 12 anteriores; `variacao_fim` = `completo_ate`, ou o último fim de mês ≤ `data_fim` se
+    ela for anterior; `data_ini` **não** limita as janelas. Nula com menos de 20 guias com
+    R$/m² em uma das janelas (as duas medianas continuam saindo).
+* `POST /api/itbi/pontos?limite=20000` → GeoJSON `FeatureCollection` com **uma feição por
+  local** (`limite` 1–50.000 conta locais):
+  ```json
+  {"type": "FeatureCollection", "total": 18314, "locais": 1085, "truncado": false,
+   "features": [{"type": "Feature", "id": 3333934147165,
+                 "geometry": {"type": "Point", "coordinates": [-46.410257, -23.564771]},
+                 "properties": {"n": 46, "m2": 2072.58, "v": 128500.0, "d": "2026-08-04",
+                                "t": "apartamento", "p": "condominio", "u": 40,
+                                "e": "Residencial Jardim dos Ypes"}}]}
+  ```
+  `id` = `local`; `n` = guias no local; `m2` = mediana de R$/m²; `v` = mediana do valor
+  integral; `d` = data da guia mais recente; `t` = tipo mais frequente (empate: qualquer um);
+  `p` = precisão; `u` = unidades distintas (SQLs; nas guias na planta, que estão todas sob o SQL
+  do lote-mãe, bloco + unidade do complemento — `queries.UNIDADE_SQL`); `e` = edifício/condomínio mais frequente
+  (pode ser nulo). `total` = guias filtradas **com coordenada**; `locais` = locais com ao menos
+  uma guia; `truncado` = havia mais locais que `limite` — vêm os de guia mais recente
+  (ordem: `d` desc, `local` desc).
+* `POST /api/itbi/local` com `{"consulta": {...}, "local": 3333934147165, "pagina": 1,
+  "por_pagina": 50, "ordem": "data|valor|rs_m2|area|unidade|bloco", "direcao": "desc|asc"}` →
+  todas as guias do local com os filtros da consulta **menos a área** (o local já é a área):
+  ```json
+  {"local": 3333934147165, "lon": -46.410257, "lat": -23.564771, "precisao": "condominio",
+   "endereco": "Rua Inacio Monteiro, 600", "edificio": "Residencial Jardim dos Ypes",
+   "distrito": {"id": "25", "nome": "Cidade Tiradentes"},
+   "subprefeitura": {"id": "31", "nome": "Cidade Tiradentes"}, "guias": 64,
+   "resumo": {"n": 46, "valor_mediano": 128500.0, "rs_m2_mediano": 2072.58,
+              "periodo": {"min": "2010-09-08", "max": "2026-08-04"},
+              "unidades": 40, "blocos": 17, "atipicos_ocultos": 18},
+   "total": 46,
+   "linhas": [{"id": 202608002839, "data": "2026-08-04", "endereco": "Rua Inacio Monteiro, 600",
+               "complemento": "AP 21", "unidade": "21", "bloco": "14", "vagas": null,
+               "tipo": "apartamento", "area": 62.0, "valor": 141000.0,
+               "valor_integral": 141000.0, "proporcao": 100.0, "valor_referencia": 140782.0,
+               "base_calculo": 141000.0, "rs_m2": 2274.19, "natureza": "Compra e venda",
+               "financiamento": null, "valor_atipico": false, "na_planta": false}]}
+  ```
+  `guias` = todas as guias do local, sem filtros; `endereco`/`edificio` = os mais frequentes do
+  local (sem filtros); `resumo` segue os filtros e `resumo.valor_mediano` usa só guias
+  **típicas** (mesmo com `atipicos: "incluir"`); `unidades` = unidades distintas como em `u` de
+  `/pontos` (um lançamento na planta de 698 apartamentos não sai "1"); `total` = linhas
+  paginadas. `area` = área usada no R$/m² (construída; terreno p/ terrenos; nula na planta).
+  Ordem `unidade`/`bloco` é natural (2 < 11 < 101 < 101A < B), nulos no fim, empate pelo `id`.
+  Local inexistente → 404; `local` fora de 0…2^42−1 → 422.
+* `GET /api/itbi/endereco?logradouro=R%20INACIO%20MONTEIRO&numero=600` → o local de um número
+  da rua ("Rua X, 600" na busca), entre **todas** as guias geocodificadas dela (sem filtros):
+  ```json
+  {"local": 3333934147165, "lon": -46.410257, "lat": -23.564771, "numero": 600,
+   "exato": true, "guias": 64, "endereco": "Rua Inacio Monteiro, 600"}
+  ```
+  Número sem guias: o mais próximo com guias (`exato: false`), até 300 de distância (empate: o
+  de mais guias); nada perto → 404. `logradouro` como na fonte (id da busca; maiúsculas e
+  espaços normalizados); `numero` 1–99.999. ~10 ms.
+* `POST /api/itbi/distritos` com `{"consulta": {...}, "nivel": "distrito|subprefeitura"}`
+  (corpo opcional; a área da consulta é ignorada) → coroplético:
+  ```json
+  {"nivel": "distrito",
+   "areas": [{"id": "45", "nome": "Jardim Paulista", "n": 42673, "rs_m2_mediano": 6611.99,
+              "valor_mediano": 600000.0, "variacao_12m": 0.0838}],
+   "quebras": [2587.63, 2856.85, 3187.49, 3324.02, 3746.2, 4717.97],
+   "n_min": 20}
+  ```
+  Todas as áreas do nível (ordem de `id`), com `n` = 0 e medianas nulas onde não há guias.
+  `variacao_12m` como no resumo (janelas por `data_fim`, mínimo de 20 guias por janela).
+  `quebras` = 6 limites (quantis k/7) de `rs_m2_mediano` das áreas com `n ≥ n_min` → 7 classes
+  (vazio com menos de 7 áreas). A área de cada guia é a do seu ponto (calculada na ingestão).
+* `GET /api/itbi/areas.geojson?tipo=distrito|subprefeitura` (padrão `distrito`) →
+  `FeatureCollection` das áreas: `id` (texto, ex. `"37"`) também como *feature id*,
+  `properties: {"id", "nome"}`, coordenadas com 6 casas. Vai comprimido (`Content-Encoding:
+  gzip`: distritos 0,84 MB → 226 KB, subprefeituras 0,58 MB → 143 KB) quando o cliente aceita
+  gzip; `Cache-Control:
+  public, max-age=86400`; montado uma vez por carga de dados. Use `promoteId: "id"` no MapLibre.
 * `POST /api/itbi/transacoes` com `{"consulta": {...}, "pagina": 1, "por_pagina": 50,
-  "ordem": "data|valor|rs_m2|area", "direcao": "desc|asc"}` →
-  `{"total": 1234, "linhas": [{"id", "data", "endereco", "complemento", "bairro", "cep",
-  "tipo", "na_planta", "uso", "padrao", "area_construida", "area_terreno", "valor", "rs_m2",
-  "natureza",
-  "financiamento", "acc_ano", "precisao", "lon", "lat"}]}`
-* `POST /api/itbi/exportar` → CSV (`;`, UTF-8 com BOM) com as linhas filtradas.
+  "ordem": "data|valor|rs_m2|area", "direcao": "desc|asc"}` (`valor` ordena pelo valor
+  integral) →
+  `{"total": 1234, "linhas": [{"id", "data", "endereco", "edificio", "bloco", "unidade",
+  "vagas", "complemento", "bairro", "cep", "tipo", "na_planta", "uso", "padrao",
+  "area_construida", "area_terreno", "valor", "proporcao", "valor_integral",
+  "valor_referencia", "valor_atipico", "rs_m2", "natureza", "financiamento", "acc_ano",
+  "precisao", "local", "lon", "lat"}]}` (`local` nulo sem coordenada).
+* `POST /api/itbi/exportar` → CSV (`;`, vírgula decimal, UTF-8 com BOM) com as linhas
+  filtradas, colunas: `ID; Data da transação; Endereço; Edifício/condomínio; Bloco/torre;
+  Unidade; Vagas; Complemento; Bairro; CEP; Tipo; Na planta; Uso (IPTU); Padrão (IPTU); Área
+  construída (m²); Área do terreno (m²); Valor declarado (R$); Proporção transmitida (%); Valor
+  integral (R$, 100%); Valor venal de referência (R$); Valor atípico; R$/m²; Natureza da
+  transação; Financiamento; Ano de construção; Precisão da localização; Longitude; Latitude`.
+  No máximo 500 mil linhas (as mais recentes); cabeçalhos `X-Total-Linhas`,
+  `X-Linhas-Exportadas`, `X-Limite-Linhas`, `X-Truncado`. CEP sai como `01452-000`, `Na planta`
+  e `Valor atípico` como `sim`/`não`, a área construída fica vazia quando a do IPTU é a do lote,
+  e textos que começam com `= + - @` ganham apóstrofo (proteção contra fórmulas).
 * `GET /api/itbi/transacao/{id}` → as colunas do esquema de `transacoes` de uma guia (lista
-  fechada `COLUNAS_TRANSACAO`), com `lon`, `lat`, `precisao`, `tier` e `endereco`.
+  fechada `COLUNAS_TRANSACAO`, inclusive `unidade`, `bloco`, `vagas`, `edificio`,
+  `valor_integral`, `valor_referencia`, `razao_referencia`, `valor_atipico`), com `lon`, `lat`,
+  `precisao`, `tier`, `local`, `distrito`, `subprefeitura` (códigos) e `endereco`.
 * `GET /api/itbi/area/{tipo}/{id}` → `{"tipo", "id", "nome", "geometria": GeoJSON, "bbox"}`.
-* `GET /api/itbi/tiles/{z}/{x}/{y}.mvt?data_ini=&data_fim=&tipo=&natureza=&valor_min=&valor_max=&area_min=&area_max=&logradouro=&cep=&precisao=`
+* `GET /api/itbi/tiles/{z}/{x}/{y}.mvt?data_ini=&data_fim=&tipo=&natureza=&valor_min=&valor_max=&area_min=&area_max=&logradouro=&cep=&precisao=&atipicos=`
   → vector tile (z 9–18; `tipo`/`natureza` repetíveis; mesmos filtros de `ConsultaItbi`, sem
-  área). Camada `itbi_agg` (z < 14): pontos de uma grade de 128 unidades com `n` (guias) e `m2`
-  (mediana de R$/m²). Camada `itbi` (z ≥ 14): uma feição por ponto geocodificado com `n` (guias no
-  ponto), `m2` (mediana no ponto) e `id`, `v`, `t`, `d` da guia mais recente. Propriedades nulas
-  são omitidas; não há *feature id* (use a propriedade `id`). Corpo vazio = nada no tile.
-* `POST /api/itbi/pontos`: `total` conta as guias filtradas **com coordenada**.
-* `POST /api/itbi/exportar`: no máximo 500 mil linhas (as mais recentes); cabeçalhos
-  `X-Total-Linhas`, `X-Linhas-Exportadas`, `X-Limite-Linhas`, `X-Truncado`. CEP sai como
-  `01452-000`, `Na planta` como `sim`/`não`, a área construída fica vazia quando a do IPTU é a
-  do lote, e textos que começam com `= + - @` ganham apóstrofo (proteção contra fórmulas).
+  área). Camada `itbi_agg` (z < 14): **quadrados** de uma grade de 128 × 128 unidades do tile
+  (32 × 32 células; ~150 m em z13, ~2,4 km em z9), polígonos que cobrem a célula inteira, com
+  `n` (guias) e `m2` (mediana de R$/m²) — desenhe como `fill` (mosaico tipo raster). Camada
+  `itbi` (z ≥ 14): uma feição (ponto) por **local** com `local`, `n` (guias), `m2` (mediana do
+  local) e `id`, `v` (valor integral), `t`, `d` da guia mais recente. Propriedades nulas são
+  omitidas; não há *feature id* (use `local`). Corpo vazio = nada no tile.
+
+Tempos medidos nos dados reais (1,67 mi de guias, 282 mil locais; servidor local, cache frio
+dos caches por carga): resumo da cidade 150 ms (círculo de 500 m 28 ms, distrito 45 ms),
+pontos da cidade 194 ms (círculo de 1 km 51 ms), local 30 ms, distritos 66–78 ms,
+`areas.geojson` 5 ms, tiles 15–63 ms, transações 12–19 ms. Carga da tabela: 0,3 s (pico de
+memória 1,0 GB contra 1,45 GB da junção na carga que havia antes), ~106 MiB em memória.
 
 ## Frontend
 
 * `web/index.html` com import map (MapLibre 6.16.0, terra-draw 1.39.0 + adaptador 1.5.0).
 * `js/main.js` — roteamento por hash (`#/apagoes`, `#/itbi`), mapa único compartilhado; cada
   view exporta `mount(ctx)` / `unmount()` e reage a `ctx.onStyle(fn)` (troca de tema recria o estilo).
+* `views/apagoes.js` — "Mapa por: Municípios | Conjuntos elétricos" (`nivel=conjunto` e
+  `conj=<código>` na URL; um `conj` abre o mapa por conjunto, salvo `nivel=municipio`). Os
+  polígonos dos conjuntos (`/api/aneel/conjuntos.geojson`) só são carregados quando o nível
+  conjunto é usado (link aberto direto nele: as camadas esperam o estilo do mapa, via
+  `onStyle`); as camadas dos dois níveis têm a mesma estrutura
+  (preenchimento, respiro, tracejado de instável, hover, seleção) e só as do nível atual ficam
+  visíveis; nos conjuntos, um filtro pela propriedade `anos` mostra só os do ano escolhido. As
+  métricas oficiais só aparecem no nível conjunto e travam critério/programadas/causas na
+  definição oficial. O enquadramento de um escopo aberto por link usa `escopo.bbox` do resumo
+  (em zoom baixo os tiles omitem polígonos pequenos).
+* `views/itbi.js` — sem região, o mapa muda com o zoom: abaixo de z12 o coroplético dos distritos
+  (`/areas.geojson` + `/distritos`, feature-state; "Cor do mapa": R$/m² ou transações, `cor=n`),
+  de z12 a z14 a grade `itbi_agg` (nº de guias, escala log. calibrada pelo p90 por zoom), de z14
+  em diante um ponto por endereço (camada `itbi`: raio ∝ √n com teto, rótulo com n, cor pelo R$/m²
+  em faixas de ½× a 2× a mediana da cidade); transição cruzada de ±0,35 zoom, legenda por nível.
+  Com região, os pontos de `/pontos` (faixas por quantil da região). Clique num endereço (ou numa
+  linha da tabela) abre a ficha (`components/location-sheet.js`, `POST /local`, `loc=<local>` na
+  URL); "Rua X, 600" na busca procura o número entre as guias da rua (`/endereco`) e abre a
+  ficha do endereço. Filtro de atípicos `at=incluir|somente`.
 * Componentes: `components/autocomplete.js`, `charts.js` (SVG: colunas, linha, barras horizontais,
-  com tooltip), `legend.js`, `table.js`; utilitários em `dom.js` (`el`, `fmt`, `field`, `kpiTile`,
+  com tooltip), `legend.js`, `table.js` (`render` devolve texto ou nó), `location-sheet.js` (ficha
+  do endereço do ITBI: painel lateral, folha inferior no celular); utilitários em `dom.js` (`el`, `fmt`, `field`, `kpiTile`,
   `showError`, `debounce`…), `api.js` (`api`, `latest`, `isAbort`). Nomes de métricas (ANEEL) e de
   tipos de imóvel (ITBI) vêm dos `/meta`; o frontend guarda só os ids, a formatação e os textos de
   ajuda.
