@@ -179,8 +179,11 @@ export function createLocationSheet(host, options) {
   let page = 1;
   /** @type {{ key: string, dir: "asc" | "desc" }} */
   let sort = { key: "data", dir: "desc" };
-  /** "filtros": os do painel; "todas": todas as guias do endereço (vale para as próximas fichas) */
-  let escopo = /** @type {"filtros" | "todas"} */ ("filtros");
+  /**
+   * "todas" (padrão): o histórico completo do endereço; "filtros": só as guias que passam pelos
+   * filtros do painel. A escolha vale para as próximas fichas.
+   */
+  let escopo = /** @type {"filtros" | "todas"} */ ("todas");
   let comAtipicas = false;
   let ocultas = 0;
   /** @type {number | null} */
@@ -327,8 +330,8 @@ export function createLocationSheet(host, options) {
       return el("label", {}, [input, el("span", { textContent: label })]);
     };
     const seg = el("div", { className: "segmented", role: "radiogroup", "aria-label": "Guias mostradas" }, [
-      radio("filtros", "Com os filtros do painel"),
       radio("todas", `Todas (${fmt.int(data?.guias)})`),
+      radio("filtros", "Com os filtros do painel"),
     ]);
     /** @type {(HTMLElement | null)[]} */
     const children = [seg];
