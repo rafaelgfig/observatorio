@@ -34,7 +34,18 @@ def test_envio_ao_space_inclui_o_que_a_imagem_copia() -> None:
     assert not faltam
 
 
+def _liberados(arquivo: str) -> set[str]:
+    """Caminhos reincluídos (``!caminho``) numa lista que exclui todo o resto (``*``)."""
+    linhas = (RAIZ / arquivo).read_text(encoding="utf-8").splitlines()
+    assert "*" in linhas
+    return {linha[1:].rstrip("/") for linha in linhas if linha.startswith("!")}
+
+
 def test_contexto_do_docker_inclui_o_que_a_imagem_copia() -> None:
-    linhas = (RAIZ / ".dockerignore").read_text(encoding="utf-8").splitlines()
-    liberados = {linha[1:].rstrip("/") for linha in linhas if linha.startswith("!")}
-    assert _copiados_pela_imagem() <= liberados
+    assert _copiados_pela_imagem() <= _liberados(".dockerignore")
+
+
+def test_envio_ao_cloud_build_inclui_o_contexto_da_imagem() -> None:
+    # `gcloud builds submit` aplica o .gcloudignore; o Docker, depois, o .dockerignore
+    assert _copiados_pela_imagem() | {"Dockerfile", ".dockerignore"} <= _liberados(".gcloudignore")
+    assert "src/**" in _liberados(".gcloudignore")

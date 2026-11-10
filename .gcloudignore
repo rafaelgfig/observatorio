@@ -1,0 +1,11 @@
+# O que `gcloud builds submit` envia ao Cloud Build: só o contexto da imagem (o mesmo do
+# .dockerignore). data/, dist/ (o pacote de ~590 MB) e o resto do repositório ficam de fora.
+*
+!Dockerfile
+!.dockerignore
+!pyproject.toml
+!uv.lock
+!README.md
+!LICENSE
+!src/
+!src/**

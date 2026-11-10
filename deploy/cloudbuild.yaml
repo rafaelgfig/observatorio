@@ -1,0 +1,23 @@
+# Imagem do Cloud Run com o pacote de dados embutido: a instância parte em segundos, sem baixar
+# ~590 MB na partida (no Cloud Run o disco é a própria RAM). Veja docs/deploy.md, seção 3.
+#
+#   gcloud builds submit --config deploy/cloudbuild.yaml
+#
+# Cada build roda numa máquina nova, sem cache do Docker: o pacote baixado é sempre o publicado
+# na Release "dados" no momento do build.
+substitutions:
+  _REGION: southamerica-east1
+  _BUNDLE_URL: https://github.com/rafaelgfig/observatorio/releases/download/dados/observatorio-dados.tar
+  _IMAGE: ${_REGION}-docker.pkg.dev/${PROJECT_ID}/observatorio/app
+options:
+  dynamicSubstitutions: true
+  logging: CLOUD_LOGGING_ONLY
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - --build-arg=BUNDLE_URL=${_BUNDLE_URL}
+      - --tag=${_IMAGE}:latest
+      - .
+images:
+  - ${_IMAGE}:latest
