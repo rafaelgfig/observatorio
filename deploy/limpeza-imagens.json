@@ -1,0 +1,12 @@
+[
+  {
+    "name": "manter-2-recentes",
+    "action": {"type": "Keep"},
+    "mostRecentVersions": {"keepCount": 2}
+  },
+  {
+    "name": "apagar-antigas",
+    "action": {"type": "Delete"},
+    "condition": {"tagState": "ANY", "olderThan": "1d"}
+  }
+]

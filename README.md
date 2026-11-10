@@ -3,6 +3,9 @@
 Onde falta energia no Brasil e por quanto se vendem os imóveis em São Paulo — em mapa, a partir
 de dados abertos oficiais, sem cadastro e sem chave de API.
 
+**Acesse: <https://observatorio-512324155576.southamerica-east1.run.app>** (sem visitas, o
+servidor desliga; a primeira visita depois disso espera ~10 s).
+
 ![Apagões: DEC de 2026 por município em todo o Brasil, com filtros e indicadores no painel](docs/img/apagoes.png)
 
 ## Funcionalidades
@@ -59,8 +62,9 @@ de 2015 até hoje, **geocodificadas** pelo cadastro de lotes do GeoSampa.
   acessível aos gráficos e API JSON documentada em `/api/docs`.
 * **Dados em dia**: a ingestão é incremental (só baixa e reprocessa o que mudou nas fontes), e
   uma Action do GitHub publica todo mês um pacote de dados pronto.
-* **Publicação**: o servidor baixa e instala sozinho esse pacote (`.tar` com sha256) na partida.
-  A imagem Docker roda no Hugging Face Spaces, no Cloud Run ou num servidor qualquer.
+* **Publicação**: a imagem Docker leva esse pacote (`.tar` com sha256) embutido ou o baixa e
+  instala sozinha na partida. Roda no Google Cloud Run, no Hugging Face Spaces ou num servidor
+  qualquer.
 
 ## Requisitos
 
@@ -120,15 +124,16 @@ uv run observatorio bundle criar dist/observatorio-dados.tar --enxuto   # pacote
 ## Publicar
 
 O GitHub Pages sozinho não serve, porque o site precisa de um servidor Python. O caminho
-recomendado é gratuito:
+recomendado tem custo quase zero:
 
 1. **Código no GitHub**: este repositório, público.
 2. **Pacote de dados numa Release**: a Action [`dados.yml`](.github/workflows/dados.yml)
    ingere as fontes todo mês e publica `observatorio-dados.tar` na Release `dados`.
-3. **App no Hugging Face Spaces**: um Space Docker com `OBSERVATORIO_BUNDLE_URL` apontando para
-   esse pacote, que ele baixa na partida.
+3. **App no Google Cloud Run**: o Cloud Build constrói a imagem com esse pacote dentro
+   ([`deploy/cloudbuild.yaml`](deploy/cloudbuild.yaml)), e o Cloud Run a serve em São Paulo,
+   desligando quando ninguém usa (cabe no nível grátis com pouco tráfego).
 
-Passo a passo, alternativas (Cloud Run, VPS com Docker), custos e limites estão em
+Passo a passo, alternativas (Hugging Face Spaces, VPS com Docker), custos e limites estão em
 [docs/deploy.md](docs/deploy.md).
 
 ## Desenvolvimento

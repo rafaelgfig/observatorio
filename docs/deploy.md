@@ -1,9 +1,9 @@
 # Publicar o site
 
 **GitHub Pages sozinho não serve: o site precisa de um servidor Python; o código e os dados
-ficam no GitHub, o app roda no Hugging Face Spaces.** O GitHub Pages só entrega arquivos
+ficam no GitHub, o app roda no Google Cloud Run.** O GitHub Pages só entrega arquivos
 estáticos, e cada tela do observatório consulta a API (FastAPI + DuckDB) — filtros, mapas,
-tiles do ITBI, exportação CSV. O caminho recomendado, sem custo:
+tiles do ITBI, exportação CSV. O caminho recomendado, de custo quase zero:
 
 ```
 GitHub ── código (este repositório)
@@ -11,12 +11,12 @@ GitHub ── código (este repositório)
    └── Action "Dados" (mensal) ── ingere as fontes ──► Release "dados"
                                                         observatorio-dados.tar  (~590 MB)
                                                         observatorio-dados.json (índice)
-                                                              │ baixado na partida
-Hugging Face Space (Docker, CPU grátis) ◄─────────────────────┘
-   https://<usuario>-observatorio.hf.space
+                                                              │ embutido no build
+Cloud Build ── imagem com os dados ──► Artifact Registry ──► Cloud Run (São Paulo)
 ```
 
-O mesmo contêiner roda no Google Cloud Run ou em qualquer servidor com Docker (seções 4 e 5).
+O mesmo contêiner roda no Hugging Face Spaces (pago desde 2026) ou em qualquer servidor com
+Docker (seções 4 e 5).
 
 ## 1. O pacote de dados
 
@@ -111,13 +111,83 @@ gh release upload dados dist/observatorio-dados.tar --clobber
 gh release upload dados dist/observatorio-dados.json --clobber
 ```
 
-## 3. Hugging Face Spaces (recomendado)
+## 3. Google Cloud Run (recomendado)
 
-O plano grátis (**CPU basic**: 2 vCPU, 16 GB de RAM, 50 GB de disco temporário) sobra para o
-observatório (medido com os dados reais: ~0,4 GB de RAM em uso, pico de ~1,1 GB).
+O Cloud Run cobra só enquanto atende requisições e desliga a instância sem visitas. O nível
+grátis mensal — 180 mil vCPU-segundos, 360 mil GiB-segundos e 2 milhões de requisições — é
+aplicado como desconto em dinheiro pelos preços de `us-central1` e vale em qualquer região: em
+São Paulo (`southamerica-east1`, ~30% mais cara e bem mais perto dos visitantes) cobre um pouco
+menos de tempo, o bastante para um site com pouco tráfego.
 
-1. Crie uma conta em <https://huggingface.co> e um Space: **New Space → SDK: Docker → Blank**,
-   hardware **CPU basic (free)**, visibilidade **Public**. Nome sugerido: `observatorio`.
+Os dados vão **dentro da imagem** (`deploy/cloudbuild.yaml` passa `BUNDLE_URL` ao Docker): no
+Cloud Run o disco é a própria RAM, e baixar o pacote na partida custaria ~1,2 GB de memória e
+~1 min a cada instância nova. Arquivos da imagem não contam na memória. Medido em 10/11/2026
+(1 vCPU, 2 GiB, `--cpu-boost`): uma instância nova responde em ~9 s, dos quais 4,5 s carregando
+os dados; com ela ligada, as rotas respondem em 0,1–0,2 s de São Paulo. O build leva ~3 min.
+
+### Uma vez
+
+1. Crie um projeto em <https://console.cloud.google.com> e vincule uma conta de faturamento
+   (exigida mesmo no nível grátis). Contas novas começam numa avaliação de 90 dias; ao fim,
+   clique em **Ativar conta completa**, senão o serviço para.
+2. Instale o [gcloud](https://cloud.google.com/sdk/docs/install) (no Windows,
+   `winget install --id Google.CloudSDK -e`), entre e prepare o projeto:
+
+   ```bash
+   gcloud auth login
+   gcloud config set project <projeto>
+   gcloud services enable run.googleapis.com cloudbuild.googleapis.com \
+     artifactregistry.googleapis.com billingbudgets.googleapis.com
+   gcloud artifacts repositories create observatorio --repository-format=docker \
+     --location=southamerica-east1
+   # guarda só as 2 imagens mais recentes (cada uma tem ~1,2 GB; 0,5 GB são grátis)
+   gcloud artifacts repositories set-cleanup-policies observatorio \
+     --location=southamerica-east1 --policy=deploy/limpeza-imagens.json --no-dry-run
+   ```
+
+   Logo depois de ligar o Cloud Build, o 1º `builds submit` pode responder `PERMISSION_DENIED`
+   por um ou dois minutos, até a permissão se propagar; é só repetir.
+3. Alerta de gastos: e-mail aos administradores do faturamento em 50%, 90% e 100% do valor, e
+   quando a previsão do mês passar dele (`gcloud billing accounts list` mostra a conta):
+
+   ```bash
+   gcloud billing budgets create --billing-account=<conta> --display-name="Observatorio" \
+     --budget-amount=10BRL --filter-projects=projects/<projeto> \
+     --threshold-rule=percent=0.5 --threshold-rule=percent=0.9 \
+     --threshold-rule=percent=1.0 --threshold-rule=percent=1.0,basis=forecasted-spend
+   ```
+
+### A cada publicação (código novo ou pacote de dados novo)
+
+Na raiz do repositório:
+
+```bash
+# constrói no Google a imagem com o pacote publicado agora (o .gcloudignore envia só ~1,5 MB)
+gcloud builds submit --config deploy/cloudbuild.yaml
+
+gcloud run deploy observatorio --region southamerica-east1 \
+  --image southamerica-east1-docker.pkg.dev/<projeto>/observatorio/app:latest \
+  --allow-unauthenticated --execution-environment gen2 --cpu 1 --memory 2Gi \
+  --min-instances 0 --max-instances 1 --cpu-boost
+```
+
+* O Cloud Run define `PORT=8080` (a imagem obedece) e `*.run.app` já é aceito em
+  `OBSERVATORIO_ALLOWED_HOSTS`.
+* `--max-instances 1` é o teto de gasto: num pico de acessos, as requisições esperam a vez em
+  vez de abrir novas instâncias. `--min-instances 0` desliga sem visitas (a próxima espera a
+  partida); manter uma instância ligada deixa de ser grátis.
+* Não defina `OBSERVATORIO_BUNDLE_URL` no serviço: com os dados na imagem, ele só faria a
+  instância baixar o pacote de novo para a memória.
+
+## 4. Hugging Face Spaces (pago)
+
+Desde 2026, Spaces com Docker exigem a assinatura **PRO** (US$ 9/mês); só os Spaces estáticos
+seguem grátis. O hardware básico (**CPU basic**: 2 vCPU, 16 GB de RAM, 50 GB de disco
+temporário) sobra para o observatório (medido com os dados reais: ~0,4 GB de RAM em uso, pico
+de ~1,1 GB).
+
+1. Com a conta PRO, crie um Space em <https://huggingface.co>: **New Space → SDK: Docker →
+   Blank**, hardware **CPU basic**, visibilidade **Public**. Nome sugerido: `observatorio`.
 2. Em **Settings → Variables and secrets → New variable**:
    `OBSERVATORIO_BUNDLE_URL` = a URL do pacote (seção 2). `*.hf.space` já é aceito pela imagem.
 3. Envie o código com a biblioteca do Hugging Face (`huggingface_hub`, rodada pelo `uv` sem
@@ -155,36 +225,15 @@ observatório (medido com os dados reais: ~0,4 GB de RAM em uso, pico de ~1,1 GB
    minuto, e o site abre sozinho em seguida, em `https://<usuario>-observatorio.hf.space` (ou
    embutido em `https://huggingface.co/spaces/<usuario>/observatorio`).
 
-**Limites do plano grátis**: o Space dorme depois de 48 h sem visitas e acorda na visita
-seguinte (~1–2 min). O disco é temporário: a cada partida o pacote é baixado de novo (do
-GitHub, ~590 MB). Com **armazenamento persistente** (pago) montado em `/data`, defina
-`OBSERVATORIO_DATA_DIR=/data/observatorio` e a partida passa a só conferir o índice.
+**Limites**: no CPU basic, o Space dorme depois de 48 h sem visitas e acorda na visita
+seguinte (~1–2 min); só o hardware pago (a partir de US$ 0,03/h) fica sempre ligado. O disco é
+temporário: a cada partida o pacote é baixado de novo (do GitHub, ~590 MB). Para evitar,
+crie também a variável `BUNDLE_URL` (a mesma URL): o Hugging Face passa as variáveis ao build
+como `--build-arg`, e os dados entram na imagem; a partida passa a só conferir o índice.
 
 **Dados novos na hora**: o Space confere o índice a cada 24 h e em toda partida. Para reiniciá-lo
 assim que a Action publicar, crie no GitHub a variável `HF_SPACE` (`<usuario>/observatorio`) e
 o segredo `HF_TOKEN` (token do Hugging Face com escrita): o último passo da Action usa os dois.
-
-## 4. Google Cloud Run (alternativa)
-
-Precisa de um projeto com faturamento ativo (o uso pequeno cabe na cota grátis) e do `gcloud`.
-
-```bash
-gcloud run deploy observatorio --source . --region southamerica-east1 \
-  --memory 4Gi --cpu 2 --min-instances 0 --max-instances 2 --allow-unauthenticated \
-  --set-env-vars OBSERVATORIO_BUNDLE_URL=https://github.com/<usuario>/<repo>/releases/download/dados/observatorio-dados.tar
-```
-
-* O Cloud Run define `PORT=8080` (a imagem obedece) e `*.run.app` já é aceito.
-* O disco do Cloud Run fica na memória: o pacote instalado (~0,6 GB) conta na RAM, por isso
-  `--memory 4Gi`.
-* Com `--min-instances 0`, cada partida a frio baixa o pacote (~1 min). Para evitar, embuta os
-  dados na imagem: `docker build --build-arg BUNDLE_URL=<url do .tar> --build-arg BUNDLE_REV=$(date +%s) -t <região>-docker.pkg.dev/<projeto>/observatorio/app .`,
-  `docker push …` e `gcloud run deploy observatorio --image …` (refaça a cada pacote novo; o
-  `BUNDLE_REV` diferente impede o Docker de reaproveitar do cache o pacote anterior).
-* **Custos**: a cota grátis mensal (cobrança por requisição) é de 180 mil vCPU-segundos,
-  360 mil GiB-segundos e 2 milhões de requisições — com 2 vCPU e 4 GiB, ~25 h de instância
-  ativa por mês. Acima disso, cobra-se pelo uso; o Artifact Registry guarda a imagem (~550 MB)
-  com 0,5 GB grátis. Confira os preços atuais em <https://cloud.google.com/run/pricing>.
 
 ## 5. Docker local ou num servidor (VPS)
 
@@ -224,23 +273,25 @@ constrói a imagem, sem publicá-la, e confere que o servidor sobe.
 
 ## 6. Atualizar os dados
 
-* **Automático**: a Action **Dados** roda todo dia 5; o servidor pega o pacote novo na próxima
-  partida ou verificação (24 h), ou na hora com o passo opcional de reinício do Space.
+* **Automático**: a Action **Dados** roda todo dia 5. No Cloud Run, os dados estão na imagem:
+  depois da Action, rode o `builds submit` e o `run deploy` da seção 3. Servidores com
+  `OBSERVATORIO_BUNDLE_URL` (Hugging Face, VPS) pegam o pacote novo na próxima partida ou
+  verificação (24 h), ou na hora com o passo opcional de reinício do Space.
 * **Manual**: Actions → Dados → Run workflow, ou os comandos locais da seção 2.
 * **Servidor com os próprios dados** (sem pacote): rode `observatorio ingest all` nele; a API
   recarrega sozinha ao fim da ingestão.
 * **Mudou a ingestão** (arquivo ou coluna nova em `data/processed`, versão de regras): o pacote
   publicado foi gerado pelo código antigo e o site novo responderia 503 nas telas que dependem
-  do que falta. Rode a Action **Dados** (ou publique da sua máquina) junto com a atualização do
-  código no Space.
+  do que falta. Rode a Action **Dados** (ou publique da sua máquina) antes de publicar o
+  código novo.
 
 ## 7. Custos e limites (resumo)
 
 | onde | custo | limites relevantes |
 |---|---|---|
 | GitHub (código, Actions, Release) | grátis em repositório público | asset ≤ 2 GB; job da Action ≤ 6 h |
-| Hugging Face Spaces, CPU basic | grátis | dorme após 48 h sem visitas; disco temporário (pacote baixado a cada partida) |
-| Google Cloud Run | grátis até a cota mensal, depois por uso | RAM inclui o disco; partida a frio baixa o pacote |
+| Google Cloud Run (São Paulo) | grátis até a cota mensal, depois por uso; imagem no Artifact Registry ~US$ 0,07/mês | desliga sem visitas (a próxima espera a partida); RAM inclui o disco gravado |
+| Hugging Face Spaces, CPU basic | assinatura PRO (US$ 9/mês) | dorme após 48 h sem visitas; disco temporário |
 | VPS | o do provedor (~US$ 5/mês com 2 GB de RAM) | você cuida de HTTPS e atualizações |
 
 A API não tem limite de requisições por cliente; num endereço muito divulgado, prefira um
