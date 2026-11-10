@@ -140,7 +140,7 @@ observatório (medido com os dados reais: ~0,4 GB de RAM em uso, pico de ~1,1 GB
        repo_id="<usuario>/observatorio",
        repo_type="space",
        folder_path=".",
-       allow_patterns=["Dockerfile", ".dockerignore", "pyproject.toml", "uv.lock", "src/*"],
+       allow_patterns=["Dockerfile", ".dockerignore", "pyproject.toml", "uv.lock", "LICENSE", "src/*"],
        ignore_patterns=["*__pycache__*"],
        delete_patterns=["src/*"],  # apaga do Space o que saiu de src/
        commit_message="Código do observatório",
