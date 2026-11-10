@@ -1,0 +1,47 @@
+# Publica o site no Google Cloud Run: o Cloud Build constrói a imagem com o pacote da Release
+# "dados" embutido e atualiza o serviço (deploy/cloudbuild.yaml; veja docs/deploy.md, seção 3).
+#
+# Roda sozinha quando a Action "Dados" publica um pacote novo e à mão em Actions → Publicar →
+# Run workflow (código novo, ou pacote publicado de um computador). O acesso ao Google Cloud é
+# por federação de identidade, sem chave guardada no GitHub: só esta Action, na main deste
+# repositório, pode assumir a conta de serviço. Sem as variáveis GCP_* (forks), não faz nada.
+name: Publicar
+
+on:
+  workflow_run:
+    workflows: [Dados]
+    types: [completed]
+  workflow_dispatch:
+
+concurrency:
+  group: publicar
+  cancel-in-progress: false
+
+jobs:
+  cloud-run:
+    if: >-
+      vars.GCP_WIF_PROVIDER != '' &&
+      (github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write # token OIDC trocado por credenciais temporárias do Google Cloud
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Construir e publicar
+        run: gcloud builds submit --config deploy/cloudbuild.yaml --project "${{ vars.GCP_PROJECT }}"
+
+      - name: Conferir o site
+        env:
+          SITE: ${{ vars.SITE_URL }}
+        if: ${{ vars.SITE_URL != '' }}
+        run: curl --fail --silent --show-error --retry 5 --retry-all-errors --max-time 60 "$SITE/api/health"

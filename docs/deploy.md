@@ -109,6 +109,8 @@ gh release create dados --title "Dados processados" --notes "Dados do observató
 # o .tar antes do índice
 gh release upload dados dist/observatorio-dados.tar --clobber
 gh release upload dados dist/observatorio-dados.json --clobber
+# o site no Cloud Run só pega o pacote novo ao ser reconstruído (seção 3)
+gh workflow run publicar.yml
 ```
 
 ## 3. Google Cloud Run (recomendado)
@@ -157,27 +159,69 @@ os dados; com ela ligada, as rotas respondem em 0,1–0,2 s de São Paulo. O bui
      --threshold-rule=percent=1.0 --threshold-rule=percent=1.0,basis=forecasted-spend
    ```
 
-### A cada publicação (código novo ou pacote de dados novo)
+### Publicar (código novo ou pacote de dados novo)
 
-Na raiz do repositório:
+Na raiz do repositório, um comando constrói no Google a imagem com o pacote publicado agora (o
+`.gcloudignore` envia só ~1,5 MB) e atualiza o serviço (`observatorio`, criado na 1ª vez):
 
 ```bash
-# constrói no Google a imagem com o pacote publicado agora (o .gcloudignore envia só ~1,5 MB)
 gcloud builds submit --config deploy/cloudbuild.yaml
+```
 
-gcloud run deploy observatorio --region southamerica-east1 \
-  --image southamerica-east1-docker.pkg.dev/<projeto>/observatorio/app:latest \
-  --allow-unauthenticated --execution-environment gen2 --cpu 1 --memory 2Gi \
-  --min-instances 0 --max-instances 1 --cpu-boost
+Só na 1ª vez, libere o acesso público (o build não mexe nas permissões do serviço):
+
+```bash
+gcloud run services add-iam-policy-binding observatorio --region=southamerica-east1 \
+  --member=allUsers --role=roles/run.invoker
 ```
 
 * O Cloud Run define `PORT=8080` (a imagem obedece) e `*.run.app` já é aceito em
   `OBSERVATORIO_ALLOWED_HOSTS`.
-* `--max-instances 1` é o teto de gasto: num pico de acessos, as requisições esperam a vez em
-  vez de abrir novas instâncias. `--min-instances 0` desliga sem visitas (a próxima espera a
-  partida); manter uma instância ligada deixa de ser grátis.
+* `--max-instances=1` (em `deploy/cloudbuild.yaml`) é o teto de gasto: num pico de acessos, as
+  requisições esperam a vez em vez de abrir novas instâncias. `--min-instances=0` desliga sem
+  visitas (a próxima espera a partida); manter uma instância ligada deixa de ser grátis.
 * Não defina `OBSERVATORIO_BUNDLE_URL` no serviço: com os dados na imagem, ele só faria a
   instância baixar o pacote de novo para a memória.
+
+### Publicar sozinho pelo GitHub
+
+A Action **Publicar** (`.github/workflows/publicar.yml`) roda o mesmo `builds submit` quando a
+Action **Dados** publica um pacote novo, e à mão em **Actions → Publicar → Run workflow** (código
+novo, ou pacote publicado de um computador). O acesso é por **federação de identidade**: nenhuma
+chave fica guardada no GitHub, e o Google só aceita tokens da `main` deste repositório. Uma vez,
+com uma conta dona do projeto:
+
+```bash
+PROJ=<projeto>; NUM=$(gcloud projects describe $PROJ --format='value(projectNumber)')
+REPO=<usuario>/<repo>; SA=github-publicar@$PROJ.iam.gserviceaccount.com
+gcloud services enable iam.googleapis.com iamcredentials.googleapis.com sts.googleapis.com
+gcloud iam service-accounts create github-publicar --display-name="GitHub Actions: publicar"
+# enviar o build (e o código ao bucket do Cloud Build) e rodá-lo como a conta padrão do build
+gcloud projects add-iam-policy-binding $PROJ --member=serviceAccount:$SA \
+  --role=roles/cloudbuild.builds.editor --condition=None
+gcloud projects add-iam-policy-binding $PROJ --member=serviceAccount:$SA \
+  --role=roles/serviceusage.serviceUsageConsumer --condition=None
+gcloud storage buckets add-iam-policy-binding gs://${PROJ}_cloudbuild \
+  --member=serviceAccount:$SA --role=roles/storage.admin
+gcloud iam service-accounts add-iam-policy-binding $NUM-compute@developer.gserviceaccount.com \
+  --member=serviceAccount:$SA --role=roles/iam.serviceAccountUser
+# GitHub → Google: só a main deste repositório
+gcloud iam workload-identity-pools create github --location=global --display-name=GitHub
+gcloud iam workload-identity-pools providers create-oidc observatorio --location=global \
+  --workload-identity-pool=github --issuer-uri=https://token.actions.githubusercontent.com \
+  --attribute-mapping=google.subject=assertion.sub,attribute.repository=assertion.repository,attribute.ref=assertion.ref \
+  --attribute-condition="assertion.repository=='$REPO' && assertion.ref=='refs/heads/main'"
+gcloud iam service-accounts add-iam-policy-binding $SA --role=roles/iam.workloadIdentityUser \
+  --member=principalSet://iam.googleapis.com/projects/$NUM/locations/global/workloadIdentityPools/github/attribute.repository/$REPO
+# variáveis da Action (não são segredos)
+gh variable set GCP_PROJECT --body $PROJ
+gh variable set GCP_SERVICE_ACCOUNT --body $SA
+gh variable set GCP_WIF_PROVIDER --body projects/$NUM/locations/global/workloadIdentityPools/github/providers/observatorio
+gh variable set SITE_URL --body <URL do serviço>   # opcional: a Action confere /api/health no fim
+```
+
+O build roda com a conta padrão do Cloud Build (`<número>-compute@…`), que já pode publicar no
+Cloud Run; a conta do GitHub só pode enviar builds.
 
 ## 4. Hugging Face Spaces (pago)
 
@@ -274,10 +318,11 @@ constrói a imagem, sem publicá-la, e confere que o servidor sobe.
 ## 6. Atualizar os dados
 
 * **Automático**: a Action **Dados** roda todo dia 5. No Cloud Run, os dados estão na imagem:
-  depois da Action, rode o `builds submit` e o `run deploy` da seção 3. Servidores com
+  em seguida a Action **Publicar** reconstrói e publica (seção 3). Servidores com
   `OBSERVATORIO_BUNDLE_URL` (Hugging Face, VPS) pegam o pacote novo na próxima partida ou
   verificação (24 h), ou na hora com o passo opcional de reinício do Space.
-* **Manual**: Actions → Dados → Run workflow, ou os comandos locais da seção 2.
+* **Manual**: Actions → Dados → Run workflow, ou os comandos locais da seção 2 seguidos de
+  Actions → Publicar → Run workflow (ou `gh workflow run publicar.yml`).
 * **Servidor com os próprios dados** (sem pacote): rode `observatorio ingest all` nele; a API
   recarrega sozinha ao fim da ingestão.
 * **Mudou a ingestão** (arquivo ou coluna nova em `data/processed`, versão de regras): o pacote

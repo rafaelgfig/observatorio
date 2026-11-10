@@ -45,6 +45,27 @@ def test_contexto_do_docker_inclui_o_que_a_imagem_copia() -> None:
     assert _copiados_pela_imagem() <= _liberados(".dockerignore")
 
 
+def test_publicacao_no_cloud_run_mantem_o_teto_de_gasto() -> None:
+    build = (RAIZ / "deploy" / "cloudbuild.yaml").read_text(encoding="utf-8")
+    publicar = build[build.index("id: publicar") :]
+    assert "--max-instances=1" in publicar
+    assert "--min-instances=0" in publicar
+    # com os dados na imagem, baixar o pacote na partida só gastaria memória (o disco é a RAM)
+    assert "OBSERVATORIO_BUNDLE_URL" not in build
+    assert "--build-arg=BUNDLE_URL=" in build
+
+
+def test_action_publicar_segue_a_action_dados() -> None:
+    fluxos = RAIZ / ".github" / "workflows"
+    dados = (fluxos / "dados.yml").read_text(encoding="utf-8")
+    publicar = (fluxos / "publicar.yml").read_text(encoding="utf-8")
+    nome = re.search(r"^name: (.+)$", dados, re.MULTILINE)
+    assert nome
+    assert f"workflows: [{nome.group(1)}]" in publicar
+    assert "--config deploy/cloudbuild.yaml" in publicar
+    assert "id-token: write" in publicar
+
+
 def test_envio_ao_cloud_build_inclui_o_contexto_da_imagem() -> None:
     # `gcloud builds submit` aplica o .gcloudignore; o Docker, depois, o .dockerignore
     assert _copiados_pela_imagem() | {"Dockerfile", ".dockerignore"} <= _liberados(".gcloudignore")
