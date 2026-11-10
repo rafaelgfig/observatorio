@@ -37,8 +37,14 @@ jobs:
 
       - uses: google-github-actions/setup-gcloud@v2
 
+      # Com o bucket de envio explícito, o gcloud não lista os buckets do projeto (a conta só tem
+      # acesso a este bucket)
       - name: Construir e publicar
-        run: gcloud builds submit --config deploy/cloudbuild.yaml --project "${{ vars.GCP_PROJECT }}"
+        env:
+          PROJETO: ${{ vars.GCP_PROJECT }}
+        run: |
+          gcloud builds submit --config deploy/cloudbuild.yaml --project "$PROJETO" \
+            --gcs-source-staging-dir "gs://${PROJETO}_cloudbuild/source"
 
       - name: Conferir o site
         env:
