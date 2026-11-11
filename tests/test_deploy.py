@@ -55,13 +55,22 @@ def test_publicacao_no_cloud_run_mantem_o_teto_de_gasto() -> None:
     assert "--build-arg=BUNDLE_URL=" in build
 
 
-def test_action_publicar_segue_a_action_dados() -> None:
+def test_action_publicar_segue_o_ci_e_a_action_dados() -> None:
     fluxos = RAIZ / ".github" / "workflows"
-    dados = (fluxos / "dados.yml").read_text(encoding="utf-8")
     publicar = (fluxos / "publicar.yml").read_text(encoding="utf-8")
-    nome = re.search(r"^name: (.+)$", dados, re.MULTILINE)
-    assert nome
-    assert f"workflows: [{nome.group(1)}]" in publicar
+    seguidas = re.search(r"workflows: \[(.+)\]", publicar)
+    assert seguidas
+    nomes = set()
+    for arquivo in ("ci.yml", "dados.yml"):
+        nome = re.search(r"^name: (.+)$", (fluxos / arquivo).read_text(encoding="utf-8"), re.M)
+        assert nome
+        nomes.add(nome.group(1))
+        # as condições do job citam os nomes literalmente
+        assert f"github.event.workflow_run.name == '{nome.group(1)}'" in publicar
+    assert {n.strip() for n in seguidas.group(1).split(",")} == nomes
+    # do CI, só pushes à main deste repositório publicam
+    assert "github.event.workflow_run.event == 'push'" in publicar
+    assert "head_repository.full_name == github.repository" in publicar
     assert "--config deploy/cloudbuild.yaml" in publicar
     assert "id-token: write" in publicar
 

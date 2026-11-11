@@ -1,34 +1,45 @@
 # Publica o site no Google Cloud Run: o Cloud Build constrói a imagem com o pacote da Release
 # "dados" embutido e atualiza o serviço (deploy/cloudbuild.yaml; veja docs/deploy.md, seção 3).
 #
-# Roda sozinha quando a Action "Dados" publica um pacote novo e à mão em Actions → Publicar →
-# Run workflow (código novo, ou pacote publicado de um computador). O acesso ao Google Cloud é
-# por federação de identidade, sem chave guardada no GitHub: só esta Action, na main deste
-# repositório, pode assumir a conta de serviço. Sem as variáveis GCP_* (forks), não faz nada.
+# Roda sozinha quando o CI passa num push à main (publica esse commit) e quando a Action "Dados"
+# publica um pacote novo; e à mão em Actions → Publicar → Run workflow (pacote publicado de um
+# computador). O acesso ao Google Cloud é por federação de identidade, sem chave guardada no
+# GitHub: só esta Action, na main deste repositório, pode assumir a conta de serviço. Sem as
+# variáveis GCP_* (forks), não faz nada.
 name: Publicar
 
 on:
   workflow_run:
-    workflows: [Dados]
+    workflows: [CI, Dados]
     types: [completed]
   workflow_dispatch:
 
+# Um envio por vez; pushes seguidos esperam (o último a passar no CI é o que fica no ar)
 concurrency:
   group: publicar
   cancel-in-progress: false
 
 jobs:
   cloud-run:
+    # do CI, só pushes à main deste repositório (pull requests e forks não publicam)
     if: >-
       vars.GCP_WIF_PROVIDER != '' &&
-      (github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success')
+      (github.event_name == 'workflow_dispatch' ||
+       (github.event.workflow_run.conclusion == 'success' &&
+        (github.event.workflow_run.name == 'Dados' ||
+         (github.event.workflow_run.event == 'push' &&
+          github.event.workflow_run.head_branch == 'main' &&
+          github.event.workflow_run.head_repository.full_name == github.repository))))
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
       contents: read
       id-token: write # token OIDC trocado por credenciais temporárias do Google Cloud
     steps:
+      # depois do CI, o commit que ele aprovou; nos outros casos, a main atual
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.name == 'CI' && github.event.workflow_run.head_sha || '' }}
 
       - uses: google-github-actions/auth@v2
         with:

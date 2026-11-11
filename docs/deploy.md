@@ -216,9 +216,12 @@ requisição em relação ao endereço `run.app`, que continua valendo.
 
 ### Publicar sozinho pelo GitHub
 
-A Action **Publicar** (`.github/workflows/publicar.yml`) roda o mesmo `builds submit` quando a
-Action **Dados** publica um pacote novo, e à mão em **Actions → Publicar → Run workflow** (código
-novo, ou pacote publicado de um computador). O acesso é por **federação de identidade**: nenhuma
+A Action **Publicar** (`.github/workflows/publicar.yml`) roda o mesmo `builds submit` quando o
+**CI** passa num push à `main` (publica o commit aprovado), quando a Action **Dados** publica um
+pacote novo, e à mão em **Actions → Publicar → Run workflow** (pacote publicado de um
+computador). Pull requests e forks não publicam; pushes seguidos entram em fila, e o último fica
+no ar. Cada publicação gera uma revisão nova no Cloud Run (a anterior continua lá para voltar:
+**Revisões → Gerenciar tráfego**). O acesso é por **federação de identidade**: nenhuma
 chave fica guardada no GitHub, e o Google só aceita tokens da `main` deste repositório. Uma vez,
 com uma conta dona do projeto:
 
@@ -358,8 +361,9 @@ constrói a imagem, sem publicá-la, e confere que o servidor sobe.
   recarrega sozinha ao fim da ingestão.
 * **Mudou a ingestão** (arquivo ou coluna nova em `data/processed`, versão de regras): o pacote
   publicado foi gerado pelo código antigo e o site novo responderia 503 nas telas que dependem
-  do que falta. Rode a Action **Dados** (ou publique da sua máquina) antes de publicar o
-  código novo.
+  do que falta. Como o push à `main` já publica, gere o pacote com o código novo na sua
+  máquina e suba-o na Release (comandos da seção 2, sem o `gh workflow run`) **antes** do push:
+  o build do push embute o pacote novo.
 
 ## 7. Custos e limites (resumo)
 

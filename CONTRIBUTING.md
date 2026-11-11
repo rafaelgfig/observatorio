@@ -2,7 +2,8 @@
 
 Obrigado pelo interesse! Problemas e ideias entram como *issue*; mande o link da tela, que já
 guarda os filtros. Correções e melhorias entram como *pull request* para `main` e, como o resto
-do código, ficam sob a [licença MIT](LICENSE).
+do código, ficam sob a [licença MIT](LICENSE). Tudo o que chega à `main` e passa no CI vai ao ar
+sozinho (Action **Publicar**, ~5 min; veja [docs/deploy.md](docs/deploy.md)).
 
 ## Ambiente
 
