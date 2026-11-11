@@ -197,7 +197,11 @@ personalizado). Uma vez:
 
 1. No [console do Firebase](https://console.firebase.google.com), **adicione o Firebase ao
    projeto do Google Cloud** que já existe (não crie um projeto novo: o repasse só alcança o
-   Cloud Run do mesmo projeto) e aceite os termos.
+   Cloud Run do mesmo projeto) e aceite os termos. Se o console perguntar o plano, escolha
+   **Blaze**: o Spark (grátis) **desvincula o faturamento do projeto inteiro**, e o Cloud Run
+   para (`Billing disabled. Shutting down instance.` no log; o site responde 503). As cotas
+   grátis valem igual no Blaze. Para religar:
+   `gcloud billing projects link <projeto> --billing-account=<conta>`.
 2. Crie o site (o nome é único entre todos os usuários do Firebase; `observatorio` já tinha
    dono) e publique a configuração:
 
