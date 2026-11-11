@@ -42,6 +42,9 @@ GEO_DATASETS = (
 # Arquivos geográficos grandes servidos pré-comprimidos.
 GEO_FILES = {"municipios.geojson", "ufs.geojson"}
 
+# Arquivos que buscadores procuram na raiz do site (ficam em web/, com os estáticos).
+ROOT_FILES = {"robots.txt": "text/plain", "sitemap.xml": "application/xml"}
+
 RELOAD_INTERVAL_S = 5.0
 
 # Maior corpo aceito em /api (o maior legítimo, um polígono de 5.000 vértices, tem ~200 KB):
@@ -236,6 +239,12 @@ def create_app(settings: Settings | None = None, *, watch: bool = True) -> FastA
     app.include_router(search.router)
     app.include_router(aneel_api.router)
     app.include_router(itbi_api.router)
+    _add_site_routes(app, settings)
+    return app
+
+
+def _add_site_routes(app: FastAPI, settings: Settings) -> None:
+    """Malhas pré-comprimidas, estáticos, a página e os arquivos de raiz para buscadores."""
 
     @app.get("/dados/geo/{name}", include_in_schema=False)
     def geo_file(name: str, request: Request) -> Response:
@@ -257,4 +266,9 @@ def create_app(settings: Settings | None = None, *, watch: bool = True) -> FastA
     def index() -> FileResponse:
         return FileResponse(WEB_DIR / "index.html", headers={"Cache-Control": "no-cache"})
 
-    return app
+    @app.get("/{name}", include_in_schema=False)
+    def root_file(name: str) -> FileResponse:
+        if name not in ROOT_FILES:
+            raise HTTPException(404)
+        headers = {"Cache-Control": "public, max-age=3600"}
+        return FileResponse(WEB_DIR / name, media_type=ROOT_FILES[name], headers=headers)

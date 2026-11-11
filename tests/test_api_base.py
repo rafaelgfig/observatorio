@@ -3,6 +3,7 @@ from __future__ import annotations
 import gzip
 import logging
 import os
+import re
 import threading
 import time
 from collections.abc import Iterator
@@ -86,6 +87,37 @@ def test_geojson_pre_comprimido(client: TestClient, settings: Settings) -> None:
 def test_index_e_estaticos(client: TestClient) -> None:
     assert client.get("/").status_code == 200
     assert client.get("/static/css/app.css").status_code == 200
+
+
+def test_arquivos_da_raiz_para_buscadores(client: TestClient) -> None:
+    robots = client.get("/robots.txt")
+    assert robots.status_code == 200
+    assert robots.headers["content-type"].startswith("text/plain")
+    sitemap = client.get("/sitemap.xml")
+    assert sitemap.headers["content-type"].startswith("application/xml")
+    # o sitemap citado no robots.txt e o endereço do sitemap são o canônico da página
+    canonico = re.search(r'<link rel="canonical" href="([^"]+)"', client.get("/").text)
+    assert canonico
+    assert f"Sitemap: {canonico.group(1)}sitemap.xml" in robots.text
+    assert f"<loc>{canonico.group(1)}</loc>" in sitemap.text
+    # só esses: o resto da raiz continua 404 (inclusive arquivos de web/ fora da lista)
+    assert client.get("/favicon.ico").status_code == 404
+    assert client.get("/index.html").status_code == 404
+    assert client.get("/jsconfig.json").status_code == 404
+
+
+def test_previa_do_link_aponta_para_a_imagem_servida(client: TestClient) -> None:
+    html = client.get("/").text
+    imagem = re.search(r'<meta property="og:image" content="https?://[^/]+(/[^"]+)"', html)
+    assert imagem
+    resp = client.get(imagem.group(1))
+    assert resp.status_code == 200
+    assert resp.headers["content-type"] == "image/png"
+    # 1200×630: o tamanho declarado nas marcações (cabeçalho IHDR do PNG)
+    largura, altura = int.from_bytes(resp.content[16:20]), int.from_bytes(resp.content[20:24])
+    assert (largura, altura) == (1200, 630)
+    assert f'content="{largura}"' in html
+    assert f'content="{altura}"' in html
 
 
 def test_422_com_nan_no_corpo_nao_vira_500(client: TestClient) -> None:
