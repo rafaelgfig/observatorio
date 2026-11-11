@@ -1,0 +1,12 @@
+{
+  "hosting": {
+    "site": "observatorio-br",
+    "public": "deploy/firebase",
+    "rewrites": [
+      {
+        "source": "**",
+        "run": { "serviceId": "observatorio", "region": "southamerica-east1" }
+      }
+    ]
+  }
+}

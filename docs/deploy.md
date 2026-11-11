@@ -13,6 +13,8 @@ GitHub ── código (este repositório)
                                                         observatorio-dados.json (índice)
                                                               │ embutido no build
 Cloud Build ── imagem com os dados ──► Artifact Registry ──► Cloud Run (São Paulo)
+                                                              ▲ repasse
+                                     Firebase Hosting (CDN) ──┘ https://observatorio-br.web.app
 ```
 
 O mesmo contêiner roda no Hugging Face Spaces (pago desde 2026) ou em qualquer servidor com
@@ -183,6 +185,31 @@ gcloud run services add-iam-policy-binding observatorio --region=southamerica-ea
 * Não defina `OBSERVATORIO_BUNDLE_URL` no serviço: com os dados na imagem, ele só faria a
   instância baixar o pacote de novo para a memória.
 
+### Endereço bonito: Firebase Hosting
+
+O mapeamento de domínio do Cloud Run não existe em São Paulo, e o balanceador de carga que o
+substitui custa ~US$ 18/mês. O Firebase Hosting (do mesmo projeto, sem custo até ~10 GB de
+tráfego por mês) dá um endereço `<site>.web.app` com HTTPS e repassa tudo ao serviço
+(`firebase.json`; sem arquivos estáticos próprios). Respostas com `Cache-Control: public` (as
+malhas de `/dados/geo/`) ficam no CDN dele; o resto passa direto. Um domínio próprio, se um dia
+houver, entra no mesmo site pelo console do Firebase (Hosting → Adicionar domínio
+personalizado). Uma vez:
+
+1. No [console do Firebase](https://console.firebase.google.com), **adicione o Firebase ao
+   projeto do Google Cloud** que já existe (não crie um projeto novo: o repasse só alcança o
+   Cloud Run do mesmo projeto) e aceite os termos.
+2. Crie o site (o nome é único entre todos os usuários do Firebase; `observatorio` já tinha
+   dono) e publique a configuração:
+
+   ```bash
+   npx firebase-tools hosting:sites:create observatorio-br --project <projeto>
+   npx firebase-tools deploy --only hosting --project <projeto>
+   ```
+
+O repasse aponta para o serviço, não para uma revisão: cada `builds submit` aparece no
+endereço do Firebase sem publicar nada nele de novo. A passagem pelo Firebase soma ~0,2 s por
+requisição em relação ao endereço `run.app`, que continua valendo.
+
 ### Publicar sozinho pelo GitHub
 
 A Action **Publicar** (`.github/workflows/publicar.yml`) roda o mesmo `builds submit` quando a
@@ -336,6 +363,7 @@ constrói a imagem, sem publicá-la, e confere que o servidor sobe.
 |---|---|---|
 | GitHub (código, Actions, Release) | grátis em repositório público | asset ≤ 2 GB; job da Action ≤ 6 h |
 | Google Cloud Run (São Paulo) | grátis até a cota mensal, depois por uso; imagem no Artifact Registry ~US$ 0,07/mês | desliga sem visitas (a próxima espera a partida); RAM inclui o disco gravado |
+| Firebase Hosting (endereço `web.app`) | grátis até 10 GB armazenados e 360 MB/dia de tráfego; depois US$ 0,15/GB | nome do site único no Firebase inteiro |
 | Hugging Face Spaces, CPU basic | assinatura PRO (US$ 9/mês) | dorme após 48 h sem visitas; disco temporário |
 | VPS | o do provedor (~US$ 5/mês com 2 GB de RAM) | você cuida de HTTPS e atualizações |
 
